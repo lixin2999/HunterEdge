@@ -1,0 +1,20 @@
+# decision_making_params.yaml — 模式仲裁决策参数（文档 13.5/10.5/3.1）
+decision_making:
+  ros__parameters:
+    cmd_vel_topic: "/cmd_vel"                  # Nav2 输出指令（Twist）
+    remote_topic: "/remote/command"             # 远程指令（ChassisCommand）
+    chassis_topic: "/chassis/state"             # 底盘状态（ChassisState）
+    estop_topic: "/estop"                       # 急停信号（Bool）
+    command_topic: "/control/command"           # 最终指令（ChassisCommand）
+    behavior_state_topic: "/planning/behavior_state"  # 行为状态
+
+    wheelbase: 0.46           # 文档 3.1：轴距（阿克曼转向转换）
+
+    # 超时保护
+    cmd_vel_timeout: 0.5      # 文档 10.5：/cmd_vel 超时 500ms 停车
+    remote_timeout: 0.5       # 文档 13.4：远程指令超时 500ms 停车
+    chassis_timeout: 0.1      # 文档 10.5：CAN 丢失 100ms 制动（触发 ESTOP）
+
+    # 限幅
+    max_velocity: 2.0         # 文档 10.5：限速 2.0 m/s
+    max_steering: 0.4         # 文档 4.3：转向 ±0.4 rad
