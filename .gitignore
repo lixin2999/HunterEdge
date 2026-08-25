@@ -31,4 +31,4 @@ __pycache__/
 *.txt
 
 #编码规则
-.cursorrules
+*.cursorrules
