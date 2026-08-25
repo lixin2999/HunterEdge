@@ -1,4 +1,97 @@
 <?xml version="1.0"?>
 <robot name="hunter_se" xmlns:xacro="http://www.ros.org/wiki/xacro">
-  <!-- TODO(task00): 占位 URDF，后续任务实现 HUNTER SE 车辆模型 -->
+  <!-- ==================================================================
+       HUNTER SE 车辆模型（URDF/Xacro）
+       依据：
+         - 文档 7.4 坐标系定义
+         - 附录 D 传感器安装示意
+         - 文档 9.3 车辆 Footprint
+       ================================================================== -->
+
+  <xacro:property name="pi" value="3.1415926535897931"/>
+
+  <!-- ========== 车辆本体尺寸（文档 3.1 / 9.3） ========== -->
+  <xacro:property name="length" value="0.82"/>          <!-- 车长 m -->
+  <xacro:property name="width" value="0.64"/>           <!-- 车宽 m -->
+  <xacro:property name="height" value="0.31"/>          <!-- 车高 m -->
+  <xacro:property name="wheelbase" value="0.46"/>       <!-- 轴距 m -->
+  <xacro:property name="front_overhang" value="0.45"/>  <!-- 前悬 m -->
+  <xacro:property name="rear_overhang" value="0.37"/>   <!-- 后悬 m -->
+  <xacro:property name="half_width" value="0.32"/>      <!-- 半宽 m -->
+  <xacro:property name="ground_clearance" value="0.15"/> <!-- base_link 距地面 m -->
+
+  <!-- Footprint（文档 9.3，矩形，原点在后轴中心，含安全余量）：
+       [ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]
+       即 前悬 0.45 / 后悬 0.37 / 半宽 0.32，车辆尺寸 0.82m × 0.64m -->
+
+  <!-- ========== 传感器安装偏移（附录 D，相对 base_link） ========== -->
+  <xacro:property name="lidar_x" value="0.23"/>
+  <xacro:property name="lidar_y" value="0.0"/>
+  <xacro:property name="lidar_z" value="0.35"/>
+
+  <xacro:property name="camera_x" value="0.40"/>
+  <xacro:property name="camera_y" value="0.0"/>
+  <xacro:property name="camera_z" value="0.30"/>
+
+  <xacro:property name="imu_x" value="0.10"/>
+  <xacro:property name="imu_y" value="0.0"/>
+  <xacro:property name="imu_z" value="0.20"/>
+
+  <!-- ========== base_link（后轴中心，X前/Y左/Z上，距地面 150mm） ========== -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="${length} ${width} ${height}"/>
+      </geometry>
+      <origin xyz="${(front_overhang - rear_overhang) / 2} 0 ${height / 2 - ground_clearance}" rpy="0 0 0"/>
+      <material name="gray">
+        <color rgba="0.5 0.5 0.5 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="${length} ${width} ${height}"/>
+      </geometry>
+      <origin xyz="${(front_overhang - rear_overhang) / 2} 0 ${height / 2 - ground_clearance}" rpy="0 0 0"/>
+    </collision>
+    <inertial>
+      <origin xyz="${(front_overhang - rear_overhang) / 2} 0 ${height / 2 - ground_clearance}" rpy="0 0 0"/>
+      <mass value="45.0"/>
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
+    </inertial>
+  </link>
+
+  <!-- ========== lidar（LiDAR 光心，X前/Y左/Z上） ========== -->
+  <link name="lidar">
+    <visual>
+      <geometry>
+        <cylinder radius="0.05" length="0.08"/>
+      </geometry>
+      <material name="blue">
+        <color rgba="0.0 0.0 0.8 1.0"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="lidar_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="lidar"/>
+    <origin xyz="${lidar_x} ${lidar_y} ${lidar_z}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ========== camera_color_optical_frame（D435 光心，Z前/X右/Y下） ========== -->
+  <link name="camera_color_optical_frame"/>
+  <joint name="camera_color_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_color_optical_frame"/>
+    <!-- 轴向转换：base_link(X前/Y左/Z上) → optical(Z前/X右/Y下) -->
+    <origin xyz="${camera_x} ${camera_y} ${camera_z}" rpy="0 ${-pi / 2} ${pi / 2}"/>
+  </joint>
+
+  <!-- ========== imu（IMU 中心，X前/Y左/Z上） ========== -->
+  <link name="imu"/>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu"/>
+    <origin xyz="${imu_x} ${imu_y} ${imu_z}" rpy="0 0 0"/>
+  </joint>
 </robot>
