@@ -1,1 +1,110 @@
-# TODO(task00): 占位配置（nav2_params.yaml），后续任务填充参数。
+# nav2_params.yaml — Nav2 导航栈参数
+# 出处：附录 C（控制器）、文档 8.3（代价地图）、9.2（SmacPlannerHybrid）、9.3（footprint）、10.2（RPP）
+
+# ---- 全局规划器（文档 9.2 SmacPlannerHybrid，Hybrid-A*） ----
+planner_server:
+  ros__parameters:
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      tolerance: 0.25                          # 文档 9.2：目标点容差
+      max_iterations: 1000000                  # 文档 9.2：最大搜索迭代次数
+      max_planning_time: 2.0
+      motion_model_for_search: "REEDS_SHEPP"   # 文档 9.2：支持前进+倒车
+      angle_quantization_bins: 72              # 文档 9.2：航向角量化(5°/bin)
+      minimum_turning_radius: 1.9              # 文档 9.2：最小转弯半径(m)
+      reverse_penalty: 2.0                     # 文档 9.2：倒车惩罚
+      change_penalty: 0.5                      # 文档 9.2：前进/倒车切换惩罚
+      downsample_obstacle_heuristic: true      # 文档 9.2：障碍物启发式降采样
+      allow_reversing: true
+      use_final_approach_orientation: false
+      max_robot_pose_search_dist: 5.0
+
+# ---- 局部控制器（附录 C + 文档 10.2 RPP） ----
+controller_server:
+  ros__parameters:
+    controller_frequency: 20.0                 # 附录 C
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      lookahead_dist: 0.6                      # 文档 10.2.2：基础前视距离
+      lookahead_time: 1.5                      # 前视时间(速度相关)
+      min_lookahead_dist: 0.3
+      max_lookahead_dist: 1.5
+      use_velocity_scaled_lookahead_dist: true
+      use_rotate_to_heading: true
+      rotate_to_heading_min_angle: 0.785
+      use_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 1.9
+      regulated_linear_scaling_min_speed: 0.2
+      max_robot_pose_search_dist: 5.0
+      transform_tolerance: 0.1
+      # 速度限制（文档 10.2.3）
+      desired_linear_vel: 2.0                  # max_velocity 2.0 m/s
+      max_linear_accel: 1.0                    # 文档 10.2.3
+      max_linear_decel: -1.5                   # 文档 10.2.3
+
+    general_goal_checker:
+      stateful: true
+      xy_goal_tolerance: 0.1                   # 文档 10.2.3：目标距离容差
+      yaw_goal_tolerance: 0.15                 # 文档 10.2.3：目标角度容差
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.1
+      movement_time_allowance: 10.0
+
+# ---- 全局代价地图（文档 8.3） ----
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0                    # 文档 8.3：更新频率 1Hz
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      resolution: 0.1                          # 文档 8.3：分辨率 0.1m
+      width: 100.0                             # 文档 8.3：100m × 100m
+      height: 100.0
+      footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      inflation_layer:
+        inflation_radius: 0.3                  # 文档 8.3：膨胀半径 0.3m
+        cost_scaling_factor: 3.0
+      obstacle_layer:
+        observation_sources: lidar
+        lidar:
+          topic: /perception/lidar/obstacle_cloud
+          data_type: "PointCloud2"
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+
+# ---- 局部代价地图（文档 8.3） ----
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0                    # 文档 8.3：更新频率 5Hz
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      resolution: 0.05                         # 文档 8.3：分辨率 0.05m
+      width: 10.0                              # 文档 8.3：10m × 10m
+      height: 10.0
+      footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
+      plugins: ["obstacle_layer", "inflation_layer"]
+      inflation_layer:
+        inflation_radius: 0.2                  # 文档 8.3：膨胀半径 0.2m
+        cost_scaling_factor: 3.0
+      obstacle_layer:
+        observation_sources: lidar
+        lidar:
+          topic: /perception/lidar/obstacle_cloud
+          data_type: "PointCloud2"
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0

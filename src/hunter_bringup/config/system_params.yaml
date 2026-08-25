@@ -1,1 +1,43 @@
-# TODO(task00): 占位配置（system_params.yaml），后续任务填充参数。
+# system_params.yaml — 系统参数
+# 出处：文档 15 系统监控、3.5 散热、10.5 安全、14.3 事件检测、19.3 运行安全
+
+vehicle:
+  max_velocity: 2.0               # 文档 10.5/19.3：软件层限速 2.0 m/s（底盘最高 4.8）
+  max_reverse_velocity: -0.5      # 文档 10.2.3：最大倒车速度
+  cmd_vel_timeout: 0.5            # 文档 10.5：/cmd_vel 超时 500ms 自动停车
+  can_timeout: 0.1                # 文档 10.5：CAN 丢失 100ms 底盘自动制动
+
+thermal:
+  warning_temp: 85.0              # 文档 3.5：85℃ 降频告警
+  critical_temp: 95.0             # 文档 3.5：95℃ 保护性降载
+  power_mode: "MODE_30W"          # 文档 3.5 / 附录 B：推荐模式2
+
+health_monitor:
+  check_interval: 2.0             # 文档 15.2：每 2 秒检查节点存活
+  restart_limit: 3                # 文档 15.2：单节点 5 分钟内重启 >3 次则故障
+  restart_window: 300.0           # 5 分钟
+  report_frequency: 1.0           # 文档 14.5：健康上报 1Hz
+
+sensor_timeout:                   # 文档 15.3 传感器状态监控阈值
+  lidar:
+    min_rate: 8.0                 # < 8Hz 持续 2s
+    duration: 2.0
+  camera:
+    min_rate: 10.0                # < 10Hz 持续 2s
+    duration: 2.0
+  imu:
+    min_rate: 50.0                # < 50Hz 持续 1s
+    duration: 1.0
+  can:
+    min_rate: 5.0                 # < 5Hz 持续 1s（0x211 报文）
+    duration: 1.0
+
+events:                           # 文档 14.3 事件检测规则
+  hard_acceleration: 3.0          # 急加速 > 3.0 m/s² 持续 0.5s (warning)
+  hard_deceleration: 3.0          # 急减速 > 3.0 m/s² 持续 0.5s (warning)
+  hard_turn: 0.8                  # 急转弯 横摆角速度 > 0.8 rad/s (warning)
+  overspeed_ratio: 1.1            # 超速 > 限速 × 1.1 (critical)
+  collision_ttc: 1.5              # 碰撞预警 TTC < 1.5s (critical)
+  low_battery_soc: 20.0           # 电池低电量 SOC < 20% (warning)
+  sensor_timeout_event: 1.0       # 传感器数据超时 > 1s (critical)
+  comm_loss_duration: 10.0        # Kafka 断开 > 10s (critical)

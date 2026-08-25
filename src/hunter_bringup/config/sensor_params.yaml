@@ -1,1 +1,33 @@
-# TODO(task00): 占位配置（sensor_params.yaml），后续任务填充参数。
+# sensor_params.yaml — 传感器参数
+# 出处：文档 3.3 传感器配置 + 附录 C sensor_params.yaml
+
+lidar:
+  model: "RS-Helios-16P"            # 文档 3.3.1
+  frame_id: "lidar"
+  topic: "/lidar_points"
+  rate: 10                          # 10Hz (600rpm)
+  lines: 16                         # 16线
+  vertical_fov: 30.0                # -15° ~ +15°
+  horizontal_fov: 360.0             # 水平视场角
+  accuracy: 0.02                    # 测距精度 ±2cm
+  roi:                              # 附录 C：车前 ROI
+    max_range: 50.0
+    min_range: 0.5
+    horizontal_fov: 120.0           # 度，车前扇形
+
+camera:
+  model: "Intel RealSense D435"     # 文档 3.3.2
+  frame_id: "camera_color_optical_frame"
+  rgb_topic: "/camera/color/image_raw"
+  depth_topic: "/camera/depth/image_rect_raw"
+  resolution: [640, 480]
+  rate: 15
+  depth_range: [0.1, 10.0]          # 推荐 0.3 ~ 3m
+
+imu:
+  model: "CH10X"                    # 文档 3.3.3
+  frame_id: "imu"
+  topic: "/imu/data"
+  rate: 100                         # 100Hz
+  accel_range: 16.0                 # ±16g
+  gyro_range: 2000.0                # ±2000°/s
