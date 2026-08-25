@@ -29,3 +29,6 @@ __pycache__/
 *.docx
 *.pdf
 *.txt
+
+#编码规则
+.cursorrules
