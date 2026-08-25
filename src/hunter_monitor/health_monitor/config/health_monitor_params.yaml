@@ -1,0 +1,29 @@
+# health_monitor_params.yaml — 系统监控健康管理参数（文档第 15 章）
+health_monitor:
+  ros__parameters:
+    # 关键节点（文档 15.2）
+    critical_nodes:
+      - "lidar_perception"
+      - "vision_perception"
+      - "fast_lio2"
+      - "ekf_filter_node"
+      - "hunter_ros2"
+      - "decision_making"
+
+    node_check_interval: 2.0    # 文档 15.2：每 2 秒检查节点存活
+    report_interval: 1.0        # 文档 14.5：健康上报 1Hz
+    restart_limit: 3            # 文档 15.2：5 分钟内重启 > 3 次 → 故障
+    restart_window: 300.0       # 5 分钟
+
+    warning_temp: 85.0          # 文档 3.5：85℃ 降频告警
+    critical_temp: 95.0         # 文档 3.5：95℃ 保护性降载
+
+    # 传感器频率异常阈值（文档 15.3）
+    lidar_min_rate: 8.0         # LiDAR < 8Hz 持续 2s
+    lidar_duration: 2.0
+    camera_min_rate: 10.0       # Camera < 10Hz 持续 2s
+    camera_duration: 2.0
+    imu_min_rate: 50.0          # IMU < 50Hz 持续 1s
+    imu_duration: 1.0
+    can_min_rate: 5.0           # CAN < 5Hz 持续 1s
+    can_duration: 1.0
