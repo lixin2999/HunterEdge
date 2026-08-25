@@ -3,29 +3,27 @@
 <package format="3">
   <name>vision_perception</name>
   <version>1.0.0</version>
-  <description>Vision perception module for HUNTER autonomous vehicle system - YOLO+TensorRT object detection and depth completion</description>
+  <description>Vision perception module for HUNTER autonomous vehicle system - YOLO+TensorRT object detection and depth-based 2D-to-3D projection</description>
   <maintainer email="developer@hunter.ai">HUNTER Development Team</maintainer>
   <license>Apache-2.0</license>
 
-  <buildtool_depend>ament_python</buildtool_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <depend>rclpy</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
   <depend>sensor_msgs</depend>
-  <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
-  <depend>vision_msgs</depend>
   <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
   <depend>hunter_msgs</depend>
-  <depend>opencv-python</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>libopencv-dev</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
-  <test_depend>ament_copyright</test_depend>
-  <test_depend>ament_flake8</test_depend>
-  <test_depend>ament_pep257</test_depend>
-  <test_depend>python3-pytest</test_depend>
 
   <export>
-    <build_type>ament_python</build_type>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>
