@@ -1,0 +1,18 @@
+# data_agent_params.yaml — 数据采集 Agent 参数（文档第 14 章）
+data_agent:
+  ros__parameters:
+    vehicle_id: "hunter_001"                    # 车辆唯一标识
+    kafka_brokers: "platform.example.com:9093"  # Kafka 地址（SASL_SSL）
+    db_path: "/data/data_agent/telemetry.db"    # SQLite 缓存路径
+
+    publish_rate: 10.0        # 文档 14.2.2：遥测打包 10Hz
+
+    # 事件检测阈值（文档 14.3.1）
+    max_velocity: 2.0         # 文档 19.3：限速 2.0 m/s（超速 = 限速×1.1）
+    min_battery_soc: 20.0     # 电池低电量 SOC < 20%
+    hard_accel: 3.0           # 急加速/急减速 > 3.0 m/s² 持续 0.5s
+    hard_turn: 0.8            # 急转弯 横摆角速度 > 0.8 rad/s
+
+    # 网络异常（文档 14.6）
+    comm_loss_duration: 10.0  # Kafka 断开 > 10s 触发事件
+    cache_max_hours: 24.0     # 本地缓存最多 24 小时
