@@ -1,0 +1,24 @@
+# lidar_perception_params.yaml — 激光感知参数（文档 5.1.2）
+lidar_perception:
+  ros__parameters:
+    cloud_topic: "/lidar_points"
+    imu_topic: "/imu/data"
+    target_frame: "base_link"
+    # ROI 裁剪（文档 5.1.1：车前 120°、50m）
+    roi_max_range: 50.0
+    roi_min_range: 0.5
+    roi_horizontal_fov: 120.0
+    # 地面分割（文档 5.1.2：高度阈值 0.15m，射线分辨率 0.1°）
+    ground_height_threshold: 0.15
+    ground_ray_resolution: 0.1
+    # 欧式聚类（文档 5.1.2：距离 0.5m，最小 10 点，最大 5000 点）
+    cluster_tolerance: 0.5
+    cluster_min_points: 10
+    cluster_max_points: 5000
+    # 跟踪（文档 5.1.2：关联距离 1.0m）
+    association_distance: 1.0
+    # 异常降级
+    timeout: 0.3            # 点云超时阈值（秒，对应 10Hz）
+    # 离群点去除（StatisticalOutlierRemoval）
+    outlier_mean_k: 10
+    outlier_std_dev: 1.0
