@@ -1,0 +1,23 @@
+[Unit]
+Description=HUNTER Remote Control Agent (non-ROS systemd service)
+Documentation=docs/hunter/remote.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+# 主程序路径（部署到车辆后）
+ExecStart=/usr/bin/python3 /opt/hunter/remote_agent/remote_agent.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# 资源限制
+LimitNOFILE=65536
+# 日志
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
