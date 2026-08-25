@@ -1,0 +1,26 @@
+{
+  "version": "1.2.0",
+  "version_code": 10200,
+  "build_time": "2026-08-19T10:00:00Z",
+  "min_base_version": "1.0.0",
+  "components": [
+    {
+      "name": "hunter_perception",
+      "type": "deb",
+      "file": "ros_packages/hunter_perception.deb",
+      "version": "2.1.0"
+    },
+    {
+      "name": "pointpillars_model",
+      "type": "model",
+      "file": "models/pointpillars.engine",
+      "version": "1.5.0"
+    }
+  ],
+  "scripts": {
+    "pre_install": "scripts/pre_install.sh",
+    "install": "scripts/install.sh",
+    "post_install": "scripts/post_install.sh"
+  },
+  "signature": "base64_rsa_signature"
+}
