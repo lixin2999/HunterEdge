@@ -1,0 +1,26 @@
+# sensor_fusion_params.yaml — 多传感器数据融合参数（文档第 6 章）
+sensor_fusion:
+  ros__parameters:
+    lidar_topic: "/perception/lidar_objects"
+    vision_topic: "/perception/vision_objects"
+    fused_topic: "/perception/fused_objects"
+    freespace_topic: "/perception/freespace"
+
+    # 关联匹配（文档 6.2：位置距离 < 2.0m 且类别一致）
+    match_distance: 2.0
+
+    # 加权状态融合（文档 6.3）
+    pos_lidar_weight: 0.7       # 位置：激光 0.7
+    pos_vision_weight: 0.3      # 位置：视觉 0.3
+    size_lidar_weight: 0.8      # 尺寸：激光 0.8
+    size_vision_weight: 0.2     # 尺寸：视觉 0.2
+
+    # 可行驶区域（文档 6.5）
+    freespace_resolution: 0.2   # 栅格分辨率 0.2m
+    freespace_length: 40.0      # 车前 40m
+    freespace_width: 30.0       # 左右各 15m
+    inflation_radius: 0.3       # 膨胀 0.3m
+
+    # 降级阈值
+    lidar_timeout: 0.3          # 激光超时（秒）
+    vision_timeout: 0.5         # 视觉超时（秒）
