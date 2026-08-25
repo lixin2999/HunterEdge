@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="hunter_se" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- TODO(task00): 占位 URDF，后续任务实现 HUNTER SE 车辆模型 -->
+</robot>

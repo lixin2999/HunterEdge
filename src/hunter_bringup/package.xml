@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hunter_bringup</name>
+  <version>1.0.0</version>
+  <description>HUNTER autonomous vehicle system bringup package - launch files and configuration</description>
+  <maintainer email="developer@hunter.ai">HUNTER Development Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>ros2launch</depend>
+  <depend>hunter_msgs</depend>
+  <depend>hunter_ros2</depend>
+  <depend>rslidar_sdk</depend>
+  <depend>realsense2_camera</depend>
+  <depend>robot_localization</depend>
+  <depend>navigation2</depend>
+  <depend>fast_lio2</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
