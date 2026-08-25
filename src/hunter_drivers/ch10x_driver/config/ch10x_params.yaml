@@ -1,0 +1,7 @@
+# ch10x_params.yaml — CH10X IMU 驱动参数（文档 3.3.3）
+ch10x_driver:
+  ros__parameters:
+    port: "/dev/ttyUSB0"        # UART 设备节点
+    baud_rate: 115200           # 波特率
+    frame_id: "imu"             # 文档 7.4：IMU 坐标系
+    timeout: 0.2                # 数据超时阈值（秒，对应 100Hz 输出）
