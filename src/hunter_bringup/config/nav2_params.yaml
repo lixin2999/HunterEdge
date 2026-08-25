@@ -108,3 +108,53 @@ local_costmap:
           data_type: "PointCloud2"
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
+
+# ---- 行为树导航器（文档 2.3 nav2_bt_navigator） ----
+bt_navigator:
+  ros__parameters:
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /localization/odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    default_bt_xml_filename: "navigate_to_pose.xml"
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_distance_traveled_condition_bt_node
+
+# ---- 速度平滑器（文档 10.2.3 速度限制） ----
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [2.0, 0.0, 2.5]     # 文档 10.2.3：max_velocity 2.0
+    min_velocity: [-0.5, 0.0, -2.5]   # 文档 10.2.3：min_velocity -0.5
+    max_accel: [1.0, 0.0, 3.0]        # 文档 10.2.3：max_accel 1.0
+    max_decel: [-1.5, 0.0, -3.0]      # 文档 10.2.3：max_decel -1.5
+    odom_topic: "/localization/odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
