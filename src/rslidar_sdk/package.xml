@@ -1,23 +1,25 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>rslidar_sdk</name>
-  <version>1.0.0</version>
-  <description>RoboSense LiDAR SDK - Vendor package placeholder (to be cloned from official repository)</description>
-  <maintainer email="developer@hunter.ai">HUNTER Development Team</maintainer>
-  <license>MIT</license>
+  <version>1.5.20</version>
+  <description>The rslidar_sdk package</description>
+  <maintainer email="orion.he@robosense.cn">robosense</maintainer>
+  <license>BSD</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend condition="$ROS_VERSION == 1">catkin</buildtool_depend>
+  <buildtool_depend condition="$ROS_VERSION == 2">ament_cmake</buildtool_depend>
 
-  <depend>rclcpp</depend>
-  <depend>rclcpp_components</depend>
+  <depend>libpcap</depend>
+  <depend condition="$ROS_VERSION == 1">pcl_ros</depend>
+  <depend condition="$ROS_VERSION == 2">rclcpp</depend>
+  <depend condition="$ROS_VERSION == 1">roscpp</depend>
+  <depend condition="$ROS_VERSION == 1">roslib</depend>
+  <depend condition="$ROS_VERSION == 2">rslidar_msg</depend>
   <depend>sensor_msgs</depend>
-  <depend>pcl_ros</depend>
-  <depend>pcl_conversions</depend>
-  <depend>tf2</depend>
-  <depend>tf2_ros</depend>
+  <depend>std_msgs</depend>
+  <depend>yaml-cpp</depend>
 
   <export>
-    <build_type>ament_cmake</build_type>
+     <build_type condition="$ROS_VERSION == 2">ament_cmake</build_type>
   </export>
 </package>

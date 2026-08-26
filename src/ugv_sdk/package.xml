@@ -1,20 +1,19 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
-<package format="3">
+<package>
   <name>ugv_sdk</name>
-  <version>1.0.0</version>
-  <description>AgileX UGV SDK - Vendor package placeholder (to be cloned from official repository)</description>
-  <maintainer email="developer@hunter.ai">HUNTER Development Team</maintainer>
-  <license>MIT</license>
+  <version>0.1.6</version>
+  <description>Weston Robot Platform SDK</description>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+  <author email="ruixiang.du@westonrobot.com">Ruixiang Du</author>
+  <maintainer email="ruixiang.du@westonrobot.com">Ruixiang Du</maintainer>
 
-  <depend>rclcpp</depend>
-  <depend>std_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>sensor_msgs</depend>
+  <license>BSD</license>
 
-  <export>
-    <build_type>ament_cmake</build_type>
-  </export>
+  <url type="website">https://www.westonrobot.com/</url>
+  <url type="bugtracker">https://github.com/westonrobot/ugv_sdk/issues</url>
+  <url type="repository">https://github.com/westonrobot/ugv_sdk</url>
+
+  <buildtool_depend>catkin</buildtool_depend> 
+  <build_depend>asio</build_depend>
+  <export></export>
 </package>

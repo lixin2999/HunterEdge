@@ -32,3 +32,14 @@ __pycache__/
 
 #编码规则
 *.cursorrules
+
+#第三方依赖包文件夹
+fast_lio2/
+rslidar_sdk/
+realsense-ros/
+hunter_ros2/
+navigation2/
+robot_localization/
+YOLOv8-ROS-TensorRT/
+yolo_trt_ros/
+ugv_sdk/
