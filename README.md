@@ -119,7 +119,7 @@
 
 ## 4. 项目目录结构
 
-基于设计文档 §4.2 的工作空间 `~/hunter_ws/src` 结构如下：
+基于设计文档 §4.2 的工作空间 `~/HunterEdge/src` 结构如下：
 
 ### 4.1 自定义功能包
 
@@ -132,13 +132,15 @@
 | `hunter_agents/data_agent` | 数据采集上传（Kafka+MinIO） | §14 |
 | `hunter_agents/ota_agent` | OTA 升级（systemd 服务） | §12 |
 | `hunter_agents/remote_agent` | 远程操控（WebRTC，systemd 服务） | §13 |
-| `hunter_common/hunter_msgs` | 自定义消息（DetectedObject/ChassisState/Trajectory 等） | §4.3 |
+| `hunter_common/hunter_msgs` | 自定义消息（DetectedObject/ChassisState/Trajectory/HunterStatus 等，含 AgileX 底盘消息） | §4.3 |
 | `hunter_common/hunter_utils` | 公共工具函数库 | §4.2 |
+| `hunter_perception/sensor_fusion` | 多传感器目标级数据融合（匈牙利关联 + 加权融合 + 可行驶区域） | §6 |
 | `hunter_monitor/health_monitor` | 系统监控与健康管理 | §15 |
+| `decision_making` | 模式仲裁决策（AUTO/REMOTE/ESTOP 状态机） | §13.5 |
 
-> 数据融合（设计文档 §6）与模式仲裁（设计文档 §13.5）分别对应感知融合环节与决策节点，相关实现体现在感知与决策模块中。
+### 4.2 第三方依赖包（外部依赖，需按 §5 安装）
 
-### 4.2 第三方依赖包（vendor）
+> 以下为设计文档 §4.2 定义的 vendor 外部依赖，**当前 `src/` 源码目录中不包含**，需按 §5 安装后随工作空间一起编译。
 
 | 包 | 用途 |
 |----|------|
@@ -155,17 +157,19 @@
 
 ## 5. 依赖安装
 
+在 Ubuntu 车载环境执行 `./src/hunter_bringup/scripts/import_vendor.sh`，自动 git clone 全部第三方包；
+
 ### 5.1 AgileX 底盘驱动（设计文档 §11.6）
 
 ```bash
-cd ~/hunter_ws/src
+cd ~/HunterEdge/src
 
 # 安装 ugv_sdk
 git clone https://github.com/agilexrobotics/ugv_sdk.git
 cd ugv_sdk && mkdir build && cd build && cmake .. && make -j4
 
 # 安装 hunter_ros2（humble 分支）
-cd ~/hunter_ws/src
+cd ~/HunterEdge/src
 git clone -b humble https://github.com/agilexrobotics/hunter_ros2.git
 ```
 
@@ -182,7 +186,7 @@ sudo apt install -y ros-humble-realsense2-camera
 以下包需源码编译（vendor 源码）：
 
 ```bash
-cd ~/hunter_ws/src
+cd ~/HunterEdge/src
 git clone https://github.com/RoboSense-LiDAR/rslidar_sdk.git   # LiDAR 驱动
 ```
 
@@ -193,7 +197,7 @@ git clone https://github.com/RoboSense-LiDAR/rslidar_sdk.git   # LiDAR 驱动
 ## 6. 编译步骤
 
 ```bash
-cd ~/hunter_ws
+cd ~/HunterEdge
 colcon build --symlink-install
 source install/setup.bash
 ```
@@ -214,7 +218,7 @@ colcon build --packages-select hunter_msgs hunter_bringup lidar_perception
 先加载环境（每次新终端都需要）：
 
 ```bash
-source ~/hunter_ws/install/setup.bash
+source ~/HunterEdge/install/setup.bash
 ```
 
 ### 7.1 全系统启动（设计文档 §4.4）
@@ -272,6 +276,8 @@ ros2 launch hunter_bringup data_agent.launch.py
 | `/system/health` | `hunter_msgs/SystemHealth` | 1Hz | 系统健康状态 |
 
 > 自定义消息定义见设计文档 §4.3（`hunter_msgs`）。
+>
+> ⚠️ **实际运行说明**：话题表为设计文档 §17.1 定义的设计接口。实际实现中：`/control/command` 由 `decision_making` 模式仲裁后发布（而非 §17.1 所述 nav2_controller）；`/planning/behavior_state` 由 `decision_making` 发布（实际约 50Hz）；若使用 Nav2，其全局路径输出为 `/plan`（`nav_msgs/Path`），自定义 `/planning/trajectory`（`hunter_msgs/Trajectory`）需由规划模块按需发布。
 
 ---
 
@@ -334,7 +340,7 @@ ros2 launch hunter_bringup data_agent.launch.py
 > 🔧 **【现场运维视角】** 脚本位于 `hunter_bringup/scripts/`，需先赋予执行权限：
 
 ```bash
-chmod +x ~/hunter_ws/src/hunter_bringup/scripts/*.sh
+chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 ```
 
 | 脚本 | 用途 |

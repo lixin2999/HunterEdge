@@ -39,7 +39,7 @@ log "导入 realsense-ros..."
 if [ -d "$WS_SRC/realsense-ros/.git" ]; then
   log "  已存在: realsense-ros"
 else
-  git clone -b humble https://github.com/IntelRealSense/realsense-ros.git "$WS_SRC/realsense-ros"
+  git clone https://github.com/realsenseai/realsense-ros.git "$WS_SRC/realsense-ros"
 fi
 
 # ============ FAST-LIO2（港大 hku-mars 雷达惯导里程计） ============
@@ -56,7 +56,7 @@ log "导入 robot_localization..."
 if [ -d "$WS_SRC/robot_localization/.git" ]; then
   log "  已存在: robot_localization"
 else
-  git clone -b ros2 https://github.com/cra-ros-pkg/robot_localization.git "$WS_SRC/robot_localization"
+  git clone -b humble-devel https://github.com/cra-ros-pkg/robot_localization.git "$WS_SRC/robot_localization"
 fi
 
 # ============ navigation2（Nav2 导航栈） ============
