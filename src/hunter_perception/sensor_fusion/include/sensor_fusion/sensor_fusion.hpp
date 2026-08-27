@@ -8,10 +8,14 @@
 #include <string>
 #include <vector>
 
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "hunter_msgs/msg/detected_object.hpp"
 #include "hunter_msgs/msg/detected_object_array.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
 
 namespace sensor_fusion
 {
@@ -87,6 +91,10 @@ private:
   bool vision_received_;
   std::chrono::steady_clock::time_point last_lidar_time_;
   std::chrono::steady_clock::time_point last_vision_time_;
+
+  // 修正：TF2 坐标转换
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 };
 
 }  // namespace sensor_fusion

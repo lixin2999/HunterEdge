@@ -53,6 +53,12 @@ class RemoteAgent:
         self.ws_url = config["ws_url"]           # wss://platform/ws/remote
         self.cmd_topic = config.get("cmd_topic", "/remote/command")
 
+        # 修正：引入 20Hz 定时器独立发布，而不是由 websocket 事件直接触发
+        self.latest_velocity = 0.0
+        self.latest_steering = 0.0
+        self.latest_brake = False
+        self.timer = None
+
     # ------------------------------------------------------------------
     # GStreamer（文档 13.2.2：AGX 硬件 H264 编码）
     # ------------------------------------------------------------------
@@ -90,7 +96,17 @@ class RemoteAgent:
         self.ros_node = Node("remote_agent_bridge")
         self.cmd_publisher = self.ros_node.create_publisher(
             ChassisCommand, self.cmd_topic, 10)
-        logger.info("ROS2 桥接就绪，发布 %s", self.cmd_topic)
+
+        # 修正：引入 20Hz 定时器独立发布，而不是由 websocket 事件直接触发
+        self.timer = self.ros_node.create_timer(0.05, self.timer_callback)  # 20Hz 频率
+        logger.info("ROS2 桥接就绪，20Hz 定时发布 %s", self.cmd_topic)
+
+    def timer_callback(self):
+        # 修正：将超时检查融入 20Hz 定时器中
+        if time.time() - self.last_cmd_time > self.config["cmd_timeout"]:
+            self.publish_command(0.0, 0.0, brake=True)
+        else:
+            self.publish_command(self.latest_velocity, self.latest_steering, self.latest_brake)
 
     def publish_command(self, velocity, steering, brake=False):
         if not HAS_ROS or not self.cmd_publisher:
@@ -131,22 +147,19 @@ class RemoteAgent:
             return
 
         # 安全限速（文档 13.4：远程模式最高 2.0 m/s，转向 ±0.4 rad）
-        velocity = clamp(
+        self.latest_velocity = clamp(
             cmd.get("velocity", 0.0),
             -self.config["max_velocity"], self.config["max_velocity"])
-        steering = clamp(
+        self.latest_steering = clamp(
             cmd.get("steering_angle", 0.0),
             -self.config["max_steering"], self.config["max_steering"])
-        brake = bool(cmd.get("brake", False))
-
-        self.publish_command(velocity, steering, brake)
+        self.latest_brake = bool(cmd.get("brake", False))
         self.last_cmd_time = time.time()
 
     def check_timeout(self):
         """指令超时自动停车（文档 13.4：500ms 未收到 → 停车）"""
+        # 修正：超时检查已移至 20Hz 定时器中，此方法保留为占位符
         while self.running:
-            if time.time() - self.last_cmd_time > self.config["cmd_timeout"]:
-                self.publish_command(0.0, 0.0, brake=True)
             time.sleep(0.1)
 
     # ------------------------------------------------------------------

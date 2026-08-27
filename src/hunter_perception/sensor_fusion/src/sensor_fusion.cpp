@@ -8,6 +8,9 @@
 #include <utility>
 #include <vector>
 
+#include <tf2/exceptions.h>
+#include <tf2_ros/transform_listener.h>
+
 namespace sensor_fusion
 {
 
@@ -27,6 +30,10 @@ SensorFusion::SensorFusion(const rclcpp::NodeOptions & options)
   last_lidar_time_(std::chrono::steady_clock::now()),
   last_vision_time_(std::chrono::steady_clock::now())
 {
+  // 修正：在 SensorFusion 构造函数中初始化 tf2
+  tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
   // 参数（文档 6.2/6.3/6.5）
   declare_parameter("lidar_topic", "/perception/lidar_objects");
   declare_parameter("vision_topic", "/perception/vision_objects");
@@ -94,6 +101,27 @@ void SensorFusion::visionCallback(
   const hunter_msgs::msg::DetectedObjectArray::SharedPtr msg)
 {
   vision_cache_ = *msg;
+
+  // 修正：必须将视觉目标从相机坐标系转换到 base_link
+  try {
+    geometry_msgs::msg::TransformStamped transform = tf_buffer_->lookupTransform(
+      "base_link", msg->header.frame_id, tf2::TimePointZero, tf2::durationFromSec(0.1));
+
+    for (auto & obj : vision_cache_.objects) {
+      geometry_msgs::msg::PoseStamped pose_in, pose_out;
+      pose_in.header = msg->header;
+      pose_in.pose = obj.pose;
+      tf2::doTransform(pose_in, pose_out, transform);
+      obj.pose = pose_out.pose;
+    }
+    // 统一替换 frame_id 为 base_link
+    vision_cache_.header.frame_id = "base_link";
+  } catch (const tf2::TransformException & ex) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      "视觉目标 TF 转换失败: %s", ex.what());
+    return; // 坐标不对齐，放弃该帧融合
+  }
+
   vision_stamp_ = msg->header.stamp;
   vision_received_ = true;
   last_vision_time_ = std::chrono::steady_clock::now();

@@ -13,45 +13,29 @@ DecisionMaking::DecisionMaking(const rclcpp::NodeOptions & options)
 : rclcpp_lifecycle::LifecycleNode("decision_making", options),
   mode_("ESTOP"),   // 初始急停，安全起见
   estop_(false),
-  cmd_vel_received_(false),
   remote_received_(false),
   chassis_received_(false)
 {
   // 参数（文档 13.5/10.5/3.1）
-  declare_parameter("cmd_vel_topic", "/cmd_vel");
   declare_parameter("remote_topic", "/remote/command");
   declare_parameter("chassis_topic", "/chassis/state");
   declare_parameter("estop_topic", "/estop");
-  declare_parameter("command_topic", "/control/command");
   declare_parameter("behavior_state_topic", "/planning/behavior_state");
-  declare_parameter("wheelbase", 0.46);        // 文档 3.1：轴距
-  declare_parameter("cmd_vel_timeout", 0.5);   // 文档 10.5：/cmd_vel 超时 500ms 停车
   declare_parameter("remote_timeout", 0.5);    // 文档 13.4：远程指令超时 500ms 停车
   declare_parameter("chassis_timeout", 0.1);   // 文档 10.5：CAN 丢失 100ms 制动
-  declare_parameter("max_velocity", 2.0);      // 文档 10.5：限速 2.0 m/s
-  declare_parameter("max_steering", 0.4);      // 文档 4.3：转向 ±0.4 rad
 }
 
 DecisionMaking::CallbackReturn
 DecisionMaking::on_configure(const rclcpp_lifecycle::State &)
 {
-  cmd_vel_topic_ = get_parameter("cmd_vel_topic").as_string();
   remote_topic_ = get_parameter("remote_topic").as_string();
   chassis_topic_ = get_parameter("chassis_topic").as_string();
   estop_topic_ = get_parameter("estop_topic").as_string();
-  command_topic_ = get_parameter("command_topic").as_string();
   behavior_state_topic_ = get_parameter("behavior_state_topic").as_string();
-  wheelbase_ = get_parameter("wheelbase").as_double();
-  cmd_vel_timeout_ = get_parameter("cmd_vel_timeout").as_double();
   remote_timeout_ = get_parameter("remote_timeout").as_double();
   chassis_timeout_ = get_parameter("chassis_timeout").as_double();
-  max_velocity_ = get_parameter("max_velocity").as_double();
-  max_steering_ = get_parameter("max_steering").as_double();
 
-  // 订阅
-  cmd_vel_sub_ = create_subscription<geometry_msgs::msg::Twist>(
-    cmd_vel_topic_, rclcpp::SensorDataQoS(),
-    std::bind(&DecisionMaking::cmdVelCallback, this, std::placeholders::_1));
+  // 订阅：只订阅所需状态，不订阅 /cmd_vel
   remote_sub_ = create_subscription<hunter_msgs::msg::ChassisCommand>(
     remote_topic_, rclcpp::SensorDataQoS(),
     std::bind(&DecisionMaking::remoteCallback, this, std::placeholders::_1));
@@ -62,29 +46,25 @@ DecisionMaking::on_configure(const rclcpp_lifecycle::State &)
     estop_topic_, rclcpp::SensorDataQoS(),
     std::bind(&DecisionMaking::estopCallback, this, std::placeholders::_1));
 
-  // 发布
-  command_pub_ =
-    create_publisher<hunter_msgs::msg::ChassisCommand>(command_topic_, 10);
+  // 发布：仅发布行为状态给 planning/control，不越权发布最终指令
   behavior_state_pub_ =
     create_publisher<hunter_msgs::msg::BehaviorState>(behavior_state_topic_, 10);
 
-  RCLCPP_INFO(get_logger(), "decision_making 已配置：限速=%.1fm/s, 转向限幅=%.2frad",
-    max_velocity_, max_steering_);
+  RCLCPP_INFO(get_logger(), "decision_making 已配置");
   return CallbackReturn::SUCCESS;
 }
 
 DecisionMaking::CallbackReturn
 DecisionMaking::on_activate(const rclcpp_lifecycle::State &)
 {
-  command_pub_->on_activate();
   behavior_state_pub_->on_activate();
 
-  // 仲裁定时器 50Hz（文档 13.5 控制频率）
+  // 仲裁定时器 10Hz（文档 17.1：/planning/behavior_state 频率）
   arbitrate_timer_ = create_wall_timer(
-    std::chrono::milliseconds(20),
+    std::chrono::milliseconds(100),
     std::bind(&DecisionMaking::arbitrate, this));
 
-  RCLCPP_INFO(get_logger(), "decision_making 已激活，模式仲裁 50Hz");
+  RCLCPP_INFO(get_logger(), "decision_making 已激活，模式仲裁 10Hz");
   return CallbackReturn::SUCCESS;
 }
 
@@ -92,7 +72,6 @@ DecisionMaking::CallbackReturn
 DecisionMaking::on_deactivate(const rclcpp_lifecycle::State &)
 {
   arbitrate_timer_.reset();
-  command_pub_->on_deactivate();
   behavior_state_pub_->on_deactivate();
   return CallbackReturn::SUCCESS;
 }
@@ -100,11 +79,9 @@ DecisionMaking::on_deactivate(const rclcpp_lifecycle::State &)
 DecisionMaking::CallbackReturn
 DecisionMaking::on_cleanup(const rclcpp_lifecycle::State &)
 {
-  cmd_vel_sub_.reset();
   remote_sub_.reset();
   chassis_sub_.reset();
   estop_sub_.reset();
-  command_pub_.reset();
   behavior_state_pub_.reset();
   return CallbackReturn::SUCCESS;
 }
@@ -114,13 +91,6 @@ DecisionMaking::on_shutdown(const rclcpp_lifecycle::State &)
 {
   arbitrate_timer_.reset();
   return CallbackReturn::SUCCESS;
-}
-
-void DecisionMaking::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
-{
-  cmd_vel_ = *msg;
-  cmd_vel_stamp_ = this->now();
-  cmd_vel_received_ = true;
 }
 
 void DecisionMaking::remoteCallback(
@@ -149,8 +119,6 @@ void DecisionMaking::arbitrate()
   const rclcpp::Time now = this->now();
 
   // 超时判断
-  const bool cmd_vel_stale =
-    !cmd_vel_received_ || (now - cmd_vel_stamp_).seconds() > cmd_vel_timeout_;
   const bool remote_stale =
     !remote_received_ || (now - remote_stamp_).seconds() > remote_timeout_;
   const bool chassis_stale =
@@ -177,47 +145,8 @@ void DecisionMaking::arbitrate()
   }
   mode_ = new_mode;
 
-  // 输出最终 ChassisCommand（文档 4.3.3）
-  hunter_msgs::msg::ChassisCommand cmd;
-  cmd.header.stamp = now;
-  cmd.header.frame_id = "base_link";
-
-  if (mode_ == "ESTOP") {
-    // 急停：零速度 + 紧急制动标志（文档 16.2）
-    cmd.target_velocity = 0.0;
-    cmd.target_steering = 0.0;
-    cmd.control_mode = "ESTOP";
-    cmd.emergency_stop = true;
-  } else if (mode_ == "REMOTE") {
-    // 远程：转发远程指令（限幅，文档 13.4）
-    cmd.target_velocity = static_cast<float>(
-      std::clamp(remote_cmd_.target_velocity, -max_velocity_, max_velocity_));
-    cmd.target_steering = static_cast<float>(
-      std::clamp(remote_cmd_.target_steering, -max_steering_, max_steering_));
-    cmd.control_mode = "REMOTE";
-    cmd.emergency_stop = remote_cmd_.emergency_stop;
-  } else {
-    // AUTO：Nav2 /cmd_vel（Twist）→ 阿克曼转向角
-    if (cmd_vel_stale) {
-      // Nav2 指令超时，自动停车（文档 10.5）
-      cmd.target_velocity = 0.0;
-      cmd.target_steering = 0.0;
-    } else {
-      const double v = cmd_vel_.linear.x;
-      const double w = cmd_vel_.angular.z;
-      // 阿克曼转向角 δ = atan2(L*ω, v)，L=轴距 0.46m（文档 11.4）
-      const double steering = std::atan2(wheelbase_ * w, v);
-      cmd.target_velocity = static_cast<float>(
-        std::clamp(v, -max_velocity_, max_velocity_));
-      cmd.target_steering = static_cast<float>(
-        std::clamp(steering, -max_steering_, max_steering_));
-    }
-    cmd.control_mode = "CAN";
-    cmd.emergency_stop = false;
-  }
-  command_pub_->publish(cmd);
-
-  // 发布行为状态（文档 17.1：/planning/behavior_state）
+  // 修正：不再组装和发布 ChassisCommand 到 /control/command
+  // 而是仅输出当前 BehaviorState 供下游规划/控制模块消费执行停车或避障逻辑
   hunter_msgs::msg::BehaviorState state;
   state.header.stamp = now;
   state.mode = mode_;

@@ -8,6 +8,4 @@ float32 battery_temperature   # 电池温度 ℃
 string control_mode           # CAN/REMOTE/ESTOP
 string vehicle_state          # NORMAL/FAULT/ESTOP
 uint32 fault_code
-float32[] motor_rpm           # 电机转速
-float32[] motor_current       # 电机电流
 float32[] motor_temperature   # 电机温度

@@ -84,6 +84,10 @@ private:
   double timeout_;
   int outlier_mean_k_;
   double outlier_std_dev_;
+  // 修正：新增参数，替代硬编码值
+  double scan_period_;        // 扫描周期
+  double marker_lifetime_;    // 可视化标记生命周期
+  double marker_alpha_;       // 可视化标记透明度
 
   // 订阅/发布
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;

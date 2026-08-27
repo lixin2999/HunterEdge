@@ -40,6 +40,10 @@ LidarPerception::LidarPerception(const rclcpp::NodeOptions & options)
   declare_parameter("timeout", 0.3);
   declare_parameter("outlier_mean_k", 10);
   declare_parameter("outlier_std_dev", 1.0);
+  // 修正：将硬编码参数提取为可配置参数
+  declare_parameter("scan_period", 0.1);        // 扫描周期，默认 0.1s (10Hz)
+  declare_parameter("marker_lifetime", 0.2);    // 可视化标记生命周期，默认 0.2s
+  declare_parameter("marker_alpha", 0.7);       // 可视化标记透明度，默认 0.7
 }
 
 LidarPerception::CallbackReturn
@@ -60,6 +64,10 @@ LidarPerception::on_configure(const rclcpp_lifecycle::State &)
   timeout_ = get_parameter("timeout").as_double();
   outlier_mean_k_ = static_cast<int>(get_parameter("outlier_mean_k").as_int());
   outlier_std_dev_ = get_parameter("outlier_std_dev").as_double();
+  // 修正：读取新增的参数
+  scan_period_ = get_parameter("scan_period").as_double();
+  marker_lifetime_ = get_parameter("marker_lifetime").as_double();
+  marker_alpha_ = get_parameter("marker_alpha").as_double();
 
   ground_filter_ = RayGroundFilter(ground_height_threshold_, ground_ray_resolution_deg_);
   tracker_ = MultiObjectTracker(association_distance_);
@@ -248,7 +256,8 @@ void LidarPerception::deskew(
   }
   // 简化运动去畸变：基于 IMU 横摆角速度（z）的旋转补偿
   const double wz = imu_queue_.back().ang_vel_z;
-  constexpr double kScanPeriod = 0.1;  // 10Hz 帧周期
+  // 修正：使用参数 scan_period_ 替代硬编码的 kScanPeriod
+  const double scan_period = scan_period_;
   out->clear();
   out->header = in->header;
   out->reserve(in->size());
@@ -256,7 +265,7 @@ void LidarPerception::deskew(
   for (const auto & p : in->points) {
     const double angle = std::atan2(p.y, p.x);  // [-pi, pi]
     // 机械雷达：角度 -pi..pi 对应扫描周期内 0..scan_period
-    const double t = (angle + M_PI) / (2.0 * M_PI) * kScanPeriod;
+    const double t = (angle + M_PI) / (2.0 * M_PI) * scan_period;
     const double rot = -wz * t;  // 反向补偿
     const double c = std::cos(rot);
     const double s = std::sin(rot);
@@ -370,11 +379,14 @@ void LidarPerception::extractClusters(
     m.scale.x = std::max(d.length, 0.1f);
     m.scale.y = std::max(d.width, 0.1f);
     m.scale.z = std::max(d.height, 0.1f);
-    m.color.a = 0.6f;
+    // 修正：使用参数 marker_alpha_ 替代硬编码的透明度
+    m.color.a = static_cast<float>(marker_alpha_);
     m.color.r = 1.0f;
     m.color.g = 0.0f;
     m.color.b = 0.0f;
-    m.lifetime = rclcpp::Duration(0, 200000000);  // 0.2s
+    // 修正：使用参数 marker_lifetime_ 替代硬编码的生命周期
+    const int64_t lifetime_ns = static_cast<int64_t>(marker_lifetime_ * 1e9);
+    m.lifetime = rclcpp::Duration(0, lifetime_ns);
     markers.markers.push_back(m);
   }
 }
@@ -404,7 +416,7 @@ void LidarPerception::publishObjects(
     obj.dimensions.z = t.last_det.height;
     obj.velocity.linear.x = t.vx;
     obj.velocity.linear.y = t.vy;
-    obj.tracking_age = static_cast<float>(t.age) * 0.1f;  // 帧数 × 0.1s 帧周期
+    obj.tracking_age = static_cast<float>(t.age) * static_cast<float>(scan_period_);  // 帧数 × 扫描周期
     arr.objects.push_back(obj);
   }
 

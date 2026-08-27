@@ -22,3 +22,7 @@ lidar_perception:
     # 离群点去除（StatisticalOutlierRemoval）
     outlier_mean_k: 10
     outlier_std_dev: 1.0
+    # 修正：新增参数，替代硬编码值
+    scan_period: 0.1        # 扫描周期（秒，对应 10Hz）
+    marker_lifetime: 0.2    # 可视化标记生命周期（秒）
+    marker_alpha: 0.7       # 可视化标记透明度
