@@ -25,10 +25,10 @@ __pycache__/
 *.a
 
 #文档
-*.md
+release.md
+User_Manual.md
 *.docx
 *.pdf
-*.txt
 
 #编码规则
 *.cursorrules

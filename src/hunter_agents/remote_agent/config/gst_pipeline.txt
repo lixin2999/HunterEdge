@@ -1,0 +1,11 @@
+# GStreamer AGX 硬件 H264 编码流水线（文档 13.2.2）
+# D435 RGB 1280x720@30fps → nvvidconv(硬件转换) → nvv4l2h264enc(硬件编码) → rtph264pay → udpsink(SRS)
+# 编码参数：bitrate=3000000(3Mbps CBR), iframeinterval=30(1秒1关键帧), control-rate=1
+# 编码延迟：< 50ms（硬件编码）
+
+v4l2src device=/dev/video0 ! \
+  video/x-raw,width=1280,height=720,framerate=30/1 ! \
+  videoconvert ! nvvidconv ! 'video/x-raw(memory:NVMM),format=NV12' ! \
+  nvv4l2h264enc bitrate=3000000 iframeinterval=30 control-rate=1 profile=4 preset-level=1 ! \
+  h264parse ! rtph264pay config-interval=1 pt=96 ! \
+  udpsink host=127.0.0.1 port=8000
