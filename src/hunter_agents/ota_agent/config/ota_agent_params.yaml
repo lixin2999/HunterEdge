@@ -1,0 +1,7 @@
+# OTA Agent parameters
+ota_agent:
+  ros__parameters:
+    upgrade_check_interval: 3600  # seconds
+    max_download_size: 1000000000  # bytes
+    upgrade_server_url: "https://upgrade.platform.example.com"
+    upgrade_timeout: 300  # seconds

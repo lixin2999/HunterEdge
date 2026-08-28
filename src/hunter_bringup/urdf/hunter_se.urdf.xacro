@@ -14,11 +14,11 @@
   <xacro:property name="length" value="0.82"/>          <!-- 车长 m -->
   <xacro:property name="width" value="0.64"/>           <!-- 车宽 m -->
   <xacro:property name="height" value="0.31"/>          <!-- 车高 m -->
-  <xacro:property name="wheelbase" value="0.46"/>       <!-- 轴距 m -->
+  <xacro:property name="wheelbase" value="0.55"/>       <!-- 轴距 m -->
   <xacro:property name="front_overhang" value="0.45"/>  <!-- 前悬 m -->
   <xacro:property name="rear_overhang" value="0.37"/>   <!-- 后悬 m -->
   <xacro:property name="half_width" value="0.32"/>      <!-- 半宽 m -->
-  <xacro:property name="ground_clearance" value="0.15"/> <!-- base_link 距地面 m -->
+  <xacro:property name="ground_clearance" value="0.12"/> <!-- base_link 距地面 m -->
 
   <!-- Footprint（文档 9.3，矩形，原点在后轴中心，含安全余量）：
        [ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]
@@ -37,7 +37,7 @@
   <xacro:property name="imu_y" value="0.0"/>
   <xacro:property name="imu_z" value="0.20"/>
 
-  <!-- ========== base_link（后轴中心，X前/Y左/Z上，距地面 150mm） ========== -->
+  <!-- ========== base_link（后轴中心，X前/Y左/Z上，距地面 120mm） ========== -->
   <link name="base_link">
     <visual>
       <geometry>

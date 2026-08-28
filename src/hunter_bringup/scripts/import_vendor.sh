@@ -32,6 +32,7 @@ if [ -d "$WS_SRC/rslidar_sdk/.git" ]; then
   log "  已存在: rslidar_sdk"
 else
   git clone https://github.com/RoboSense-LiDAR/rslidar_sdk.git "$WS_SRC/rslidar_sdk"
+  git clone https://github.com/RoboSense-LiDAR/rs_driver.git "$WS_SRC/rslidar_sdk/src/rs_driver"
 fi
 
 # ============ Intel RealSense（realsense-ros） ============
@@ -48,7 +49,8 @@ if [ -d "$WS_SRC/fast_lio2/.git" ]; then
   log "  已存在: fast_lio2"
 else
   # ROS2 版本（若仓库默认分支为 ROS1，可改用 -b ros2 分支）
-  git clone https://github.com/hku-mars/FAST_LIO.git "$WS_SRC/fast_lio2"
+  git clone -b ROS2 https://github.com/hku-mars/FAST_LIO.git "$WS_SRC/fast_lio2"
+  git clone https://github.com/Livox-SDK/livox_ros_driver2.git "$WS_SRC/livox_ros_driver2"
 fi
 
 # ============ robot_localization（EKF 传感器融合） ============

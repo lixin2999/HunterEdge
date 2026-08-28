@@ -1,0 +1,14 @@
+# Remote Agent parameters
+remote_agent:
+  ros__parameters:
+    vehicle_id: "hunter_001"
+    camera_device: "/dev/video0"
+    bitrate: 3000000
+    srs_host: "127.0.0.1"
+    srs_rtp_port: 8000
+    ws_url: "wss://platform.example.com/ws/remote"
+    cmd_topic: "/remote/command"
+    kafka_brokers: "platform.example.com:9093"
+    max_velocity: 2.0
+    max_steering: 0.4
+    cmd_timeout: 0.5
