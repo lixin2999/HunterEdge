@@ -56,10 +56,13 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   telemetry_topic_ = "hunter." + vehicle_id_ + ".telemetry";
   event_topic_ = "hunter." + vehicle_id_ + ".event";
 
-  // 订阅（文档 14.2.1）
+  // 订阅（文档 14.2.1：/chassis/state 10Hz + /chassis/feedback 50Hz→10Hz）
   chassis_sub_ = create_subscription<hunter_msgs::msg::ChassisState>(
     "/chassis/state", rclcpp::SensorDataQoS(),
     std::bind(&DataAgent::chassisCallback, this, std::placeholders::_1));
+  chassis_feedback_sub_ = create_subscription<hunter_msgs::msg::ChassisState>(
+    "/chassis/feedback", rclcpp::SensorDataQoS(),
+    std::bind(&DataAgent::chassisFeedbackCallback, this, std::placeholders::_1));
   localization_sub_ = create_subscription<nav_msgs::msg::Odometry>(
     "/localization/odom", rclcpp::SensorDataQoS(),
     std::bind(&DataAgent::localizationCallback, this, std::placeholders::_1));
@@ -109,6 +112,12 @@ void DataAgent::chassisCallback(const hunter_msgs::msg::ChassisState::SharedPtr 
 {
   chassis_ = *msg;
   chassis_received_ = true;
+}
+
+void DataAgent::chassisFeedbackCallback(const hunter_msgs::msg::ChassisState::SharedPtr msg)
+{
+  chassis_feedback_ = *msg;
+  chassis_feedback_received_ = true;
 }
 
 void DataAgent::localizationCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -172,6 +181,10 @@ std::string DataAgent::buildTelemetryJson()
     oss << ",\"battery_soc\":" << chassis_.battery_soc;
     oss << ",\"control_mode\":\"" << chassis_.control_mode << "\"";
     oss << ",\"vehicle_state\":\"" << chassis_.vehicle_state << "\"";
+  }
+  if (chassis_feedback_received_) {
+    oss << ",\"fb_velocity\":" << chassis_feedback_.velocity;
+    oss << ",\"fb_steering\":" << chassis_feedback_.steering_angle;
   }
   if (localization_received_) {
     oss << ",\"pose_x\":" << localization_.pose.pose.position.x;

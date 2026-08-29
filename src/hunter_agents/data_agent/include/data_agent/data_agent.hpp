@@ -30,6 +30,7 @@ public:
 private:
   // 遥测回调（文档 14.2.1）
   void chassisCallback(const hunter_msgs::msg::ChassisState::SharedPtr msg);
+  void chassisFeedbackCallback(const hunter_msgs::msg::ChassisState::SharedPtr msg);
   void localizationCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
   void fusedObjectsCallback(const hunter_msgs::msg::DetectedObjectArray::SharedPtr msg);
   void trajectoryCallback(const hunter_msgs::msg::Trajectory::SharedPtr msg);
@@ -77,6 +78,7 @@ private:
 
   // 订阅
   rclcpp::Subscription<hunter_msgs::msg::ChassisState>::SharedPtr chassis_sub_;
+  rclcpp::Subscription<hunter_msgs::msg::ChassisState>::SharedPtr chassis_feedback_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr localization_sub_;
   rclcpp::Subscription<hunter_msgs::msg::DetectedObjectArray>::SharedPtr fused_sub_;
   rclcpp::Subscription<hunter_msgs::msg::Trajectory>::SharedPtr trajectory_sub_;
@@ -89,11 +91,13 @@ private:
 
   // 遥测缓存（最新值）
   hunter_msgs::msg::ChassisState chassis_;
+  hunter_msgs::msg::ChassisState chassis_feedback_;
   nav_msgs::msg::Odometry localization_;
   hunter_msgs::msg::ChassisCommand control_;
   hunter_msgs::msg::SystemHealth health_;
   int fused_object_count_;
   bool chassis_received_;
+  bool chassis_feedback_received_;
   bool localization_received_;
   bool control_received_;
   bool health_received_;

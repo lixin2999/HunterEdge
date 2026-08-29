@@ -353,8 +353,13 @@ void SensorFusion::buildFreespace(
   grid.info.origin.position.z = 0.0;
   grid.info.origin.orientation.w = 1.0;
 
-  // 初始化：自由空间 0（文档 6.5）
-  grid.data.assign(static_cast<size_t>(width) * height, 0);
+  // 初始化：未知 -1，再按车前已知范围标记自由 0（文档 6.5：占用100/自由0/未知-1）
+  grid.data.assign(static_cast<size_t>(width) * height, -1);
+  for (int gy = 0; gy < height; ++gy) {
+    for (int gx = 0; gx < width; ++gx) {
+      grid.data[static_cast<size_t>(gy) * width + gx] = 0;
+    }
+  }
 
   // 障碍物标记为占用 100，并向外膨胀（文档 6.5：0.3m 安全余量）
   const double y_off = freespace_width_ / 2.0;
