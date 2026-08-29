@@ -184,6 +184,7 @@ git clone -b humble https://github.com/agilexrobotics/hunter_ros2.git
 sudo apt install -y ros-humble-navigation2 ros-humble-nav2-bringup
 sudo apt install -y ros-humble-robot-localization
 sudo apt install -y ros-humble-realsense2-camera
+sudo apt install -y librdkafka-dev libsqlite3-dev   # data_agent（Kafka + SQLite 缓存）
 ```
 
 以下包需源码编译（vendor 源码）：
