@@ -157,7 +157,10 @@
 
 ## 5. 依赖安装
 
-在 Ubuntu 车载环境执行 `./src/hunter_bringup/scripts/import_vendor.sh`，自动 git clone 全部第三方包；
+在 Ubuntu 车载环境执行 `bash ./src/hunter_bringup/scripts/import_vendor.sh`，自动 git clone 全部第三方包。脚本会自动：
+
+- **Nav2 跳过**：检测环境中是否已 apt 安装 `ros-humble-navigation2`，若已装则跳过 `navigation2` 源码编译（避免与二进制包同名冲突）；
+- **yolo_trt_ros 去重**：仅保留 `src/jetson` 子包，其余同名 ROS 包自动禁用（重命名 `package.xml`）。
 
 ### 5.1 AgileX 底盘驱动（设计文档 §11.6）
 
@@ -187,7 +190,8 @@ sudo apt install -y ros-humble-realsense2-camera
 
 ```bash
 cd ~/HunterEdge/src
-git clone https://github.com/RoboSense-LiDAR/rslidar_sdk.git   # LiDAR 驱动
+git clone https://github.com/RoboSense-LiDAR/rslidar_sdk.git                 # LiDAR 驱动
+git clone https://github.com/wyf-yfw/TensorRT_YOLO_ROS2.git yolo_trt_ros     # YOLO TensorRT（可选，仅保留 src/jetson）
 ```
 
 > ⚠️ **【运维视角】** 上述第三方仓库地址/分支以各项目官方文档为准；`ugv_sdk`、`hunter_ros2` 安装见 §5.1（源自设计文档 §11.6）。`navigation2`、`robot_localization`、`realsense2_camera` 建议用上文 `apt` 安装。

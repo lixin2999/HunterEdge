@@ -62,11 +62,16 @@ else
 fi
 
 # ============ navigation2（Nav2 导航栈） ============
-log "导入 navigation2..."
-if [ -d "$WS_SRC/navigation2/.git" ]; then
-  log "  已存在: navigation2"
+# 若环境中已通过 apt 安装 Nav2，则跳过源码导入/编译（避免与二进制包同名冲突）
+if dpkg -s ros-humble-navigation2 >/dev/null 2>&1 || ros2 pkg prefix navigation2 >/dev/null 2>&1; then
+  log "检测到 apt 已安装 Nav2，跳过 navigation2 源码导入/编译"
 else
-  git clone -b humble https://github.com/ros-navigation/navigation2.git "$WS_SRC/navigation2"
+  log "导入 navigation2..."
+  if [ -d "$WS_SRC/navigation2/.git" ]; then
+    log "  已存在: navigation2"
+  else
+    git clone -b humble https://github.com/ros-navigation/navigation2.git "$WS_SRC/navigation2"
+  fi
 fi
 
 # ============ yolo_trt_ros（YOLO TensorRT 推理） ============
@@ -75,7 +80,21 @@ if [ -d "$WS_SRC/yolo_trt_ros/.git" ]; then
   log "  已存在: yolo_trt_ros"
 else
   # 根据实际仓库地址调整（本行失败不影响整体导入）
-  git clone https://github.com/linClubs/YOLOv8-ROS-TensorRT.git "$WS_SRC/yolo_trt_ros"
+  git clone https://github.com/wyf-yfw/TensorRT_YOLO_ROS2.git "$WS_SRC/yolo_trt_ros"
+fi
+
+# 处理：仓库含多套同名 ROS 包，仅保留 src/jetson 一套，其余 package.xml 重命名移出 colcon 扫描
+if [ -d "$WS_SRC/yolo_trt_ros" ]; then
+  log "yolo_trt_ros：仅保留 src/jetson 子包，禁用其余同名包"
+  find "$WS_SRC/yolo_trt_ros" -name package.xml | while read -r f; do
+    case "$f" in
+      *src/jetson*) ;;   # 保留 src/jetson 下的 package.xml
+      *)
+        mv "$f" "$f.disabled"
+        log "  已禁用: ${f#$WS_SRC/yolo_trt_ros/}"
+        ;;
+    esac
+  done
 fi
 
 log "第三方依赖包导入完成"
