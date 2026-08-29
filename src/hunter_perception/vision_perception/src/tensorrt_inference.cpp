@@ -4,6 +4,9 @@
 
 #include <cuda_runtime.h>
 
+#include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudawarping.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -78,10 +81,14 @@ bool TensorRTInference::infer(const cv::Mat & image, std::vector<BBox2D> & boxes
     return false;
   }
 
-  // 预处理（CPU：resize + BGR→RGB + 归一化 + HWC→CHW）
-  cv::Mat resized, rgb;
-  cv::resize(image, resized, cv::Size(input_w_, input_h_));
-  cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
+  // 预处理（OpenCV CUDA 硬件加速：resize + BGR→RGB，文档 5.2.3）
+  cv::Mat rgb;
+  {
+    cv::cuda::GpuMat gpu_in(image), gpu_resized, gpu_rgb;
+    cv::cuda::resize(gpu_in, gpu_resized, cv::Size(input_w_, input_h_));
+    cv::cuda::cvtColor(gpu_resized, gpu_rgb, cv::COLOR_BGR2RGB);
+    gpu_rgb.download(rgb);
+  }
   rgb.convertTo(rgb, CV_32FC3, 1.0f / 255.0f);
 
   const int h = input_h_;

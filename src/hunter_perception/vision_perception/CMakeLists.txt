@@ -9,6 +9,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(hunter_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -29,6 +30,7 @@ ament_target_dependencies(vision_perception_node
   rclcpp
   rclcpp_lifecycle
   sensor_msgs
+  nav_msgs
   cv_bridge
   hunter_msgs
 )

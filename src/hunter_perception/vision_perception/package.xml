@@ -13,6 +13,7 @@
   <depend>rclcpp_lifecycle</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>cv_bridge</depend>
   <depend>image_transport</depend>
   <depend>hunter_msgs</depend>

@@ -11,6 +11,7 @@
 #include "vision_perception/tensorrt_inference.hpp"
 
 #include "hunter_msgs/msg/detected_object_array.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "sensor_msgs/msg/image.hpp"
@@ -52,9 +53,12 @@ private:
   bool projectTo3D(const BBox2D & box, const cv::Mat & depth, Detection3D & det);
   void publishObjects(
     const std::vector<Detection3D> & dets, const rclcpp::Time & stamp);
+  // 构建可行驶区域（文档 5.2.1 输出 /perception/freespace）
+  void buildFreespace(
+    const std::vector<Detection3D> & dets, nav_msgs::msg::OccupancyGrid & grid);
 
   // 参数
-  std::string color_topic_, depth_topic_, target_frame_;
+  std::string color_topic_, depth_topic_, target_frame_, freespace_topic_;
   std::string engine_path_;
   int input_width_, input_height_;
   float conf_threshold_, nms_threshold_;
@@ -62,12 +66,18 @@ private:
   double publish_rate_;               // 输出频率（默认 15Hz）
   double timeout_;                    // 图像超时阈值
   double min_depth_, max_depth_;      // 深度有效范围
+  double freespace_resolution_;       // 可行驶区域分辨率（文档 6.5：0.2m）
+  double freespace_length_;           // 车前长度（40m）
+  double freespace_width_;            // 总宽度（左右各 15m）
+  double free_depth_;                 // 可行驶深度阈值（m）
 
   // 订阅/发布
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr color_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
   rclcpp_lifecycle::LifecyclePublisher<hunter_msgs::msg::DetectedObjectArray>::SharedPtr
     objects_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::OccupancyGrid>::SharedPtr
+    freespace_pub_;
   rclcpp::TimerBase::SharedPtr timeout_timer_;
 
   // 推理

@@ -48,6 +48,11 @@ VisionPerception::VisionPerception(const rclcpp::NodeOptions & options)
   declare_parameter("timeout", 0.5);
   declare_parameter("min_depth", 0.1);
   declare_parameter("max_depth", 10.0);
+  declare_parameter("freespace_topic", "/perception/vision_freespace");
+  declare_parameter("freespace_resolution", 0.2);
+  declare_parameter("freespace_length", 40.0);
+  declare_parameter("freespace_width", 30.0);
+  declare_parameter("free_depth", 5.0);
 }
 
 VisionPerception::CallbackReturn
@@ -69,6 +74,11 @@ VisionPerception::on_configure(const rclcpp_lifecycle::State &)
   timeout_ = get_parameter("timeout").as_double();
   min_depth_ = get_parameter("min_depth").as_double();
   max_depth_ = get_parameter("max_depth").as_double();
+  freespace_topic_ = get_parameter("freespace_topic").as_string();
+  freespace_resolution_ = get_parameter("freespace_resolution").as_double();
+  freespace_length_ = get_parameter("freespace_length").as_double();
+  freespace_width_ = get_parameter("freespace_width").as_double();
+  free_depth_ = get_parameter("free_depth").as_double();
 
   trt_.setThresholds(conf_threshold_, nms_threshold_);
 
@@ -80,6 +90,8 @@ VisionPerception::on_configure(const rclcpp_lifecycle::State &)
 
   objects_pub_ =
     create_publisher<hunter_msgs::msg::DetectedObjectArray>("/perception/vision_objects", 10);
+  freespace_pub_ =
+    create_publisher<nav_msgs::msg::OccupancyGrid>(freespace_topic_, 10);
 
   color_sub_ = create_subscription<sensor_msgs::msg::Image>(
     color_topic_, rclcpp::SensorDataQoS(),
@@ -97,6 +109,7 @@ VisionPerception::CallbackReturn
 VisionPerception::on_activate(const rclcpp_lifecycle::State &)
 {
   objects_pub_->on_activate();
+  freespace_pub_->on_activate();
   timeout_timer_ = create_wall_timer(
     std::chrono::milliseconds(1000),
     std::bind(&VisionPerception::checkTimeout, this));
@@ -109,6 +122,7 @@ VisionPerception::on_deactivate(const rclcpp_lifecycle::State &)
 {
   timeout_timer_.reset();
   objects_pub_->on_deactivate();
+  freespace_pub_->on_deactivate();
   return CallbackReturn::SUCCESS;
 }
 
@@ -118,6 +132,7 @@ VisionPerception::on_cleanup(const rclcpp_lifecycle::State &)
   color_sub_.reset();
   depth_sub_.reset();
   objects_pub_.reset();
+  freespace_pub_.reset();
   return CallbackReturn::SUCCESS;
 }
 
@@ -200,6 +215,13 @@ void VisionPerception::colorCallback(const sensor_msgs::msg::Image::SharedPtr ms
 
   // 5. 发布结果
   publishObjects(dets, msg->header.stamp);
+
+  // 6. 发布视觉可行驶区域（文档 5.2.1 输出 freespace）
+  nav_msgs::msg::OccupancyGrid grid;
+  buildFreespace(dets, grid);
+  grid.header.stamp = msg->header.stamp;
+  freespace_pub_->publish(grid);
+
   last_publish_time_ = now;
 }
 
@@ -263,6 +285,47 @@ void VisionPerception::publishObjects(
   }
 
   objects_pub_->publish(arr);
+}
+
+void VisionPerception::buildFreespace(
+  const std::vector<Detection3D> & dets, nav_msgs::msg::OccupancyGrid & grid)
+{
+  // 视觉可行驶区域（光学坐标系：Z前/X右），车前 z∈[0,length]，左右 x∈[-width/2, width/2]
+  const int width = static_cast<int>(freespace_length_ / freespace_resolution_);
+  const int height = static_cast<int>(freespace_width_ / freespace_resolution_);
+
+  grid.header.frame_id = target_frame_;  // camera_color_optical_frame
+  grid.info.resolution = freespace_resolution_;
+  grid.info.width = width;
+  grid.info.height = height;
+  grid.info.origin.position.x = -freespace_width_ / 2.0;
+  grid.info.origin.position.y = 0.0;
+  grid.info.origin.position.z = 0.0;
+  grid.info.origin.orientation.w = 1.0;
+
+  // 初始化：自由空间 0（文档 6.5）
+  grid.data.assign(static_cast<size_t>(width) * height, 0);
+
+  // 检测目标投影为占用 100（膨胀由参数 free_depth 示意，此处以目标包围盒标记）
+  for (const auto & det : dets) {
+    if (det.z <= 0.0f || det.z > free_depth_) {
+      continue;
+    }
+    const double half_l = det.length / 2.0;
+    const double half_w = det.width / 2.0;
+    const int gz_min = std::max(0, static_cast<int>((det.z - half_l) / freespace_resolution_));
+    const int gz_max =
+      std::min(width - 1, static_cast<int>((det.z + half_l) / freespace_resolution_));
+    const int gx_min = std::max(0, static_cast<int>(
+      (det.x - half_w + freespace_width_ / 2.0) / freespace_resolution_));
+    const int gx_max = std::min(height - 1, static_cast<int>(
+      (det.x + half_w + freespace_width_ / 2.0) / freespace_resolution_));
+    for (int gx = gx_min; gx <= gx_max; ++gx) {
+      for (int gz = gz_min; gz <= gz_max; ++gz) {
+        grid.data[static_cast<size_t>(gx) * width + gz] = 100;
+      }
+    }
+  }
 }
 
 }  // namespace vision_perception
