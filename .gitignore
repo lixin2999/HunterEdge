@@ -32,6 +32,7 @@ User_Manual.md
 
 #编码规则
 *.cursorrules
+*.ai‑rules.md
 
 #第三方依赖包文件夹
 fast_lio2/
@@ -43,3 +44,4 @@ robot_localization/
 YOLOv8-ROS-TensorRT/
 yolo_trt_ros/
 ugv_sdk/
+livox_ros_driver2/

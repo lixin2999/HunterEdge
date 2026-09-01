@@ -26,6 +26,13 @@ else
   git clone -b humble https://github.com/agilexrobotics/hunter_ros2.git "$WS_SRC/hunter_ros2"
 fi
 
+# hunter_ros2 自带 hunter_msgs，与 hunter_common/hunter_msgs 同名。
+# 5 条底盘消息已并入自定义包；跳过 vendor 包，避免 colcon Duplicate package names。
+if [ -d "$WS_SRC/hunter_ros2/hunter_msgs" ]; then
+  touch "$WS_SRC/hunter_ros2/hunter_msgs/COLCON_IGNORE"
+  log "  已忽略重复包: hunter_ros2/hunter_msgs"
+fi
+
 # ============ RoboSense LiDAR（rslidar_sdk） ============
 log "导入 rslidar_sdk..."
 if [ -d "$WS_SRC/rslidar_sdk/.git" ]; then
