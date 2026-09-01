@@ -57,6 +57,9 @@ if [ -d "$WS_SRC/fast_lio2/.git" ]; then
 else
   # ROS2 版本（若仓库默认分支为 ROS1，可改用 -b ros2 分支）
   git clone -b ROS2 https://github.com/hku-mars/FAST_LIO.git "$WS_SRC/fast_lio2"
+  # 递归拉取 ikd-Tree 子模块（ikd_Tree.cpp 编译必须）
+  git -C "$WS_SRC/fast_lio2" submodule update --init --recursive
+  log "  已初始化子模块: fast_lio2/include/ikd-Tree"
   git clone https://github.com/Livox-SDK/livox_ros_driver2.git "$WS_SRC/livox_ros_driver2"
   # 当前部署无 Livox 雷达，无需编译 livox_ros_driver2；
   # clone 后立即打 COLCON_IGNORE，colcon 扫描时跳过该包。
