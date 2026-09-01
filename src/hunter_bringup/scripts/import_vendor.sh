@@ -60,6 +60,38 @@ else
   git clone https://github.com/Livox-SDK/livox_ros_driver2.git "$WS_SRC/livox_ros_driver2"
 fi
 
+# 1. livox_ros_driver2 仅作为 fast_lio2 的头文件依赖，不作为独立 ROS2 包参与 colcon 构建。
+#    touch COLCON_IGNORE 让 colcon 扫描时直接跳过该目录（幂等：重跑也会补上）。
+touch "$WS_SRC/livox_ros_driver2/COLCON_IGNORE"
+log "  已设置: livox_ros_driver2/COLCON_IGNORE（colcon 构建时跳过该包）"
+
+# livox_ros_driver2 不携带 package.xml（ROS1/ROS2 分开存放），colcon 构建时需要 package.xml。
+# 将 package_ROS2.xml 的内容复制为 package.xml（幂等：已存在则跳过）。
+if [ ! -f "$WS_SRC/livox_ros_driver2/package.xml" ]; then
+  cp "$WS_SRC/livox_ros_driver2/package_ROS2.xml" "$WS_SRC/livox_ros_driver2/package.xml"
+  log "  已创建: livox_ros_driver2/package.xml（来源: package_ROS2.xml）"
+else
+  log "  已存在: livox_ros_driver2/package.xml，跳过"
+fi
+
+# 2. fast_lio2/CMakeLists.txt：移除 find_package(livox_ros_driver2 REQUIRED)
+#    以及 dependencies 列表中的 livox_ros_driver2（幂等：不存在时 sed 静默跳过）。
+FAST_LIO_CMAKE="$WS_SRC/fast_lio2/CMakeLists.txt"
+if [ -f "$FAST_LIO_CMAKE" ]; then
+  # 删除整行 find_package(livox_ros_driver2 ...)
+  sed -i '/find_package(livox_ros_driver2[[:space:]]/d' "$FAST_LIO_CMAKE"
+  # 删除 dependencies 列表中的 livox_ros_driver2 条目行
+  sed -i '/^[[:space:]]*livox_ros_driver2[[:space:]]*$/d' "$FAST_LIO_CMAKE"
+  log "  已处理: fast_lio2/CMakeLists.txt（移除 livox_ros_driver2 依赖）"
+fi
+
+# 3. fast_lio2/package.xml：移除 <depend>livox_ros_driver2</depend>（幂等）。
+FAST_LIO_PKG="$WS_SRC/fast_lio2/package.xml"
+if [ -f "$FAST_LIO_PKG" ]; then
+  sed -i '/<depend>livox_ros_driver2<\/depend>/d' "$FAST_LIO_PKG"
+  log "  已处理: fast_lio2/package.xml（移除 livox_ros_driver2 依赖）"
+fi
+
 # ============ robot_localization（EKF 传感器融合） ============
 log "导入 robot_localization..."
 if [ -d "$WS_SRC/robot_localization/.git" ]; then
