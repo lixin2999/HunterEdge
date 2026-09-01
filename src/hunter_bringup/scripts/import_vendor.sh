@@ -60,11 +60,6 @@ else
   git clone https://github.com/Livox-SDK/livox_ros_driver2.git "$WS_SRC/livox_ros_driver2"
 fi
 
-# 1. livox_ros_driver2 仅作为 fast_lio2 的头文件依赖，不作为独立 ROS2 包参与 colcon 构建。
-#    touch COLCON_IGNORE 让 colcon 扫描时直接跳过该目录（幂等：重跑也会补上）。
-touch "$WS_SRC/livox_ros_driver2/COLCON_IGNORE"
-log "  已设置: livox_ros_driver2/COLCON_IGNORE（colcon 构建时跳过该包）"
-
 # livox_ros_driver2 不携带 package.xml（ROS1/ROS2 分开存放），colcon 构建时需要 package.xml。
 # 将 package_ROS2.xml 的内容复制为 package.xml（幂等：已存在则跳过）。
 if [ ! -f "$WS_SRC/livox_ros_driver2/package.xml" ]; then
