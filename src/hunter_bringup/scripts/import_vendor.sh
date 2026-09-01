@@ -58,16 +58,14 @@ else
   # ROS2 版本（若仓库默认分支为 ROS1，可改用 -b ros2 分支）
   git clone -b ROS2 https://github.com/hku-mars/FAST_LIO.git "$WS_SRC/fast_lio2"
   git clone https://github.com/Livox-SDK/livox_ros_driver2.git "$WS_SRC/livox_ros_driver2"
+  # 当前部署无 Livox 雷达，无需编译 livox_ros_driver2；
+  # clone 后立即打 COLCON_IGNORE，colcon 扫描时跳过该包。
+  touch "$WS_SRC/livox_ros_driver2/COLCON_IGNORE"
+  log "  已标记跳过编译: livox_ros_driver2（COLCON_IGNORE）"
 fi
 
-# livox_ros_driver2 不携带 package.xml（ROS1/ROS2 分开存放），colcon 构建时需要 package.xml。
-# 将 package_ROS2.xml 的内容复制为 package.xml（幂等：已存在则跳过）。
-if [ ! -f "$WS_SRC/livox_ros_driver2/package.xml" ]; then
-  cp "$WS_SRC/livox_ros_driver2/package_ROS2.xml" "$WS_SRC/livox_ros_driver2/package.xml"
-  log "  已创建: livox_ros_driver2/package.xml（来源: package_ROS2.xml）"
-else
-  log "  已存在: livox_ros_driver2/package.xml，跳过"
-fi
+# 幂等保障：目录已存在时重跑脚本，同样补上 COLCON_IGNORE。
+touch "$WS_SRC/livox_ros_driver2/COLCON_IGNORE"
 
 # 2. fast_lio2/CMakeLists.txt：移除 find_package(livox_ros_driver2 REQUIRED)
 #    以及 dependencies 列表中的 livox_ros_driver2（幂等：不存在时 sed 静默跳过）。
