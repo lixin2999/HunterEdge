@@ -91,25 +91,24 @@ else
 fi
 
  # 先恢复误禁用的 package.xml（幂等；当前上游无 src/jetson）
-+  find "$WS_SRC/yolo_trt_ros" -name 'package.xml.disabled' | while read -r f; do
-+    mv "$f" "${f%.disabled}"
-+    log "  已恢复: ${f#$WS_SRC/yolo_trt_ros/}"
-+  done
-+
-+  if [ -d "$WS_SRC/yolo_trt_ros/src/jetson" ]; then
-+    log "yolo_trt_ros：检测到 src/jetson，禁用其余同名包"
-+    find "$WS_SRC/yolo_trt_ros" -name package.xml | while read -r f; do
-+      case "$f" in
-+        *src/jetson*) ;;
-+        *)
-+          mv "$f" "$f.disabled"
-+          log "  已禁用: ${f#$WS_SRC/yolo_trt_ros/}"
-+          ;;
-+      esac
-+    done
-+  else
-+    log "yolo_trt_ros：无 src/jetson，保持 tensorrt_yolo_core / tensorrt_yolo_msg 不变"
-+  fi
+find "$WS_SRC/yolo_trt_ros" -name 'package.xml.disabled' | while read -r f; do
+  mv "$f" "${f%.disabled}"
+  log "  已恢复: ${f#$WS_SRC/yolo_trt_ros/}"
+done
+
+if [ -d "$WS_SRC/yolo_trt_ros/src/jetson" ]; then
+  log "yolo_trt_ros：检测到 src/jetson，禁用其余同名包"
+  find "$WS_SRC/yolo_trt_ros" -name package.xml | while read -r f; do
+    case "$f" in
+      *src/jetson*) ;;
+      *)
+        mv "$f" "$f.disabled"
+        log "  已禁用: ${f#$WS_SRC/yolo_trt_ros/}"
+        ;;
+    esac
+  done
+else
+  log "yolo_trt_ros：无 src/jetson，保持 tensorrt_yolo_core / tensorrt_yolo_msg 不变"
 fi
 
 log "第三方依赖包导入完成"
