@@ -60,6 +60,15 @@ else
   git clone https://github.com/Livox-SDK/livox_ros_driver2.git "$WS_SRC/livox_ros_driver2"
 fi
 
+# livox_ros_driver2 不携带 package.xml（ROS1/ROS2 分开存放），colcon 构建时需要 package.xml。
+# 将 package_ROS2.xml 的内容复制为 package.xml（幂等：已存在则跳过）。
+if [ ! -f "$WS_SRC/livox_ros_driver2/package.xml" ]; then
+  cp "$WS_SRC/livox_ros_driver2/package_ROS2.xml" "$WS_SRC/livox_ros_driver2/package.xml"
+  log "  已创建: livox_ros_driver2/package.xml（来源: package_ROS2.xml）"
+else
+  log "  已存在: livox_ros_driver2/package.xml，跳过"
+fi
+
 # ============ robot_localization（EKF 传感器融合） ============
 log "导入 robot_localization..."
 if [ -d "$WS_SRC/robot_localization/.git" ]; then
