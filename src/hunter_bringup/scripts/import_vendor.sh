@@ -66,9 +66,58 @@ fi
 
 # fast_lio2 源码实际使用了 livox_ros_driver2/msg/custom_msg.hpp，
 # livox_ros_driver2 必须编译以生成消息头文件。
-# CMakeLists.txt 已在源码侧修改：find_library/find_path 去掉 REQUIRED，
-# 驱动编译块用 if(LIVOX_LIDAR_SDK_LIBRARY AND LIVOX_LIDAR_SDK_INCLUDE_DIR) 守卫，
-# SDK 缺失时只跳过驱动节点编译，消息接口照常生成。
+# 修改 livox_ros_driver2/CMakeLists.txt：
+#   1. find_library / find_path 去掉 REQUIRED（SDK 缺失时不中止 cmake）
+#   2. 驱动编译块加 if(LIVOX_LIDAR_SDK_LIBRARY AND LIVOX_LIDAR_SDK_INCLUDE_DIR) 守卫
+# 幂等：已修改则跳过，多次重跑脚本安全。
+LIVOX_CMAKE="$WS_SRC/livox_ros_driver2/CMakeLists.txt"
+if [ -f "$LIVOX_CMAKE" ]; then
+  # Step 1: 去掉 find_library 的 REQUIRED
+  sed -i \
+    's|find_library(LIVOX_LIDAR_SDK_LIBRARY liblivox_lidar_sdk_shared\.so /usr/local/lib REQUIRED)|find_library(LIVOX_LIDAR_SDK_LIBRARY liblivox_lidar_sdk_shared.so /usr/local/lib)|' \
+    "$LIVOX_CMAKE"
+  # Step 2: 去掉 find_path 的 REQUIRED（独占一行："    REQUIRED)"）
+  sed -i '/^[[:space:]]*NAMES "livox_lidar_api\.h"/{n; s/[[:space:]]*REQUIRED)$/)/}' "$LIVOX_CMAKE"
+  # Step 3: 加 if/endif 守卫（幂等：已有守卫则跳过）
+  python3 - "$LIVOX_CMAKE" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+GUARD = 'if(LIVOX_LIDAR_SDK_LIBRARY AND LIVOX_LIDAR_SDK_INCLUDE_DIR)'
+if GUARD in content:
+    print('  livox_ros_driver2/CMakeLists.txt: 守卫已存在，跳过')
+    sys.exit(0)
+start_idx = content.find('  # livox ros2 driver target')
+reg_start = content.find('  rclcpp_components_register_node(', start_idx)
+if start_idx == -1 or reg_start == -1:
+    print('  livox_ros_driver2/CMakeLists.txt: 未找到标记行，跳过')
+    sys.exit(0)
+depth = 0
+i = reg_start + len('  rclcpp_components_register_node(') - 1
+while i < len(content):
+    if content[i] == '(':
+        depth += 1
+    elif content[i] == ')':
+        depth -= 1
+        if depth == 0:
+            break
+    i += 1
+end_idx = content.find('\n', i) + 1
+block = content[start_idx:end_idx]
+patched = (
+    content[:start_idx]
+    + '  if(LIVOX_LIDAR_SDK_LIBRARY AND LIVOX_LIDAR_SDK_INCLUDE_DIR)\n'
+    + block
+    + '  endif()  # LIVOX_LIDAR_SDK_LIBRARY\n'
+    + content[end_idx:]
+)
+with open(path, 'w') as f:
+    f.write(patched)
+print('  livox_ros_driver2/CMakeLists.txt: SDK 守卫已添加')
+PYEOF
+  log "  已处理: livox_ros_driver2/CMakeLists.txt（REQUIRED 已移除，驱动块已加守卫）"
+fi
 
 # livox_ros_driver2 不携带 package.xml（ROS1/ROS2 分开存放），colcon 编译消息接口时需要它。
 # 将 package_ROS2.xml 复制为 package.xml（幂等：已存在则跳过）。
