@@ -18,7 +18,8 @@ namespace
 {
 // 传感器话题频率监控（文档 15.3：低于阈值持续 duration 秒判定异常）
 void checkTopicFrequency(
-  TopicMonitor & mon, const rclcpp::Time & now, rclcpp::Logger logger)
+  TopicMonitor & mon, const rclcpp::Time & now, rclcpp::Logger logger,
+  rclcpp::Clock & clock)
 {
   const double dt = (now - mon.window_start).seconds();
   if (dt < 1.0) {
@@ -34,7 +35,7 @@ void checkTopicFrequency(
       mon.anomaly_since = now.seconds();
     } else if ((now.seconds() - mon.anomaly_since) > mon.duration) {
       RCLCPP_WARN_THROTTLE(
-        logger, now, 3000, "%s 话题频率异常：%.1fHz < %.1fHz，持续超 %.0fs",
+        logger, clock, 3000, "%s 话题频率异常：%.1fHz < %.1fHz，持续超 %.0fs",
         mon.name.c_str(), freq, mon.min_rate, mon.duration);
     }
   } else {
@@ -152,10 +153,10 @@ void HealthMonitor::checkHealth()
   const rclcpp::Time now = this->now();
 
   // 1. 传感器频率监控（文档 15.3）
-  checkTopicFrequency(lidar_mon_, now, get_logger());
-  checkTopicFrequency(camera_mon_, now, get_logger());
-  checkTopicFrequency(imu_mon_, now, get_logger());
-  checkTopicFrequency(can_mon_, now, get_logger());
+  checkTopicFrequency(lidar_mon_, now, get_logger(), *get_clock());
+  checkTopicFrequency(camera_mon_, now, get_logger(), *get_clock());
+  checkTopicFrequency(imu_mon_, now, get_logger(), *get_clock());
+  checkTopicFrequency(can_mon_, now, get_logger(), *get_clock());
 
   // 2. 资源采集
   const double cpu = readCpuUsage();
@@ -172,7 +173,7 @@ void HealthMonitor::checkHealth()
     std_msgs::msg::Bool estop;
     estop.data = true;
     estop_pub_->publish(estop);
-    RCLCPP_WARN_THROTTLE(get_logger(), now, 3000, "CAN 通信中断，触发安全停车");
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000, "CAN 通信中断，触发安全停车");
   }
   // 传感器异常 → 告警降级
   if (lidar_mon_.anomaly || camera_mon_.anomaly || imu_mon_.anomaly) {
