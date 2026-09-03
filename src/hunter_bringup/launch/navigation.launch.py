@@ -21,7 +21,7 @@ def generate_launch_description():
     declare_use_sim_time = DeclareLaunchArgument('use_sim_time', default_value='false')
 
     lifecycle_nodes = [
-        'controller_server', 'planner_server', 'recoveries_server',
+        'controller_server', 'planner_server', 'behavior_server',
         'bt_navigator', 'velocity_smoother']
 
     # RPP 局部控制器（文档 10.2）
@@ -44,11 +44,11 @@ def generate_launch_description():
         parameters=[LaunchConfiguration('params_file')],
     )
 
-    # 恢复行为服务
+    # 恢复行为服务（Nav2 Humble 中 nav2_recoveries 已改名为 nav2_behaviors）
     recoveries_server = Node(
-        package='nav2_recoveries',
-        executable='recoveries_server',
-        name='recoveries_server',
+        package='nav2_behaviors',
+        executable='behavior_server',
+        name='behavior_server',
         output='screen',
         parameters=[LaunchConfiguration('params_file')],
     )
