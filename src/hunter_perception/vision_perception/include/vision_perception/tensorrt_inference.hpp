@@ -6,6 +6,7 @@
 #include <NvInfer.h>
 
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,16 @@ public:
   }
 };
 
+// TensorRT >= 8.5 废弃了 destroy()，改用 delete（通过自定义 deleter 的智能指针管理）
+struct TRTDeleter
+{
+  template <typename T>
+  void operator()(T * obj) const { delete obj; }
+};
+
+template <typename T>
+using TRTUniquePtr = std::unique_ptr<T, TRTDeleter>;
+
 // YOLOv8 2D 检测框（像素坐标）
 struct BBox2D
 {
@@ -38,9 +49,8 @@ class TensorRTInference
 {
 public:
   TensorRTInference()
-  : runtime_(nullptr), engine_(nullptr), context_(nullptr),
-    input_w_(640), input_h_(640), conf_threshold_(0.25f), nms_threshold_(0.45f) {}
-  ~TensorRTInference();
+  : input_w_(640), input_h_(640), conf_threshold_(0.25f), nms_threshold_(0.45f) {}
+  ~TensorRTInference() = default;
 
   // 加载 TensorRT 引擎（.engine）
   bool loadEngine(const std::string & engine_path);
@@ -62,9 +72,14 @@ private:
 
   static Logger logger_;
 
-  nvinfer1::IRuntime * runtime_;
-  nvinfer1::ICudaEngine * engine_;
-  nvinfer1::IExecutionContext * context_;
+  // TensorRT >= 8.5：用智能指针替代手动 destroy()
+  TRTUniquePtr<nvinfer1::IRuntime> runtime_;
+  TRTUniquePtr<nvinfer1::ICudaEngine> engine_;
+  TRTUniquePtr<nvinfer1::IExecutionContext> context_;
+
+  // 引擎 I/O 张量名称（TRT >= 8.5 用名称查询维度）
+  std::string input_name_;
+  std::string output_name_;
 
   int input_w_, input_h_;
   int num_classes_, num_boxes_;

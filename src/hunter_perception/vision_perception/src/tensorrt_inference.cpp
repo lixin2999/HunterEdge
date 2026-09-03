@@ -22,21 +22,8 @@ namespace vision_perception
 
 Logger TensorRTInference::logger_;
 
-TensorRTInference::~TensorRTInference()
-{
-  if (context_) {
-    context_->destroy();
-    context_ = nullptr;
-  }
-  if (engine_) {
-    engine_->destroy();
-    engine_ = nullptr;
-  }
-  if (runtime_) {
-    runtime_->destroy();
-    runtime_ = nullptr;
-  }
-}
+// TensorRT >= 8.5：IRuntime/ICudaEngine/IExecutionContext 已改为通过 delete 释放
+// 析构由智能指针（TRTUniquePtr）自动完成，此处无需手动 destroy()
 
 bool TensorRTInference::loadEngine(const std::string & engine_path)
 {
@@ -52,27 +39,38 @@ bool TensorRTInference::loadEngine(const std::string & engine_path)
   file.read(data.data(), static_cast<std::streamsize>(size));
   file.close();
 
-  runtime_ = nvinfer1::createInferRuntime(logger_);
+  runtime_.reset(nvinfer1::createInferRuntime(logger_));
   if (!runtime_) {
     return false;
   }
-  engine_ = runtime_->deserializeCudaEngine(data.data(), size, nullptr);
+  // TRT >= 8.5：deserializeCudaEngine 只接受 (blob, size)，第三个参数已移除
+  engine_.reset(runtime_->deserializeCudaEngine(data.data(), size));
   if (!engine_) {
     return false;
   }
-  context_ = engine_->createExecutionContext();
+  context_.reset(engine_->createExecutionContext());
   if (!context_) {
     return false;
   }
 
+  // TRT >= 8.5：用张量名称查询维度，废弃了基于绑定索引的 getBindingDimensions()
+  // 约定：引擎第 0 个 I/O 为输入，第 1 个为输出（YOLOv8 导出的默认命名）
+  const int num_io = engine_->getNbIOTensors();
+  if (num_io < 2) {
+    std::cerr << "[TensorRT] 引擎 I/O 张量数量不足（期望 >= 2，实际 " << num_io << "）" << std::endl;
+    return false;
+  }
+  input_name_ = engine_->getIOTensorName(0);
+  output_name_ = engine_->getIOTensorName(1);
+
   // 输入维度 (1, 3, H, W)
-  const auto input_dims = engine_->getBindingDimensions(0);
+  const auto input_dims = engine_->getTensorShape(input_name_.c_str());
   input_h_ = input_dims.d[2];
   input_w_ = input_dims.d[3];
   input_buffer_.resize(3 * input_h_ * input_w_);
 
   // 输出维度 (1, 4+num_classes, num_boxes)
-  const auto output_dims = engine_->getBindingDimensions(1);
+  const auto output_dims = engine_->getTensorShape(output_name_.c_str());
   num_classes_ = output_dims.d[1] - 4;
   num_boxes_ = output_dims.d[2];
   output_buffer_.resize((4 + num_classes_) * num_boxes_);
@@ -124,8 +122,11 @@ bool TensorRTInference::infer(const cv::Mat & image, std::vector<BBox2D> & boxes
     buffers[0], input_buffer_.data(), input_buffer_.size() * sizeof(float),
     cudaMemcpyHostToDevice);
 
-  cudaStream_t stream = nullptr;
-  if (!context_->enqueueV2(buffers, stream, nullptr)) {
+  // TRT >= 8.5：用张量名称绑定地址，通过 executeV2() 同步执行
+  // （enqueueV2 已废弃，enqueueV3 不再接受 bindings 数组，改用 setTensorAddress）
+  context_->setTensorAddress(input_name_.c_str(), buffers[0]);
+  context_->setTensorAddress(output_name_.c_str(), buffers[1]);
+  if (!context_->executeV2(buffers)) {
     cudaFree(buffers[0]);
     cudaFree(buffers[1]);
     return false;

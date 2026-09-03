@@ -156,7 +156,7 @@ void LidarPerception::imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
   imu_queue_.push_back(s);
   // 保留最近 1 秒
   while (!imu_queue_.empty() &&
-    (msg->header.stamp - imu_queue_.front().stamp).seconds() > 1.0)
+    (rclcpp::Time(msg->header.stamp) - rclcpp::Time(imu_queue_.front().stamp)).seconds() > 1.0)
   {
     imu_queue_.pop_front();
   }
@@ -236,7 +236,7 @@ void LidarPerception::transformToBaseLink(
   try {
     const auto tf = tf_buffer_->lookupTransform(
       target_frame_, in->header.frame_id, tf2::TimePointZero, tf2::durationFromSec(0.1));
-    pcl_ros::transformPointCloud(*in, *out, tf.transform);
+    pcl_ros::transformPointCloud(*in, *out, tf);
   } catch (const tf2::TransformException & e) {
     // TF 不可用，降级：保留原坐标系
     RCLCPP_WARN_THROTTLE(
