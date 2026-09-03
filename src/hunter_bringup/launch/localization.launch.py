@@ -24,7 +24,7 @@ def generate_launch_description():
     #    算法：IEKF + ikd-Tree；外参 LiDAR-IMU 见 fast_lio2_params.yaml
     # =====================================================================
     fast_lio2_node = Node(
-        package='fast_lio2',
+        package='fast_lio',
         executable='fastlio_mapping',
         name='fast_lio2',
         output='screen',
