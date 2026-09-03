@@ -320,7 +320,9 @@ bool DataAgent::kafkaProduce(const std::string & topic, const std::string & payl
   }
   const RdKafka::ErrorCode err = producer_->produce(
     topic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-    const_cast<char *>(payload.c_str()), payload.size(), nullptr, nullptr);
+    const_cast<char *>(payload.c_str()), payload.size(),
+    nullptr, 0,   // key, key_len
+    0, nullptr);  // timestamp, msg_opaque
   if (err != RdKafka::ERR_NO_ERROR) {
     return false;
   }
