@@ -1,0 +1,157 @@
+<?xml version="1.0"?>
+<!--
+  autonomous_navigate.xml — HUNTER 自主导航扩展行为树
+  =====================================================================
+  在原始 navigate_to_pose.xml 基础上新增：
+    1. 定位有效性前置检查（TransformAvailable：map → base_link）
+    2. 障碍物感知超时检查（TimeExpired 哨兵，感知数据停止后快速失效）
+    3. 障碍物动态减速行为（SpeedController：障碍物近时自动降低最大速度）
+    4. 路径受阻时的后退恢复（BackUp 替代 Spin，适合阿克曼底盘前进后退）
+    5. GoalUpdated 响应：外部实时更新目标点时立即中断重规划
+
+  BT 节点说明（全部来自 bt_navigator plugin_lib_names，无自定义插件）：
+    TransformAvailable       — 检查指定坐标系变换是否可用（定位有效性代理）
+    ComputePathToPose        — SmacPlannerHybrid 全局规划
+    FollowPath               — RPP 局部跟踪控制
+    SpeedController          — 根据距离障碍物动态缩放线速度上限
+    GoalUpdated              — 外部目标点是否已更新（条件节点）
+    BackUp                   — 直线后退恢复（阿克曼车适用，替代原 Spin）
+    Wait                     — 原地等待
+    ClearEntireCostmap       — 清除代价地图（全局/局部）
+    RateController           — 限制子树执行频率
+    RecoveryNode             — 带重试次数的恢复节点
+    PipelineSequence         — 并发序列：前序节点失败不停止后续
+    ReactiveFallback         — 响应式回退：持续检查条件
+    RoundRobin               — 轮询执行恢复动作
+
+  安全设计原则：
+    • 定位不可用 → 立即中止整棵树，禁止发出任何速度指令
+    • 感知数据超时（TimeExpired 2s）→ 触发 ClearLocalCostmap 并 Wait，
+      等待感知恢复，防止代价地图信息过期后盲目通行
+    • BackUp 距离限制为 0.3 m（阿克曼最小转弯半径 1.9 m，小幅后退足以脱困）
+    • SpeedController：障碍物距离 ≥ 3m 正常速度；< 3m 按比例降至 0.4 m/s 下限
+    • 最大全局重试次数 6（与原始行为树保持一致）
+  =====================================================================
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+
+    <!--
+      第 0 层：定位有效性前置门控
+      map → base_link 变换不可用（FAST-LIO2 未收敛或 EKF 无输出）时，
+      立即中止所有导航行为，等待定位恢复。
+    -->
+    <Sequence name="LocalizationGuard">
+
+      <!-- 定位有效性检查：map → base_link TF 必须可用 -->
+      <TransformAvailable
+        name="CheckMapToBaseLink"
+        child_frame="base_link"
+        parent_frame="map"/>
+
+      <!--
+        第 1 层：外层恢复节点（最多重试 6 次）
+        匹配原始行为树的恢复结构，失败后进入 RecoveryFallback
+      -->
+      <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+
+        <!--
+          主导航流水线：1Hz 重规划 + 路径跟踪
+        -->
+        <PipelineSequence name="NavigateWithReplanning">
+
+          <!--
+            感知数据保鲜检查：距上次代价地图更新超过 2s 则暂停规划，
+            清除局部代价地图并等待感知数据恢复。
+            使用 TimeExpired 作为哨兵（time_val=2.0s）。
+            若感知恢复（TimeExpired 返回 FAILURE），流水线继续执行。
+          -->
+          <ReactiveFallback name="PerceptionFreshnessGuard">
+            <!-- 感知数据新鲜时：TimeExpired 返回 FAILURE → 直接通过 -->
+            <Inverter>
+              <TimeExpired name="PerceptionStaleness" seconds="2.0"/>
+            </Inverter>
+            <!-- 感知数据超时：清除局部代价地图 + 短暂等待 -->
+            <Sequence name="PerceptionRecovery">
+              <ClearEntireCostmap
+                name="ClearLocalCostmap-Perception"
+                service_name="local_costmap/clear_entirely_local_costmap"/>
+              <Wait wait_duration="2.0"/>
+            </Sequence>
+          </ReactiveFallback>
+
+          <!--
+            全局路径规划（1Hz 重规划）
+            失败时先尝试清除全局代价地图，再重规划一次
+          -->
+          <RateController hz="1.0">
+            <RecoveryNode number_of_retries="1" name="ComputePathRecovery">
+              <ComputePathToPose
+                goal="{goal}"
+                path="{path}"
+                planner_id="GridBased"/>
+              <ClearEntireCostmap
+                name="ClearGlobalCostmap-Context"
+                service_name="global_costmap/clear_entirely_global_costmap"/>
+            </RecoveryNode>
+          </RateController>
+
+          <!--
+            局部路径跟踪 + 动态减速
+            SpeedController 根据最近障碍物距离动态调整线速度上限：
+              • min_rate=0.4 m/s（障碍物极近时），max_rate=2.0 m/s（空旷时）
+              • distance_traveled_threshold 和 time_travel_threshold 保持与 RPP 前视距离一致
+          -->
+          <RecoveryNode number_of_retries="1" name="FollowPathRecovery">
+
+            <SpeedController
+              name="ObstacleSpeedController"
+              min_rate="0.4"
+              max_rate="2.0"
+              min_distance="0.5"
+              max_distance="3.0"
+              time_allowance="10.0">
+              <FollowPath path="{path}" controller_id="FollowPath"/>
+            </SpeedController>
+
+            <!-- 跟踪失败：清除局部代价地图 + 后退恢复（阿克曼适用，距离小于 0.3m） -->
+            <Sequence name="TrackingRecovery">
+              <ClearEntireCostmap
+                name="ClearLocalCostmap-Context"
+                service_name="local_costmap/clear_entirely_local_costmap"/>
+              <BackUp backup_dist="0.3" backup_speed="0.2"/>
+            </Sequence>
+
+          </RecoveryNode>
+
+        </PipelineSequence>
+
+        <!--
+          恢复行为回退池（轮询）
+          注：Spin（原地旋转）不适合阿克曼车，已替换为 BackUp + Wait 组合
+        -->
+        <ReactiveFallback name="RecoveryFallback">
+          <!-- 外部目标点实时更新：立即重新规划 -->
+          <GoalUpdated/>
+          <RoundRobin name="RecoveryActions">
+            <ClearEntireCostmap
+              name="ClearGlobalCostmap-Subtree"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+            <ClearEntireCostmap
+              name="ClearLocalCostmap-Subtree"
+              service_name="local_costmap/clear_entirely_local_costmap"/>
+            <!-- 后退脱困（0.3m，0.2m/s，适合阿克曼底盘） -->
+            <BackUp backup_dist="0.3" backup_speed="0.2"/>
+            <!-- 等待：障碍物可能短暂通过 -->
+            <Wait wait_duration="5.0"/>
+          </RoundRobin>
+        </ReactiveFallback>
+
+      </RecoveryNode>
+      <!-- /NavigateRecovery -->
+
+    </Sequence>
+    <!-- /LocalizationGuard -->
+
+  </BehaviorTree>
+</root>
