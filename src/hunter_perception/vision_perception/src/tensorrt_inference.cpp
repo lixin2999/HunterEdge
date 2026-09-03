@@ -4,8 +4,14 @@
 
 #include <cuda_runtime.h>
 
+// OpenCV CUDA 模块仅在编译时检测到 opencv_cudaimgproc / opencv_cudawarping 时启用
+// 无 CUDA OpenCV 的环境（如仅安装 CPU-only OpenCV）会自动降级到 CPU 预处理路径
+#ifdef HAVE_OPENCV_CUDA
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudawarping.hpp>
+#endif
+
+#include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -81,14 +87,23 @@ bool TensorRTInference::infer(const cv::Mat & image, std::vector<BBox2D> & boxes
     return false;
   }
 
-  // 预处理（OpenCV CUDA 硬件加速：resize + BGR→RGB，文档 5.2.3）
+  // 预处理（resize + BGR→RGB）
+  // 有 CUDA OpenCV 时走 GPU 路径（延迟更低），否则降级为 CPU 路径
   cv::Mat rgb;
+#ifdef HAVE_OPENCV_CUDA
   {
     cv::cuda::GpuMat gpu_in(image), gpu_resized, gpu_rgb;
     cv::cuda::resize(gpu_in, gpu_resized, cv::Size(input_w_, input_h_));
     cv::cuda::cvtColor(gpu_resized, gpu_rgb, cv::COLOR_BGR2RGB);
     gpu_rgb.download(rgb);
   }
+#else
+  {
+    cv::Mat resized;
+    cv::resize(image, resized, cv::Size(input_w_, input_h_));
+    cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
+  }
+#endif
   rgb.convertTo(rgb, CV_32FC3, 1.0f / 255.0f);
 
   const int h = input_h_;

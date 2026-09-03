@@ -14,6 +14,46 @@ find_package(cv_bridge REQUIRED)
 find_package(hunter_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 
+# 检测 OpenCV 是否包含 CUDA 模块（cudaimgproc / cudawarping）
+# 有些环境（无 GPU 或仅安装 CPU-only OpenCV）不包含这些模块
+set(OPENCV_CUDA_AVAILABLE FALSE)
+if(OpenCV_FOUND)
+  foreach(_mod IN ITEMS opencv_cudaimgproc opencv_cudawarping)
+    if(_mod IN_LIST OpenCV_LIBS OR TARGET ${_mod})
+      set(OPENCV_CUDA_AVAILABLE TRUE)
+    endif()
+  endforeach()
+  # 额外检查：确认头文件实际存在（防止库存在但头文件路径缺失导致编译失败）
+  if(OPENCV_CUDA_AVAILABLE)
+    # find_file 需要在 hint 目录的子目录下找，所以把 opencv4/opencv2 目录都加进来
+    set(_opencv_hint_dirs "")
+    foreach(_inc_dir IN LISTS OpenCV_INCLUDE_DIRS)
+      list(APPEND _opencv_hint_dirs
+        "${_inc_dir}"
+        "${_inc_dir}/opencv2"
+      )
+    endforeach()
+    find_file(_cudaimgproc_header
+      NAMES "cudaimgproc.hpp"
+      HINTS ${_opencv_hint_dirs}
+            /usr/local/include/opencv4/opencv2
+            /usr/include/opencv4/opencv2
+      NO_DEFAULT_PATH
+    )
+    if(NOT _cudaimgproc_header)
+      message(STATUS "vision_perception: opencv_cudaimgproc target found but header missing "
+        "in OpenCV_INCLUDE_DIRS=${OpenCV_INCLUDE_DIRS} — disabling GPU path")
+      set(OPENCV_CUDA_AVAILABLE FALSE)
+    endif()
+    unset(_cudaimgproc_header CACHE)
+  endif()
+endif()
+if(OPENCV_CUDA_AVAILABLE)
+  message(STATUS "vision_perception: OpenCV CUDA modules found — GPU preprocessing enabled")
+else()
+  message(STATUS "vision_perception: OpenCV CUDA modules NOT found — falling back to CPU preprocessing")
+endif()
+
 # CUDA / TensorRT（NVIDIA Jetson JetPack）
 # JetPack 安装路径为 /usr/local/cuda-x.y，CMake find_package(CUDA) 依赖符号链接
 # /usr/local/cuda，若不存在则 CUDA_INCLUDE_DIRS 为空；此处手动补充 fallback。
@@ -53,8 +93,13 @@ add_executable(vision_perception_node
 target_include_directories(vision_perception_node PRIVATE
   include
   ${CUDA_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
 )
 target_compile_features(vision_perception_node PUBLIC cxx_std_17)
+# 将 OpenCV CUDA 可用性传递给源码
+if(OPENCV_CUDA_AVAILABLE)
+  target_compile_definitions(vision_perception_node PRIVATE HAVE_OPENCV_CUDA)
+endif()
 ament_target_dependencies(vision_perception_node
   rclcpp
   rclcpp_lifecycle
