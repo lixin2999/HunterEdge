@@ -42,6 +42,20 @@ else
   git clone https://github.com/RoboSense-LiDAR/rs_driver.git "$WS_SRC/rslidar_sdk/src/rs_driver"
 fi
 
+# 确保 rslidar_sdk 配置文件中 lidar_type 为 RSHELIOS_16P
+RSLIDAR_CONFIG="$WS_SRC/rslidar_sdk/config/config.yaml"
+if [ -f "$RSLIDAR_CONFIG" ]; then
+  CURRENT_TYPE=$(grep -oP '(?<=lidar_type:\s)(\S+)' "$RSLIDAR_CONFIG" | head -1)
+  if [ "$CURRENT_TYPE" = "RSHELIOS_16P" ]; then
+    log "  rslidar_sdk config.yaml: lidar_type 已是 RSHELIOS_16P，无需修改"
+  else
+    sed -i "s/lidar_type:[[:space:]]*${CURRENT_TYPE}/lidar_type: RSHELIOS_16P/" "$RSLIDAR_CONFIG"
+    log "  rslidar_sdk config.yaml: lidar_type 已从 '${CURRENT_TYPE}' 修改为 RSHELIOS_16P"
+  fi
+else
+  log "  警告: 未找到 rslidar_sdk 配置文件 $RSLIDAR_CONFIG，跳过 lidar_type 检查"
+fi
+
 # ============ Intel RealSense（realsense-ros） ============
 log "导入 realsense-ros..."
 if [ -d "$WS_SRC/realsense-ros/.git" ]; then
