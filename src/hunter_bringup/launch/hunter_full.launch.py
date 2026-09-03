@@ -32,7 +32,7 @@ def generate_launch_description():
     lidar_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('rslidar_sdk'),
-                         'launch', 'rs_lidar.launch.py')))
+                         'launch', 'humble_start.py')))
     camera_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('realsense2_camera'),
