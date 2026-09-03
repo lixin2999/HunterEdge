@@ -42,10 +42,10 @@ def generate_launch_description():
             os.path.join(get_package_share_directory('ch10x_driver'),
                          'launch', 'ch10x_driver.launch.py')))
 
-    # ---- 2. CAN 驱动（hunter_ros2，文档 11） ----
+    # ---- 2. CAN 驱动（hunter_base，文档 11） ----
     can_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory('hunter_ros2'),
+            os.path.join(get_package_share_directory('hunter_base'),
                          'launch', 'hunter_base.launch.py')))
 
     # ---- 3. 定位（fast_lio2 + EKF，文档 7） ----
