@@ -294,7 +294,7 @@ void DataAgent::triggerBagRecord(const std::string & event_type)
   const std::string cmd =
     "ros2 bag record -o /data/rosbag/" +
     std::to_string(static_cast<int>(this->now().seconds())) + "_" + event_type +
-    " /lidar_points /camera/color/image_raw /imu/data /chassis/state &";
+    " /lidar_points /camera/camera/color/image_raw /imu/data /chassis/state &";
   std::system(cmd.c_str());
   RCLCPP_INFO(get_logger(), "触发 rosbag 录制（事件：%s）", event_type.c_str());
 }

@@ -32,8 +32,8 @@ VisionPerception::VisionPerception(const rclcpp::NodeOptions & options)
   last_publish_time_(0, 0, RCL_ROS_TIME)
 {
   // 参数（模型路径、推理参数全部 yaml 化，文档 5.2.2）
-  declare_parameter("color_topic", "/camera/color/image_raw");
-  declare_parameter("depth_topic", "/camera/depth/image_rect_raw");
+  declare_parameter("color_topic", "/camera/camera/color/image_raw");
+  declare_parameter("depth_topic", "/camera/camera/depth/image_rect_raw");
   declare_parameter("target_frame", "camera_color_optical_frame");
   declare_parameter("engine_path", "/data/models/yolov8n.engine");
   declare_parameter("input_width", 640);

@@ -102,7 +102,7 @@ HealthMonitor::HealthMonitor(const rclcpp::NodeOptions & options)
     "/lidar_points", rclcpp::SensorDataQoS(),
     std::bind(&HealthMonitor::lidarCallback, this, std::placeholders::_1));
   camera_sub_ = create_subscription<sensor_msgs::msg::Image>(
-    "/camera/color/image_raw", rclcpp::SensorDataQoS(),
+    "/camera/camera/color/image_raw", rclcpp::SensorDataQoS(),
     std::bind(&HealthMonitor::cameraCallback, this, std::placeholders::_1));
   imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
     "/imu/data", rclcpp::SensorDataQoS(),
