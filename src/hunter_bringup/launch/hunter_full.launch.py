@@ -35,6 +35,8 @@ def _isolated(source, *, condition=None, launch_arguments=None):
     if launch_arguments is not None:
         include_kwargs['launch_arguments'] = launch_arguments.items()
     return GroupAction(
+        scoped=True,
+        forwarding=False,
         actions=[IncludeLaunchDescription(source, **include_kwargs)],
         **kwargs,
     )
