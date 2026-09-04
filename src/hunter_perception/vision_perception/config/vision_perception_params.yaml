@@ -6,8 +6,8 @@ vision_perception:
     depth_topic: "/camera/depth/image_rect_raw"
     target_frame: "camera_color_optical_frame"   # 文档 7.4 相机光学坐标系
 
-    # TensorRT 引擎（文档 5.2.3：YOLOv8n TensorRT FP16）
-    engine_path: "/data/models/yolov8n.engine"
+    # TensorRT 引擎（文档 5.2.3：YOLOv8s TensorRT FP16）
+    engine_path: "/data/models/yolov8s.engine"
     input_width: 640
     input_height: 640
     conf_threshold: 0.25
