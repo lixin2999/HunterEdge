@@ -70,6 +70,7 @@ class FastLio2ParamInjector(Node):
         # 使用定时器触发注入（给 fast_lio2 节点足够的启动时间）
         self._attempt = 0
         self._finished = False
+        self._request_in_flight = False
         self._timer = self.create_timer(self._retry_interval, self._try_inject)
 
     def _build_params(self):
@@ -113,7 +114,7 @@ class FastLio2ParamInjector(Node):
         rclpy.shutdown()
 
     def _try_inject(self) -> None:
-        if self._finished:
+        if self._finished or self._request_in_flight:
             return
         self._attempt += 1
         srv_name = f'/{self._target_node}/set_parameters'
@@ -134,6 +135,7 @@ class FastLio2ParamInjector(Node):
 
         req = self._build_params()
         future = self._cli.call_async(req)
+        self._request_in_flight = True
 
         # 等待响应（max call_timeout 秒）。期间用 spin_once 让本节点继续处理
         # 服务发现/响应，避免单线程 executor 死等。
@@ -142,6 +144,20 @@ class FastLio2ParamInjector(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
 
         if future.done():
+            self._handle_inject_result(req, future)
+        else:
+            # 不取消请求：服务端可能已经开始处理，取消客户端 future 不会撤销服务端操作。
+            # 保持单请求在途，等迟到响应返回后再结束，避免重复修改 fast_lio2 参数。
+            future.add_done_callback(lambda completed: self._handle_inject_result(req, completed))
+            self.get_logger().warn(
+                f'[注入超时] {srv_name} 本次调用 {self._call_timeout:.0f}s 未响应'
+                f'（第 {self._attempt}/{self._retry_times} 次），保持请求在途等待结果')
+
+    def _handle_inject_result(self, req, future) -> None:
+        if self._finished:
+            return
+        self._request_in_flight = False
+        try:
             resp = future.result()
             all_ok = all(r.successful for r in resp.results)
             if all_ok:
@@ -151,29 +167,15 @@ class FastLio2ParamInjector(Node):
                     f'  map_file_path={self._map_file_path!r}，'
                     f'  interval={self._interval}'
                 )
-                self._finish()
             else:
                 for i, r in enumerate(resp.results):
                     if not r.successful:
                         self.get_logger().warn(
                             f'[注入部分失败] 参数 {req.parameters[i].name}：{r.reason}')
-                self._finish()
-        else:
-            # 服务已存在但未在期限内应答：多半是 fast_lio2 此刻被点云处理占满。
-            # 取消本次等待，保留节点在后续轮次继续重试。
-            future.cancel()
-            if self._attempt >= self._retry_times:
-                self.get_logger().error(
-                    f'[注入失败] {srv_name} 调用 {self._retry_times} 次均超时'
-                    f'（>{self._call_timeout}s），fast_lio2 pcd_save 参数未生效，\n'
-                    f'  请确认 fast_lio2 点云/IMU 输入正常（见 rslidar_sdk XYZIRT 与 '
-                    f'/imu/data QoS 排查）。'
-                )
-                self._finish()
-            else:
-                self.get_logger().warn(
-                    f'[注入超时] {srv_name} 本次调用 {self._call_timeout:.0f}s 未响应'
-                    f'（第 {self._attempt}/{self._retry_times} 次），稍后自动重试')
+            self._finish()
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().error(f'[注入失败] 参数服务返回异常：{e}')
+            self._finish()
 
 
 # ---------------------------------------------------------------------------

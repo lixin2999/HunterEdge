@@ -5,6 +5,7 @@
 #include <cv_bridge/cv_bridge.h>
 
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <utility>
 
@@ -183,6 +184,13 @@ void VisionPerception::colorCallback(const sensor_msgs::msg::Image::SharedPtr ms
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "彩色图像转换失败: %s", e.what());
     return;
   }
+  if (color.empty() || color.cols <= 0 || color.rows <= 0 || color.type() != CV_8UC3) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "彩色图像无效，跳过本帧（width=%u height=%u encoding=%s）",
+      msg->width, msg->height, msg->encoding.c_str());
+    return;
+  }
 
   // 2. TensorRT YOLOv8 推理（含预处理）
   std::vector<BBox2D> boxes;
@@ -195,7 +203,8 @@ void VisionPerception::colorCallback(const sensor_msgs::msg::Image::SharedPtr ms
   cv::Mat depth;
   {
     std::lock_guard<std::mutex> lock(depth_mutex_);
-    if (!depth_received_ || depth_img_.empty()) {
+    if (!depth_received_ || depth_img_.empty() || depth_img_.cols <= 0 ||
+      depth_img_.rows <= 0 || depth_img_.type() != CV_16UC1) {
       // 深度失效：降级告警，跳过本帧
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "深度图未就绪/失效，跳过本帧");
       return;
@@ -228,6 +237,13 @@ void VisionPerception::colorCallback(const sensor_msgs::msg::Image::SharedPtr ms
 bool VisionPerception::projectTo3D(
   const BBox2D & box, const cv::Mat & depth, Detection3D & det)
 {
+  if (depth.empty() || depth.type() != CV_16UC1 ||
+    !std::isfinite(box.x1) || !std::isfinite(box.y1) ||
+    !std::isfinite(box.x2) || !std::isfinite(box.y2) ||
+    box.x2 <= box.x1 || box.y2 <= box.y1) {
+    return false;
+  }
+
   // 框中心像素坐标
   const float u = (box.x1 + box.x2) / 2.0f;
   const float v = (box.y1 + box.y2) / 2.0f;

@@ -319,6 +319,7 @@ class PcdToMap(Node):
         self._prev_mission_status = ''
         self._converting = False        # 防止重入
         self._convert_lock = threading.Lock()
+        self._auto_convert_scheduled = False  # 同一轮建图结束只启动一次自动转换
         self._save_cli = None           # /fast_lio2/map_save 客户端（懒创建）
         self._fallback_timer = None     # map_save 无响应时的兜底定时器
 
@@ -368,6 +369,8 @@ class PcdToMap(Node):
                 f'[pcd_to_map] 检测到建图结束（{self._prev_mission_status} → {current}），'
                 f'请求 FAST-LIO2 保存地图后自动转换...'
             )
+            with self._convert_lock:
+                self._auto_convert_scheduled = False
             self._request_map_save_and_convert()
 
         self._prev_mission_status = current
@@ -388,7 +391,7 @@ class PcdToMap(Node):
         except ImportError:
             self.get_logger().warn(
                 '[pcd_to_map] std_srvs 不可用，跳过 map_save，直接等待 PCD 文件')
-            threading.Timer(3.0, self._do_convert).start()
+            self._schedule_auto_convert(3.0)
             return
 
         if self._save_cli is None:
@@ -421,14 +424,22 @@ class PcdToMap(Node):
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f'[pcd_to_map] 调用 /fast_lio2/map_save 异常：{e}')
         # 等 1s 让磁盘写入落稳后开始转换
-        threading.Timer(1.0, self._do_convert).start()
+        self._schedule_auto_convert(1.0)
 
     def _fallback_convert(self) -> None:
         self._fallback_timer = None
         self.get_logger().warn(
             '[pcd_to_map] /fast_lio2/map_save 长时间无响应，'
             '回退为直接等待 PCD 文件出现')
-        threading.Timer(1.0, self._do_convert).start()
+        self._schedule_auto_convert(1.0)
+
+    def _schedule_auto_convert(self, delay: float) -> None:
+        with self._convert_lock:
+            if self._auto_convert_scheduled:
+                self.get_logger().debug('[pcd_to_map] 自动转换已安排，忽略重复触发')
+                return
+            self._auto_convert_scheduled = True
+        threading.Timer(delay, self._do_convert).start()
 
     # ------------------------------------------------------------------
     # 手动触发服务回调

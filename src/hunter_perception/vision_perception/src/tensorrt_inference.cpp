@@ -99,7 +99,7 @@ bool TensorRTInference::loadEngine(const std::string & engine_path)
 bool TensorRTInference::infer(const cv::Mat & image, std::vector<BBox2D> & boxes)
 {
   boxes.clear();
-  if (!context_) {
+  if (!context_ || image.empty() || image.cols <= 0 || image.rows <= 0 || image.type() != CV_8UC3) {
     return false;
   }
   if (input_w_ <= 0 || input_h_ <= 0) {
@@ -192,6 +192,11 @@ void TensorRTInference::postprocess(
     const float cy = output[1 * num_boxes + j];
     const float w = output[2 * num_boxes + j];
     const float h = output[3 * num_boxes + j];
+
+    if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(w) ||
+      !std::isfinite(h) || w <= 0.0f || h <= 0.0f) {
+      continue;
+    }
 
     BBox2D b;
     b.x1 = (cx - w / 2.0f) * input_w_ * scale_x;
