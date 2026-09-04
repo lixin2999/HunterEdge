@@ -119,16 +119,18 @@ def generate_launch_description():
                                condition=IfCondition(_nav_condition))
 
     # ---- 6b. 自主导航全栈（可选，use_autonomous_nav=true 时启动） ----
-    # 显式传入子模式和路径参数，因为 _isolated(scoped=True, forwarding=False) 会阻断参数透传
+    # 显式传入子模式和路径参数，因为 _isolated(scoped=True, forwarding=False) 会阻断参数透传。
+    # 注意：launch_arguments 的值必须是 substitution 列表形式 [LaunchConfiguration(...)]，
+    # 直接传 LaunchConfiguration 对象在 scoped GroupAction 里会因作用域隔离报 does not exist。
     autonomous_nav = _isolated(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_share, 'launch', 'hunter_autonomous_nav.launch.py')
         ),
         condition=IfCondition(use_autonomous_nav),
         launch_arguments={
-            'mode':          autonomous_nav_mode,
-            'map_yaml_path': LaunchConfiguration('map_yaml_path'),
-            'map_file_path': LaunchConfiguration('map_file_path'),
+            'mode':          [autonomous_nav_mode],
+            'map_yaml_path': [LaunchConfiguration('map_yaml_path')],
+            'map_file_path': [LaunchConfiguration('map_file_path')],
         },
     )
 
