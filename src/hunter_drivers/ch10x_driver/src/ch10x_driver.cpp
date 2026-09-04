@@ -13,6 +13,26 @@
 namespace ch10x_driver
 {
 
+namespace
+{
+// CRC16/XMODEM：poly=0x1021, init=0x0000, 无反射/无异或（厂商 crc16_update）
+uint16_t crc16XmodemUpdate(uint16_t crc, const uint8_t * data, size_t n)
+{
+  for (size_t i = 0; i < n; ++i) {
+    crc ^= static_cast<uint16_t>(data[i]) << 8;
+    for (int j = 0; j < 8; ++j) {
+      crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021)
+                           : static_cast<uint16_t>(crc << 1);
+    }
+  }
+  return crc;
+}
+
+// 单位换算常量：加速度 G→m/s²，角速度 °/s→rad/s
+constexpr float kGravity = 9.80665f;
+constexpr float kDegToRad = 0.017453292519943295f;
+}  // namespace
+
 Ch10xDriver::Ch10xDriver(const rclcpp::NodeOptions & options)
 : rclcpp_lifecycle::LifecycleNode("ch10x_driver", options),
   fd_(-1),
@@ -35,7 +55,8 @@ Ch10xDriver::on_configure(const rclcpp_lifecycle::State &)
   frame_id_ = get_parameter("frame_id").as_string();
   timeout_ = get_parameter("timeout").as_double();
 
-  imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("/imu/data", rclcpp::SensorDataQoS());
+  imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("/imu/data",
+    rclcpp::SensorDataQoS(rclcpp::KeepLast(500)));
 
   if (!openSerial()) {
     RCLCPP_ERROR(get_logger(), "串口打开失败，配置阶段失败");
@@ -231,55 +252,71 @@ int Ch10xDriver::parseFrame(std::vector<uint8_t> & buffer, ImuData & data)
     }
     i++;
   }
-  if (i + 1 >= n) {
-    if (i > 0) {
-      buffer.erase(buffer.begin(), buffer.begin() + i);
-    }
-    return 0;  // 数据不足
-  }
   if (i > 0) {
     buffer.erase(buffer.begin(), buffer.begin() + i);
   }
-
-  // 2. 帧头已在开头，检查是否收到完整帧头
-  if (buffer.size() < FRAME_OVERHEAD) {
+  if (buffer.size() < 2) {
     return 0;  // 数据不足
   }
 
-  // 3. 校验类型与长度
-  const uint8_t type = buffer[2];
-  const uint16_t len = static_cast<uint16_t>(buffer[3] | (buffer[4] << 8));
-  if (type != FRAME_TYPE_IMU || len != PAYLOAD_LEN) {
-    buffer.erase(buffer.begin());  // 帧头误判，丢弃 1 字节重新同步
-    return -1;
+  // 2. 帧头已在开头，等待完整帧头字段（2帧头+2长度+2CRC）
+  if (buffer.size() < FRAME_HEADER_LEN) {
+    return 0;  // 数据不足
   }
 
-  const size_t total = FRAME_OVERHEAD + len + FRAME_CHECKSUM;
+  // 3. 数据域长度（小端）：buf[2] | buf[3]<<8；上限保护防伪帧
+  const uint16_t len = static_cast<uint16_t>(buffer[2] | (buffer[3] << 8));
+  if (len < 12 || len > 512) {
+    buffer.erase(buffer.begin());  // 长度非法，丢弃 1 字节重新同步
+    return -1;
+  }
+  const size_t total = FRAME_HEADER_LEN + len;
   if (buffer.size() < total) {
     return 0;  // 载荷未收齐
   }
 
-  // 4. 校验（8-bit 累加和：帧头 + 类型 + 长度 + 载荷）
-  uint8_t checksum = 0;
-  for (size_t j = 0; j < FRAME_OVERHEAD + len; ++j) {
-    checksum = static_cast<uint8_t>(checksum + buffer[j]);
-  }
-  if (checksum != buffer[FRAME_OVERHEAD + len]) {
-    buffer.erase(buffer.begin());  // 校验失败，丢弃 1 字节
+  // 4. CRC16 校验：先算 5A A5 + LEN（buf[0..4)），再算数据域（buf[6..6+LEN)）
+  uint16_t crc = 0;
+  crc = crc16XmodemUpdate(crc, buffer.data(), 4);
+  crc = crc16XmodemUpdate(crc, buffer.data() + FRAME_HEADER_LEN, len);
+  const uint16_t expected = static_cast<uint16_t>(buffer[4] | (buffer[5] << 8));
+  if (crc != expected) {
+    buffer.erase(buffer.begin());  // 校验失败，丢弃 1 字节重新同步
     return -1;
   }
 
-  // 5. 解析载荷（小端）
-  const uint8_t * p = &buffer[FRAME_OVERHEAD];
-  std::memcpy(&data.timestamp_ms, p, 4);
-  p += 4;
-  std::memcpy(data.quaternion, p, 4 * sizeof(float));
-  p += 4 * sizeof(float);
-  std::memcpy(data.euler, p, 3 * sizeof(float));
-  p += 3 * sizeof(float);
-  std::memcpy(data.angular_velocity, p, 3 * sizeof(float));
-  p += 3 * sizeof(float);
-  std::memcpy(data.linear_acceleration, p, 3 * sizeof(float));
+  // 5. 仅处理 0x91 数据包；其它类型整帧跳过
+  if (buffer[6] != PACKET_TAG_91 || len != PAYLOAD_LEN_91) {
+    buffer.erase(buffer.begin(), buffer.begin() + total);
+    return 0;
+  }
+
+  // 6. 解析 0x91 数据域（数据域起始 = buffer[6]，全部小端）
+  const uint8_t * p = buffer.data() + FRAME_HEADER_LEN;
+  float acc[3] = {0.f, 0.f, 0.f};
+  float gyr[3] = {0.f, 0.f, 0.f};
+  float mag[3] = {0.f, 0.f, 0.f};
+  float eul[3] = {0.f, 0.f, 0.f};
+  float quat[4] = {1.f, 0.f, 0.f, 0.f};
+
+  // +1  id, +2..3 reserved
+  std::memcpy(&data.timestamp_ms, p + 8, sizeof(uint32_t));      // ms
+  std::memcpy(acc,  p + 12, 3 * sizeof(float));                  // G
+  std::memcpy(gyr,  p + 24, 3 * sizeof(float));                  // °/s
+  std::memcpy(mag,  p + 36, 3 * sizeof(float));                  // uT（不发布，仅保留）
+  std::memcpy(eul,  p + 48, 3 * sizeof(float));                  // °
+  std::memcpy(quat, p + 60, 4 * sizeof(float));                  // w,x,y,z
+
+  // 单位换算到 ROS 约定：角速度 rad/s、加速度 m/s²、欧拉角 rad
+  for (int k = 0; k < 3; ++k) {
+    data.angular_velocity[k]    = gyr[k] * kDegToRad;
+    data.linear_acceleration[k] = acc[k] * kGravity;
+    data.euler[k]               = eul[k] * kDegToRad;
+  }
+  data.quaternion[0] = quat[0];
+  data.quaternion[1] = quat[1];
+  data.quaternion[2] = quat[2];
+  data.quaternion[3] = quat[3];
 
   buffer.erase(buffer.begin(), buffer.begin() + total);
   return 1;

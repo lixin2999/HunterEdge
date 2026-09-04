@@ -306,6 +306,11 @@ class PcdToMap(Node):
         self._auto_reload     = self.get_parameter('auto_reload_map').get_parameter_value().bool_value
         self._trigger_on_end  = self.get_parameter('trigger_on_mapping_end').get_parameter_value().bool_value
 
+        # launch 命令行传参形如 map_file_path:=~/HunterEdge/... 时 '~' 不会被 shell 展开，
+        # 这里统一 expanduser，保证与 FAST-LIO2 落盘路径一致
+        self._pcd_file = os.path.expanduser(self._pcd_file)
+        self._map_output_dir = os.path.expanduser(self._map_output_dir)
+
         # 输出目录：为空则与 pcd_file 同目录
         if not self._map_output_dir:
             self._map_output_dir = str(Path(self._pcd_file).parent)
@@ -314,6 +319,8 @@ class PcdToMap(Node):
         self._prev_mission_status = ''
         self._converting = False        # 防止重入
         self._convert_lock = threading.Lock()
+        self._save_cli = None           # /fast_lio2/map_save 客户端（懒创建）
+        self._fallback_timer = None     # map_save 无响应时的兜底定时器
 
         # ---- 发布 ----
         self._status_pub = self.create_publisher(String, '/pcd_to_map/status', 10)
@@ -359,14 +366,69 @@ class PcdToMap(Node):
                 current != 'MAPPING'):
             self.get_logger().info(
                 f'[pcd_to_map] 检测到建图结束（{self._prev_mission_status} → {current}），'
-                f'等待 PCD 文件写入完成后自动触发转换...'
+                f'请求 FAST-LIO2 保存地图后自动转换...'
             )
-            # 延迟 3s 等待 FAST-LIO2 完成磁盘写入
-            timer = threading.Timer(3.0, self._do_convert)
-            timer.daemon = True
-            timer.start()
+            self._request_map_save_and_convert()
 
         self._prev_mission_status = current
+
+    # ------------------------------------------------------------------
+    # 建图结束：先请求 /fast_lio2/map_save 把内存地图写入 map_file_path
+    # ------------------------------------------------------------------
+    def _request_map_save_and_convert(self) -> None:
+        """在主 executor 线程中调用（订阅回调），避免在工作线程里做 ROS 服务调用。
+
+        map_save 是 FAST-LIO2 提供的 Trigger 服务，回调内把累积地图写到
+        map_file_path（即本节点的 pcd_file），写盘成功后再触发转换。
+        若服务长时间无响应（例如 FAST-LIO2 已退出），由兜底定时器回退到
+        “直接等待 PCD 文件出现”的旧逻辑。
+        """
+        try:
+            from std_srvs.srv import Trigger
+        except ImportError:
+            self.get_logger().warn(
+                '[pcd_to_map] std_srvs 不可用，跳过 map_save，直接等待 PCD 文件')
+            threading.Timer(3.0, self._do_convert).start()
+            return
+
+        if self._save_cli is None:
+            self._save_cli = self.create_client(Trigger, '/fast_lio2/map_save')
+
+        if self._fallback_timer is None:
+            # 兜底：15s 内 map_save 未返回则进入文件等待流程（原逻辑最多等 30s）
+            self._fallback_timer = self.create_timer(15.0, self._fallback_convert)
+
+        if not self._save_cli.service_is_ready():
+            self.get_logger().info(
+                '[pcd_to_map] /fast_lio2/map_save 尚未就绪，仍尝试调用（兜底定时器生效中）')
+
+        req = Trigger.Request()
+        future = self._save_cli.call_async(req)
+        future.add_done_callback(self._on_map_save_done)
+
+    def _on_map_save_done(self, future) -> None:
+        if self._fallback_timer is not None:
+            self._fallback_timer.cancel()
+            self._fallback_timer = None
+        try:
+            resp = future.result()
+            if resp.success:
+                self.get_logger().info(
+                    f'[pcd_to_map] FAST-LIO2 地图保存成功：{resp.message}')
+            else:
+                self.get_logger().warn(
+                    f'[pcd_to_map] FAST-LIO2 地图保存返回失败：{resp.message}')
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f'[pcd_to_map] 调用 /fast_lio2/map_save 异常：{e}')
+        # 等 1s 让磁盘写入落稳后开始转换
+        threading.Timer(1.0, self._do_convert).start()
+
+    def _fallback_convert(self) -> None:
+        self._fallback_timer = None
+        self.get_logger().warn(
+            '[pcd_to_map] /fast_lio2/map_save 长时间无响应，'
+            '回退为直接等待 PCD 文件出现')
+        threading.Timer(1.0, self._do_convert).start()
 
     # ------------------------------------------------------------------
     # 手动触发服务回调

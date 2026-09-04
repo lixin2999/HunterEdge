@@ -18,15 +18,22 @@
 namespace ch10x_driver
 {
 
-// CH10X 协议帧常量（文档 3.3.3：UART 自定义协议，含四元数/欧拉角/角速度/加速度）
-// 帧结构：0xAA 0x55 | TYPE(1B) | LEN(2B,小端) | PAYLOAD | CHECKSUM(1B)
-constexpr uint8_t FRAME_HEAD_1 = 0xAA;
-constexpr uint8_t FRAME_HEAD_2 = 0x55;
-constexpr uint8_t FRAME_TYPE_IMU = 0x01;
-// PAYLOAD = timestamp(4) + quaternion(4*4) + euler(3*4) + gyro(3*4) + accel(3*4)
-constexpr uint16_t PAYLOAD_LEN = 56;
-constexpr size_t FRAME_OVERHEAD = 5;   // 帧头2 + 类型1 + 长度2
-constexpr size_t FRAME_CHECKSUM = 1;   // 校验 1 字节
+// CH10X 串口协议（按厂商手册实测确认，帧长 82 字节 @100Hz）：
+//   5A A5 | LEN(2B 小端) | CRC16(2B 小端) | PAYLOAD(LEN 字节)
+//   LEN 即 0x91 数据域长度 = 76
+//   CRC16/XMODEM：初值 0x0000，先对 buf[0..4)（帧头+长度）更新，
+//   再接着对 buf[6..6+LEN)（数据域）更新，结果 == buf[4] | (buf[5]<<8)
+// 0x91 数据域布局（相对数据域起始 buf[6]）：
+//   +0  tag=0x91   +1  id(1B)     +2..3 reserved
+//   +4  pressure(float32, Pa)     +8 timestamp(uint32, ms)
+//   +12 acc[3](float32, 单位 G)   +24 gyr[3](float32, 单位 °/s)
+//   +36 mag[3](float32, 单位 uT)  +48 eul[3](float32, 单位 °)
+//   +60 quat[4](float32, w,x,y,z)
+constexpr uint8_t FRAME_HEAD_1 = 0x5A;
+constexpr uint8_t FRAME_HEAD_2 = 0xA5;
+constexpr uint8_t PACKET_TAG_91 = 0x91;
+constexpr size_t FRAME_HEADER_LEN = 6;   // 帧头2 + 长度2 + CRC16 2
+constexpr size_t PAYLOAD_LEN_91 = 76;    // 0x91 数据包的数据域长度
 
 // IMU 数据帧（协议解析结果）
 struct ImuData

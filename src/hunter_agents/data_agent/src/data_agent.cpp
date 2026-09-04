@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <utility>
@@ -90,6 +92,11 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   event_timer_ = create_wall_timer(
     std::chrono::milliseconds(100),
     std::bind(&DataAgent::detectEvents, this));
+
+  // 事件检测的上一帧时间必须用节点时钟初始化。
+  // 否则 rclcpp::Time 默认时钟源(RCL_SYSTEM_TIME)与 this->now()(RCL_ROS_TIME)不同，
+  // detectEvents 里 now - prev_time_ 会抛 "can't subtract times with different time sources"。
+  prev_time_ = this->now();
 
   RCLCPP_INFO(get_logger(), "data_agent 启动：vehicle=%s, brokers=%s",
     vehicle_id_.c_str(), kafka_brokers_.c_str());
@@ -349,6 +356,18 @@ void DataAgent::kafkaReconnect()
 
 bool DataAgent::sqliteInit()
 {
+  // 先确保数据库所在目录存在：sqlite3_open 遇到父目录缺失会直接返回
+  // SQLITE_CANTOPEN（"unable to open database file"），不会自动建目录。
+  try {
+    const std::filesystem::path db_path(db_path_);
+    if (db_path.has_parent_path()) {
+      std::filesystem::create_directories(db_path.parent_path());
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(get_logger(), "创建数据库目录失败: %s", e.what());
+    return false;
+  }
+
   const int rc = sqlite3_open(db_path_.c_str(), &db_);
   if (rc != SQLITE_OK) {
     RCLCPP_ERROR(get_logger(), "SQLite 打开失败: %s",

@@ -19,6 +19,7 @@
 #   retry_times       : 服务连接重试次数（默认 10）
 #   retry_interval    : 重试间隔秒数（默认 1.0）
 
+import os
 import sys
 import time
 
@@ -37,50 +38,41 @@ class FastLio2ParamInjector(Node):
         self.declare_parameter('pcd_save_en',        False)
         self.declare_parameter('map_file_path',      '')
         self.declare_parameter('pcd_save_interval',  -1)
-        self.declare_parameter('retry_times',        10)
+        self.declare_parameter('retry_times',        8)
         self.declare_parameter('retry_interval',     1.0)
+        # 单次 set_parameters 服务调用允许等待的最长时间（s）。
+        # fast_lio2 单线程 executor 被点云回调占用时参数服务响应可能很慢（实测 >5s），
+        # 放宽到 15s，避免每次都因过早取消而永远注入不成功。
+        self.declare_parameter('call_timeout',       15.0)
 
         self._target_node     = self.get_parameter('target_node').get_parameter_value().string_value
         self._pcd_save_en     = self.get_parameter('pcd_save_en').get_parameter_value().bool_value
-        self._map_file_path   = self.get_parameter('map_file_path').get_parameter_value().string_value
+        self._map_file_path   = os.path.expanduser(
+            self.get_parameter('map_file_path').get_parameter_value().string_value)
         self._interval        = self.get_parameter('pcd_save_interval').get_parameter_value().integer_value
         self._retry_times     = self.get_parameter('retry_times').get_parameter_value().integer_value
         self._retry_interval  = self.get_parameter('retry_interval').get_parameter_value().double_value
+        self._call_timeout    = self.get_parameter('call_timeout').get_parameter_value().double_value
+
+        # 只创建一次 client（重复 create_client 同一服务名在 rclpy 中会报错/导致行为异常）
+        self._cli = self.create_client(
+            SetParameters, f'/{self._target_node}/set_parameters')
 
         self.get_logger().info(
             f'fast_lio2_param_injector 启动\n'
             f'  目标节点       : /{self._target_node}\n'
             f'  pcd_save_en    : {self._pcd_save_en}\n'
             f'  map_file_path  : {self._map_file_path!r}\n'
-            f'  pcd_save_interval: {self._interval}'
+            f'  pcd_save_interval: {self._interval}\n'
+            f'  服务调用超时   : {self._call_timeout}s'
         )
 
         # 使用定时器触发注入（给 fast_lio2 节点足够的启动时间）
         self._attempt = 0
+        self._finished = False
         self._timer = self.create_timer(self._retry_interval, self._try_inject)
 
-    def _try_inject(self) -> None:
-        self._attempt += 1
-        srv_name = f'/{self._target_node}/set_parameters'
-
-        cli = self.create_client(SetParameters, srv_name)
-
-        if not cli.wait_for_service(timeout_sec=0.5):
-            if self._attempt >= self._retry_times:
-                self.get_logger().error(
-                    f'[注入失败] {srv_name} 服务在 {self._retry_times} 次重试后仍不可用。\n'
-                    f'  fast_lio2 节点可能未启动，请检查 localization.launch.py。\n'
-                    f'  ⚠ pcd_save_en 未能设置为 {self._pcd_save_en}，'
-                    f'需手动在 fast_lio2_params.yaml 中配置。'
-                )
-                self._timer.cancel()
-                # 非致命错误：打印警告后退出，不阻断整个系统
-                rclpy.shutdown()
-            else:
-                self.get_logger().info(
-                    f'等待 {srv_name} 服务（第 {self._attempt}/{self._retry_times} 次）...')
-            return
-
+    def _build_params(self):
         # 构造参数列表
         params = []
 
@@ -109,14 +101,45 @@ class FastLio2ParamInjector(Node):
 
         req = SetParameters.Request()
         req.parameters = params
+        return req
 
-        future = cli.call_async(req)
-        # 等待响应（最多 3s）
-        deadline = time.time() + 3.0
+    def _finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if self._timer is not None:
+            self._timer.cancel()
+        # one-shot：注入流程结束后关闭节点
+        rclpy.shutdown()
+
+    def _try_inject(self) -> None:
+        if self._finished:
+            return
+        self._attempt += 1
+        srv_name = f'/{self._target_node}/set_parameters'
+
+        if not self._cli.wait_for_service(timeout_sec=0.5):
+            if self._attempt >= self._retry_times:
+                self.get_logger().error(
+                    f'[注入失败] {srv_name} 服务在 {self._retry_times} 次重试后仍不可用。\n'
+                    f'  fast_lio2 节点可能未启动，请检查 localization.launch.py。\n'
+                    f'  ⚠ pcd_save_en 未能设置为 {self._pcd_save_en}，'
+                    f'需手动在 fast_lio2_params.yaml 中配置。'
+                )
+                self._finish()
+            else:
+                self.get_logger().info(
+                    f'等待 {srv_name} 服务（第 {self._attempt}/{self._retry_times} 次）...')
+            return
+
+        req = self._build_params()
+        future = self._cli.call_async(req)
+
+        # 等待响应（max call_timeout 秒）。期间用 spin_once 让本节点继续处理
+        # 服务发现/响应，避免单线程 executor 死等。
+        deadline = time.time() + self._call_timeout
         while not future.done() and time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
-
-        self._timer.cancel()
 
         if future.done():
             resp = future.result()
@@ -128,17 +151,29 @@ class FastLio2ParamInjector(Node):
                     f'  map_file_path={self._map_file_path!r}，'
                     f'  interval={self._interval}'
                 )
+                self._finish()
             else:
                 for i, r in enumerate(resp.results):
                     if not r.successful:
                         self.get_logger().warn(
-                            f'[注入部分失败] 参数 {params[i].name}：{r.reason}')
+                            f'[注入部分失败] 参数 {req.parameters[i].name}：{r.reason}')
+                self._finish()
         else:
-            self.get_logger().warn(
-                f'[注入超时] {srv_name} 调用超时，fast_lio2 pcd_save 参数可能未生效')
-
-        # one-shot：注入完成后关闭节点
-        rclpy.shutdown()
+            # 服务已存在但未在期限内应答：多半是 fast_lio2 此刻被点云处理占满。
+            # 取消本次等待，保留节点在后续轮次继续重试。
+            future.cancel()
+            if self._attempt >= self._retry_times:
+                self.get_logger().error(
+                    f'[注入失败] {srv_name} 调用 {self._retry_times} 次均超时'
+                    f'（>{self._call_timeout}s），fast_lio2 pcd_save 参数未生效，\n'
+                    f'  请确认 fast_lio2 点云/IMU 输入正常（见 rslidar_sdk XYZIRT 与 '
+                    f'/imu/data QoS 排查）。'
+                )
+                self._finish()
+            else:
+                self.get_logger().warn(
+                    f'[注入超时] {srv_name} 本次调用 {self._call_timeout:.0f}s 未响应'
+                    f'（第 {self._attempt}/{self._retry_times} 次），稍后自动重试')
 
 
 # ---------------------------------------------------------------------------

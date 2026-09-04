@@ -19,7 +19,10 @@ fast_lio2:
     filter_size_map: 0.5
     cube_side_length: 1000.0
     runtime_pos_log_enable: false
-    map_file_path: ""
+    # 默认保存地图到绝对路径：set_parameters 动态注入不可靠（fast_lio2 单线程 executor
+    # 被点云回调占满时服务长期无响应），故启动即配好；导航模式由 fast_lio2_param_injector
+    # 在运行时改回 false/''，若注入失败最多是多写一次地图，不再阻塞建图保存。
+    map_file_path: "/home/agilex/HunterEdge/maps/hunter_map.pcd"
 
     common:
       lid_topic:  "/lidar_points"          # 文档 3.3.1 RS-Helios-16P 驱动输出话题
@@ -59,7 +62,7 @@ fast_lio2:
       scan_bodyframe_pub_en: true
 
     pcd_save:
-      # 建图模式由 fast_lio2_param_injector 运行时注入 pcd_save_en=true + map_file_path
-      # 导航模式保持 false，避免无限写盘
-      pcd_save_en: false
+      # 默认开启 PCD 保存（见 map_file_path 说明），fast_lio2_param_injector
+      # 仍会按模式覆盖：建图模式保持 true，导航模式置 false 防无限写盘。
+      pcd_save_en: true
       interval: -1
