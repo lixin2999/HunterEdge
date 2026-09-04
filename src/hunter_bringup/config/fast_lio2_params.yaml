@@ -29,9 +29,11 @@ fast_lio2:
 
     preprocess:
       lidar_type: 2                        # 2 = Velodyne 机械旋转式（RS-Helios-16P 兼容）
+                                           # rslidar_sdk XYZIRT 模式输出 ring + time 字段（已通过
+                                           # pcl_point_cloud_msg.hpp 中 POINT_CLOUD_REGISTER 别名映射）
       scan_line: 16                        # 文档 3.3.1：RS-Helios-16P 为 16 线
       scan_rate: 10                        # 文档 3.3.1：10Hz
-      timestamp_unit: 2                    # 2 = microsecond（RS 雷达时间戳单位）
+      timestamp_unit: 0                    # 0 = second（RS XYZIRT 的 timestamp 字段为 double 秒）
       blind: 0.2                           # 文档 3.3.1：最近盲区 0.2m
 
     mapping:
