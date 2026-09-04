@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V1.0（开发指南）
+> **文档版本**：V1.1（开发指南）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -18,10 +18,11 @@
 - [7. 快速启动](#7-快速启动)
 - [8. ROS2 关键话题总览](#8-ros2-关键话题总览)
 - [9. 系统控制模式](#9-系统控制模式)
-- [10. 开发指引](#10-开发指引)
-- [11. 运维脚本说明](#11-运维脚本说明)
-- [12. 已知限制与注意事项](#12-已知限制与注意事项)
-- [13. 文档索引](#13-文档索引)
+- [10. 自主导航模块](#10-自主导航模块)
+- [11. 开发指引](#11-开发指引)
+- [12. 运维脚本说明](#12-运维脚本说明)
+- [13. 已知限制与注意事项](#13-已知限制与注意事项)
+- [14. 文档索引](#14-文档索引)
 
 ---
 
@@ -137,6 +138,7 @@
 | `hunter_perception/sensor_fusion` | 多传感器目标级数据融合（匈牙利关联 + 加权融合 + 可行驶区域） | §6 |
 | `hunter_monitor/health_monitor` | 系统监控与健康管理 | §15 |
 | `decision_making` | 模式仲裁决策（AUTO/REMOTE/ESTOP 状态机） | §13.5 |
+| `auto_mission` | AUTO 模式自主任务调度（航点巡航/安全守护/建图控制） | 自主导航扩展 |
 
 ### 4.2 第三方依赖包（外部依赖，需按 §5 安装）
 
@@ -234,6 +236,18 @@ ros2 launch hunter_bringup hunter_full.launch.py
 
 启动顺序（按设计文档 §4.4）：传感器驱动 → CAN 驱动 → 定位 → 感知 → 融合 → 决策 → 规划 → 控制 → Agent → 监控。
 
+**可选参数开关**：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `use_perception` | `true` | 是否启动感知模块 |
+| `use_navigation` | `true` | 是否启动 Nav2（`use_autonomous_nav=true` 时自动禁用） |
+| `use_data_agent` | `true` | 是否启动数据采集 Agent |
+| `use_autonomous_nav` | `false` | 是否启动自主导航全栈（建图/巡航） |
+| `autonomous_nav_mode` | `nav` | `nav`=导航巡航模式，`mapping`=建图模式 |
+| `map_yaml_path` | `/home/hunter/maps/hunter_map.yaml` | 导航模式地图 YAML 路径 |
+| `map_file_path` | `/home/hunter/maps/hunter_map.pcd` | 建图模式 PCD 保存路径 |
+
 ### 7.2 仅启动感知
 
 ```bash
@@ -253,7 +267,25 @@ ros2 launch hunter_bringup navigation.launch.py
 ros2 launch hunter_bringup data_agent.launch.py
 ```
 
-> 💡 **【开发者视角】** 模块化启动便于逐模块联调；`hunter_full.launch.py` 支持 `use_perception`/`use_navigation`/`use_data_agent` 等参数开关（见设计文档 §4.4）。
+### 7.5 自主导航模式启动
+
+详见 [§10 自主导航模块](#10-自主导航模块)，快速命令：
+
+```bash
+# 全系统 + 在线建图（边建图边记录航点）
+ros2 launch hunter_bringup hunter_full.launch.py \
+  use_autonomous_nav:=true \
+  autonomous_nav_mode:=mapping \
+  map_file_path:=/home/hunter/maps/hunter_map.pcd
+
+# 全系统 + 自主航点巡航（加载已有地图）
+ros2 launch hunter_bringup hunter_full.launch.py \
+  use_autonomous_nav:=true \
+  autonomous_nav_mode:=nav \
+  map_yaml_path:=/home/hunter/maps/hunter_map.yaml
+```
+
+> 💡 **【开发者视角】** 模块化启动便于逐模块联调；`hunter_full.launch.py` 的参数开关见上表（设计文档 §4.4）。
 
 ---
 
@@ -279,6 +311,10 @@ ros2 launch hunter_bringup data_agent.launch.py
 | `/control/command` | `hunter_msgs/ChassisCommand` | 50Hz | 最终控制指令 |
 | `/remote/command` | `hunter_msgs/ChassisCommand` | 20Hz | 远程控制指令 |
 | `/system/health` | `hunter_msgs/SystemHealth` | 1Hz | 系统健康状态 |
+| `/auto_mission/status` | `std_msgs/String` | 10Hz | 自主任务状态（IDLE/MAPPING/NAVIGATING/OBSTACLE_AVOID/ESTOP） |
+| `/auto_mission/current_waypoint` | `std_msgs/Int32` | 事件 | 当前执行的航点索引 |
+| `/pcd_to_map/status` | `std_msgs/String` | 事件 | PCD→地图转换状态（IDLE/CONVERTING/DONE/ERROR） |
+| `/navigate_to_pose` (action) | `nav2_msgs/NavigateToPose` | — | Nav2 单点导航 action 接口（方式B 外部下发） |
 
 > 自定义消息定义见设计文档 §4.3（`hunter_msgs`）。
 >
@@ -304,11 +340,112 @@ ros2 launch hunter_bringup data_agent.launch.py
 
 ---
 
-## 10. 开发指引
+## 10. 自主导航模块
+
+`auto_mission` 包实现 AUTO 模式下的完整自主导航能力，包含**建图模式**与**定位导航模式**，以及三个自动化工具节点，消除建图、转换、航点采集三项手动操作。
+
+### 10.1 模块架构
+
+```
+hunter_full.launch.py (use_autonomous_nav:=true)
+└── hunter_autonomous_nav.launch.py
+    ├── [mapping 模式]
+    │   ├── fast_lio2_param_injector  ← 自动注入 pcd_save_en=true + 路径
+    │   ├── auto_mission_node         ← 状态机（MAPPING 状态，不下发 goal）
+    │   ├── pcd_to_map                ← 建图结束自动 PCD→PGM+YAML 转换
+    │   └── waypoint_recorder         ← /clicked_point 自动写入航点 yaml
+    └── [nav 模式]
+        ├── fast_lio2_param_injector  ← 自动注入 pcd_save_en=false
+        ├── map_server                ← 加载静态 PGM 地图
+        ├── Nav2 全栈                 ← 使用 autonomous_navigate.xml 扩展行为树
+        └── auto_mission_node         ← 状态机（航点巡航/安全守护）
+```
+
+### 10.2 AUTO 进入条件（全部满足才允许导航）
+
+| 条件 | 检测方式 |
+|------|----------|
+| `decision_making` 输出 `mode == "AUTO"` | 订阅 `/planning/behavior_state` |
+| 无急停信号 | 订阅 `/estop` |
+| `SystemHealth` 非 `CRITICAL` | 订阅 `/system/health` |
+| 定位协方差迹 ≤ 0.5（可配） | 订阅 `/localization/odom` 协方差对角元素 |
+| 感知数据新鲜度 ≤ 2s（可配） | 订阅 `/perception/fused_objects` 时间戳 |
+
+### 10.3 任务状态机
+
+```
+IDLE ──[AUTO条件满足]──→ WAITING_LOCALIZE ──[收敛]──→ NAVIGATING
+IDLE ──[mapping模式]──→ MAPPING
+NAVIGATING ──[障碍物 < warn_dist]──→ OBSTACLE_AVOID ──[路清]──→ NAVIGATING
+NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
+任意状态 ──[非AUTO/急停]──→ IDLE / ESTOP
+```
+
+### 10.4 安全约束参数（`autonomous_nav_params.yaml`）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `warn_obstacle_dist` | 2.0 m | 障碍物减速警告距离 |
+| `stop_obstacle_dist` | 0.8 m | 障碍物急停距离 |
+| `obstacle_fov_deg` | 120° | 前向检测扇区 |
+| `localize_cov_threshold` | 0.5 | 定位协方差迹收敛阈值 |
+| `localize_wait_timeout` | 10 s | 等待定位收敛超时 |
+| `perception_timeout` | 2 s | 感知数据超时阈值 |
+| `max_velocity` | 1.5 m/s | 巡航速度（≤ 2.0 m/s 合规限制） |
+| `loop_waypoints` | `true` | 完成所有航点后是否循环 |
+| `goal_timeout` | 60 s | 单点导航超时 |
+| `obstacle_wait_timeout` | 30 s | 障碍物等待超时后触发 ESTOP |
+
+### 10.5 自动化工具节点
+
+| 节点 | 可执行文件 | 解决的手动操作 |
+|------|-----------|---------------|
+| `fast_lio2_param_injector` | 同名 | 自动向 `fast_lio2` 注入 `pcd_save_en` + `map_file_path` |
+| `pcd_to_map` | 同名 | 建图结束自动将 PCD 三维点云转换为 Nav2 栅格地图（.pgm + .yaml） |
+| `waypoint_recorder` | 同名 | 建图时 rviz2 点击即自动追加写入 `autonomous_nav_params.yaml` |
+
+### 10.6 扩展行为树
+
+`autonomous_navigate.xml` 在原 `navigate_to_pose.xml` 基础上新增：
+
+- **定位门控**：`TransformAvailable(map→base_link)` 前置检查，定位不可用时立即阻断导航；
+- **感知保鲜**：`TimeExpired(2s)` 哨兵，感知超时时清除局部代价地图并等待恢复；
+- **动态减速**：`SpeedController(0.4~2.0 m/s)`，障碍物距离 < 3m 时按比例降速；
+- **阿克曼后退**：`BackUp(0.3m)` 替代 `Spin`（原地旋转），适合阿克曼底盘脱困。
+
+### 10.7 新增/修改文件清单
+
+```
+src/
+├── auto_mission/                               ← 新增包
+│   ├── CMakeLists.txt
+│   ├── package.xml
+│   ├── config/
+│   │   └── autonomous_nav_params.yaml          ← 全部参数配置（含航点列表）
+│   ├── include/auto_mission/
+│   │   └── auto_mission_node.hpp
+│   ├── src/
+│   │   ├── auto_mission_node.cpp               ← 6态状态机 C++ 实现
+│   │   └── main.cpp
+│   └── scripts/
+│       ├── waypoint_recorder.py                ← 航点自动采集
+│       ├── pcd_to_map.py                       ← PCD→PGM 自动转换
+│       └── fast_lio2_param_injector.py         ← pcd_save 参数自动注入
+└── hunter_bringup/
+    ├── behavior_trees/
+    │   └── autonomous_navigate.xml             ← 扩展行为树（新增）
+    └── launch/
+        ├── hunter_full.launch.py               ← 修改：新增 4 个参数开关
+        └── hunter_autonomous_nav.launch.py     ← 新增一体化 launch
+```
+
+---
+
+## 11. 开发指引
 
 > 💡 **【开发者视角】**
 
-### 10.1 分模块 AI 任务清单
+### 11.1 分模块 AI 任务清单
 
 本项目按功能模块拆分为独立的开发/联调任务，每个模块均对应设计文档章节，便于分模块开发与验收：
 
@@ -331,8 +468,9 @@ ros2 launch hunter_bringup data_agent.launch.py
 | 任务 14 | 远程操控 Agent（systemd 服务） | §13 |
 | 任务 15 | 全系统总启动 launch | §4.4 |
 | 任务 16 | 运维 Shell 工具集 | §20.3 |
+| 任务 17 | 自主导航模块（auto_mission + 行为树扩展 + 三工具节点） | 自主导航扩展 |
 
-### 10.2 接口契约驱动开发原则
+### 11.2 接口契约驱动开发原则
 
 - 移动端模块之间以 `hunter_msgs` 自定义消息（设计文档 §4.3）为**接口契约**通过 ROS2 话题/服务通信；
 - 开发/修改模块时，**先对齐接口契约**（消息字段、话题名、频率、坐标系），再实现内部逻辑；
@@ -340,7 +478,7 @@ ros2 launch hunter_bringup data_agent.launch.py
 
 ---
 
-## 11. 运维脚本说明
+## 12. 运维脚本说明
 
 > 🔧 **【现场运维视角】** 脚本位于 `hunter_bringup/scripts/`，需先赋予执行权限：
 
@@ -355,27 +493,27 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 | `hunter_can_test.sh` | CAN 通信测试 |
 | `hunter_bag.sh` | ROS Bag 录制/回放 |
 
-### 11.1 系统状态
+### 12.1 系统状态
 
 ```bash
 ./hunter_status.sh          # 节点列表 + 关键节点存活 + CPU/内存/磁盘/温度
 ```
 
-### 11.2 日志查看/导出
+### 12.2 日志查看/导出
 
 ```bash
 ./hunter_log.sh                       # 查看最新日志
 ./hunter_log.sh /tmp/logs_export      # 导出并打包 tar.gz
 ```
 
-### 11.3 CAN 通信测试
+### 12.3 CAN 通信测试
 
 ```bash
 ./hunter_can_test.sh up      # 配置 can0 @ 500Kbps
 ./hunter_can_test.sh test    # 检测 0x211/0x221 底盘反馈报文
 ```
 
-### 11.4 Bag 录制/回放
+### 12.4 Bag 录制/回放
 
 ```bash
 ./hunter_bag.sh record                 # 录制默认话题
@@ -385,13 +523,11 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 
 ---
 
-
-
-## 12. 已知限制与注意事项
+## 13. 已知限制与注意事项
 
 > ⚠️ **【现场运维视角】** 联调与部署时需关注以下约束（均源自设计文档）。
 
-### 12.1 性能约束（设计文档 §18）
+### 13.1 性能约束（设计文档 §18）
 
 | 指标 | 设计值 |
 |------|--------|
@@ -402,23 +538,23 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 
 > 视觉感知（TensorRT + OpenCV CUDA）为 GPU 密集模块；高负载下注意散热与降频。
 
-### 12.2 默认限速与安全（设计文档 §19.3 / §10.5）
+### 13.2 默认限速与安全（设计文档 §19.3 / §10.5）
 
 - **默认最高速度 2.0 m/s**，可通过平台配置调整（最高不超过底盘 4.8 m/s）；
 - `/cmd_vel` 超时 > 500ms 自动停车；CAN 通信丢失 > 100ms 底盘自动制动；
 - 自动驾驶运行时需有安全员监控，可随时急停。
 
-### 12.3 传感器标定要求（设计文档 §20.2）
+### 13.3 传感器标定要求（设计文档 §20.2）
 
 - 需完成 **LiDAR-Camera 外参标定、LiDAR-IMU 外参标定、车辆运动学标定**；
 - 未标定或标定误差会直接影响感知融合与定位精度；关键配置（外参、控制参数）需校验后生效。
 
-### 12.4 散热与功耗模式（设计文档 §3.5 / 附录 B）
+### 13.4 散热与功耗模式（设计文档 §3.5 / 附录 B）
 
 - AGX Xavier 默认功耗模式 **MODE_15W**（15W TDP），附录 B 推荐 **MODE_30W**（平衡性能与散热）；
 - 温度 > 85℃ 降频告警，> 95℃ 触发保护性降载；依据场景选定功耗模式。
 
-### 12.5 CAN 通信（设计文档 §11.3 / 附录 A）
+### 13.5 CAN 通信（设计文档 §11.3 / 附录 A）
 
 启动底盘通信前需配置 CAN 接口（can0 @ 500Kbps）：
 
@@ -429,16 +565,16 @@ sudo ip link set can0 up
 
 核心报文：`0x111` 运动控制、`0x211` 系统状态、`0x221` 运动反馈。
 
-### 12.6 systemd 服务与非 ROS 进程（设计文档 §12 / §13）
+### 13.6 systemd 服务与非 ROS 进程（设计文档 §12 / §13）
 
 - **OTA Agent** 与 **Remote Agent** 为独立 systemd 服务（非 ROS 节点），需单独部署；
 - 两者通过 Kafka / WebSocket 与平台交互，Remote Agent 通过 rclpy 桥接发布 `/remote/command`。
 
-### 12.7 容器化可选（设计文档 §20.5）
+### 13.7 容器化可选（设计文档 §20.5）
 
 平台支持 Docker 镜像部署（`nvidia` 运行时 + host 网络 + 设备直通 + `--ipc=host`），与 OTA 升级（镜像拉取替换）协同；原生 colcon 工作空间部署仍为默认方式。
 
-### 12.8 常见故障排查（设计文档 §20.4）
+### 13.8 常见故障排查（设计文档 §20.4）
 
 | 故障现象 | 可能原因 | 排查步骤 |
 |----------|----------|----------|
@@ -452,19 +588,20 @@ sudo ip link set can0 up
 
 ---
 
-## 13. 文档索引
+## 14. 文档索引
 
 关联文档如下：
 
 | 文档 | 说明 |
 |------|------|
 | 《自动驾驶车辆系统详细设计文档 V2.0》 | 本项目的设计基准；本文档全部参数、话题、CAN 协议、坐标系均可追溯至其对应章节 |
-| AI 编码任务清单 | 分模块开发任务（任务 00 ~ 任务 16），指导按模块开发与验收 |
-| `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查流程） |
+| AI 编码任务清单 | 分模块开发任务（任务 00 ~ 任务 17），指导按模块开发与验收 |
+| `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程） |
+| `release.md` | 版本历史（V0.0.1 ~ 当前），记录每版主要功能与修复 |
 
-> **追溯原则**：本 README 中所有硬件参数（§2）、软件版本（§3）、话题（§8）、控制模式（§9）、限制（§12）均源自《自动驾驶车辆系统详细设计文档 V2.0》，未虚构功能。
+> **追溯原则**：本 README 中所有硬件参数（§2）、软件版本（§3）、话题（§8）、控制模式（§9）、限制（§13）均源自《自动驾驶车辆系统详细设计文档 V2.0》，未虚构功能。自主导航模块（§10）为在设计文档框架内的扩展实现。
 
 ---
 
-*HunterEdge 开发指南 · 文档版本 V1.0 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》*
+*HunterEdge 开发指南 · 文档版本 V1.1 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》*
 
