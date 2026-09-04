@@ -69,8 +69,8 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       resolution: 0.1                          # 文档 8.3：分辨率 0.1m
-      width: 100.0                             # 文档 8.3：100m × 100m
-      height: 100.0
+      width: 100                               # 文档 8.3：100m × 100m（Nav2 Humble 要求 integer）
+      height: 100
       footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       inflation_layer:
@@ -94,8 +94,8 @@ local_costmap:
       robot_base_frame: base_link
       rolling_window: true
       resolution: 0.05                         # 文档 8.3：分辨率 0.05m
-      width: 10.0                              # 文档 8.3：10m × 10m
-      height: 10.0
+      width: 10                                # 文档 8.3：10m × 10m（Nav2 Humble 要求 integer）
+      height: 10
       footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
       plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:

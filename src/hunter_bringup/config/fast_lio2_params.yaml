@@ -1,39 +1,63 @@
 # fast_lio2_params.yaml — FAST-LIO2 雷达惯导里程计参数
 # 出处：文档 7.2 FAST-LIO2 配置 + 3.3.1/3.3.3 传感器规格 + 附录 D 外参
+#
+# 参数格式说明：
+#   ROS2 参数文件顶层 key 是节点名，第二层固定为 ros__parameters。
+#   fast_lio2 源码用点号访问嵌套结构（如 "common.lid_topic"），
+#   在 YAML 里写成嵌套 map 或点号 key 均等价，这里用嵌套 map 保持可读性。
+#
+#   ⚠ 崩溃根因：mapping.extrinsic_T/extrinsic_R 为空 vector 时，
+#   源码 VEC_FROM_ARRAY/MAT_FROM_ARRAY 越界访问 → SIGSEGV（exit code -11）。
+#   必须提供完整的 3 元素 T 和 9 元素 R。
 
 fast_lio2:
   ros__parameters:
-    # ---- 激光雷达（文档 3.3.1 RS-Helios-16P） ----
-    lidar_topic: "/lidar_points"
-    lidar_type: "velodyne"          # 机械旋转式雷达
-    N_SCANS: 16                     # 16线
-    scan_rate: 10                   # 10Hz (600rpm)
-    downsample_rate: 1              # 文档 7.2：原始分辨率(可设2降采样)
-    lidar_min_range: 0.2            # 文档 3.3.1：0.2m ~ 150m
-    lidar_max_range: 150.0
-
-    # ---- IMU（文档 3.3.3 CH10X） ----
-    imu_topic: "/imu/data"
-    imu_freq: 100                   # 100Hz
-    acc_cov: 0.1
-    gyr_cov: 0.1
-    b_acc_cov: 0.0001
-    b_gyr_cov: 0.0001
-
-    # ---- LiDAR-IMU 外参（附录 D 推算：IMU 相对 LiDAR） ----
-    # IMU_base - LiDAR_base = (0.10-0.23, 0, 0.20-0.35) = (-0.13, 0, -0.15)
-    extrinsic_T: [-0.13, 0.0, -0.15]
-    extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-
-    # ---- 算法（文档 7.2） ----
-    filter_estimator: "IEKF"        # 迭代扩展卡尔曼滤波
-    map_management: "ikd-Tree"      # 增量式动态 k-d 树
-    max_odometry_freq: 10.0         # 文档 7.2：最大里程计频率 10Hz
-    imu_preintegration_freq: 100.0  # 文档 7.2：IMU预积分 100Hz
+    feature_extract_enable: false
     point_filter_num: 1
+    max_iteration: 3
     filter_size_surf: 0.5
     filter_size_map: 0.5
+    cube_side_length: 1000.0
+    runtime_pos_log_enable: false
+    map_file_path: ""
 
-    # ---- 输出 ----
-    publish_frame: "odom"
-    publish_odometry_topic: "/Odometry"   # 文档 7.3：FAST-LIO2 输出 /Odometry
+    common:
+      lid_topic:  "/lidar_points"          # 文档 3.3.1 RS-Helios-16P 驱动输出话题
+      imu_topic:  "/imu/data"              # 文档 3.3.3 CH10X IMU 话题
+      time_sync_en: false
+      time_offset_lidar_to_imu: 0.0
+
+    preprocess:
+      lidar_type: 2                        # 2 = Velodyne 机械旋转式（RS-Helios-16P 兼容）
+      scan_line: 16                        # 文档 3.3.1：RS-Helios-16P 为 16 线
+      scan_rate: 10                        # 文档 3.3.1：10Hz
+      timestamp_unit: 2                    # 2 = microsecond（RS 雷达时间戳单位）
+      blind: 0.2                           # 文档 3.3.1：最近盲区 0.2m
+
+    mapping:
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      fov_degree: 360.0
+      det_range: 150.0                     # 文档 3.3.1：最大探测距离 150m
+      extrinsic_est_en: false
+      # ---- LiDAR-IMU 外参（附录 D 推算：IMU 相对 LiDAR） ----
+      # ⚠ 必须提供完整 3 元素 T 和 9 元素 R，否则 VEC_FROM_ARRAY 越界 → SIGSEGV
+      # IMU_base - LiDAR_base ≈ (-0.13, 0, -0.15)
+      extrinsic_T: [-0.13, 0.0, -0.15]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+
+    publish:
+      path_en: false
+      scan_publish_en: true
+      dense_publish_en: true
+      scan_bodyframe_pub_en: true
+
+    pcd_save:
+      # 建图模式由 fast_lio2_param_injector 运行时注入 pcd_save_en=true + map_file_path
+      # 导航模式保持 false，避免无限写盘
+      pcd_save_en: false
+      interval: -1

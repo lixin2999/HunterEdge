@@ -84,35 +84,28 @@ auto_mission_node:
       - "0.0,5.0,3.1416,检查点C"
       - "0.0,0.0,0.0,返回起点"
 
+    # -------------------------------------------------------------------------
+    # 建图模式参数（autonomous_nav_mode: mapping 时生效）
+    # -------------------------------------------------------------------------
+    # FAST-LIO2 在线建图输出 PCD 保存配置
+    # 说明：fast_lio2 通过参数 pcd_save_en=true + map_file_path 控制建图保存
+    #       结束建图时发送 SIGINT（Ctrl+C）触发保存
+    pcd_save_en: true
+    map_file_path: "/home/hunter/maps/hunter_map.pcd"  # 地图保存绝对路径
+    pcd_save_interval: -1    # -1: 全部帧保存为单文件；>0: 每 N 帧保存一次（内存受限时使用）
 
-# =============================================================================
-# 建图模式参数（hunter_autonomous_nav.launch.py 中 mode:=mapping 时使用）
-# =============================================================================
-mapping:
-  # FAST-LIO2 在线建图输出 PCD 保存配置
-  # 说明：fast_lio2 通过参数 pcd_save_en=true + map_file_path 控制建图保存
-  #       结束建图时发送 SIGINT（Ctrl+C）或调用以下命令保存地图
-  pcd_save_en: true
-  map_file_path: "/home/hunter/maps/hunter_map.pcd"  # 地图保存绝对路径
-  pcd_save_interval: -1    # -1: 全部帧保存为单文件；>0: 每 N 帧保存一次（内存受限时使用）
+    # 建图时关闭 Nav2 代价地图更新以节省计算资源
+    disable_costmap_during_mapping: true
 
-  # 建图时关闭 Nav2 代价地图更新以节省计算资源
-  disable_costmap_during_mapping: true
+    # -------------------------------------------------------------------------
+    # 导航模式参数（autonomous_nav_mode: nav 时生效）
+    # -------------------------------------------------------------------------
+    # 加载已保存的静态地图文件（PGM+YAML 格式，由 nav2_map_server 加载）
+    # 注意：map_yaml_path 指向 .yaml 元数据文件，同目录下需有同名 .pgm 栅格文件
+    map_yaml_path: "/home/hunter/maps/hunter_map.yaml"
 
-# =============================================================================
-# 导航模式参数（hunter_autonomous_nav.launch.py 中 mode:=nav 时使用）
-# =============================================================================
-navigation:
-  # 加载已保存的静态地图文件（PGM+YAML 格式，由 nav2_map_server 加载）
-  # 注意：map_file_path 指向 .yaml 元数据文件，同目录下需有同名 .pgm 栅格文件
-  map_yaml_path: "/home/hunter/maps/hunter_map.yaml"
+    # 本系统已有 FAST-LIO2+EKF 作为定位源，默认不启动 AMCL
+    use_amcl: false
 
-  # AMCL 初始位姿（导航模式下建议手动设置或由 /initialpose 话题提供）
-  # 若使用 FAST-LIO2 作为全局定位（不用 AMCL），此字段忽略
-  use_amcl: false   # 本系统已有 FAST-LIO2+EKF 作为定位源，默认不启动 AMCL
-
-  # 代价地图障碍物来源（与 nav2_params.yaml 一致）
-  # 全局代价地图：/perception/lidar/obstacle_cloud（激光障碍点云）
-  # 局部代价地图：/perception/lidar/obstacle_cloud
-  # 融合对象额外注入：auto_mission_node 通过观察 /perception/fused_objects 执行应用层安全保护
-  costmap_obstacle_topic: "/perception/lidar/obstacle_cloud"
+    # 代价地图障碍物来源（与 nav2_params.yaml 一致）
+    costmap_obstacle_topic: "/perception/lidar/obstacle_cloud"
