@@ -67,12 +67,30 @@ bool TensorRTInference::loadEngine(const std::string & engine_path)
   const auto input_dims = engine_->getTensorShape(input_name_.c_str());
   input_h_ = input_dims.d[2];
   input_w_ = input_dims.d[3];
+  if (input_h_ <= 0 || input_w_ <= 0) {
+    std::cerr << "[TensorRT] 引擎输入维度无效：H=" << input_h_
+              << " W=" << input_w_ << "，引擎文件可能损坏或未正确转换。"
+              << " 请重新执行：trtexec --onnx=yolov8s.onnx"
+              << " --saveEngine=/data/models/yolov8s.engine --fp16" << std::endl;
+    context_.reset();
+    engine_.reset();
+    runtime_.reset();
+    return false;
+  }
   input_buffer_.resize(3 * input_h_ * input_w_);
 
   // 输出维度 (1, 4+num_classes, num_boxes)
   const auto output_dims = engine_->getTensorShape(output_name_.c_str());
   num_classes_ = output_dims.d[1] - 4;
   num_boxes_ = output_dims.d[2];
+  if (num_classes_ <= 0 || num_boxes_ <= 0) {
+    std::cerr << "[TensorRT] 引擎输出维度无效：num_classes=" << num_classes_
+              << " num_boxes=" << num_boxes_ << "，引擎文件可能损坏。" << std::endl;
+    context_.reset();
+    engine_.reset();
+    runtime_.reset();
+    return false;
+  }
   output_buffer_.resize((4 + num_classes_) * num_boxes_);
 
   return true;
@@ -82,6 +100,9 @@ bool TensorRTInference::infer(const cv::Mat & image, std::vector<BBox2D> & boxes
 {
   boxes.clear();
   if (!context_) {
+    return false;
+  }
+  if (input_w_ <= 0 || input_h_ <= 0) {
     return false;
   }
 
