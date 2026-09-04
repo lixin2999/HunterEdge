@@ -91,7 +91,7 @@ auto_mission_node:
     # 说明：fast_lio2 通过参数 pcd_save_en=true + map_file_path 控制建图保存
     #       结束建图时发送 SIGINT（Ctrl+C）触发保存
     pcd_save_en: true
-    map_file_path: "/home/hunter/maps/hunter_map.pcd"  # 地图保存绝对路径
+    map_file_path: "/home/agilex/HunterEdge/maps/hunter_map.pcd"  # 地图保存绝对路径
     pcd_save_interval: -1    # -1: 全部帧保存为单文件；>0: 每 N 帧保存一次（内存受限时使用）
 
     # 建图时关闭 Nav2 代价地图更新以节省计算资源
@@ -102,7 +102,7 @@ auto_mission_node:
     # -------------------------------------------------------------------------
     # 加载已保存的静态地图文件（PGM+YAML 格式，由 nav2_map_server 加载）
     # 注意：map_yaml_path 指向 .yaml 元数据文件，同目录下需有同名 .pgm 栅格文件
-    map_yaml_path: "/home/hunter/maps/hunter_map.yaml"
+    map_yaml_path: "/home/agilex/HunterEdge/maps/hunter_map.yaml"
 
     # 本系统已有 FAST-LIO2+EKF 作为定位源，默认不启动 AMCL
     use_amcl: false

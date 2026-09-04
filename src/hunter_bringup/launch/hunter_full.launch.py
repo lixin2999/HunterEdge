@@ -71,13 +71,13 @@ def generate_launch_description():
     # 导航地图路径（传递给 hunter_autonomous_nav.launch.py）
     declare_map_yaml_path = DeclareLaunchArgument(
         'map_yaml_path',
-        default_value='/home/hunter/maps/hunter_map.yaml',
+        default_value='/home/agilex/HunterEdge/maps/hunter_map.yaml',
         description='[use_autonomous_nav=true, autonomous_nav_mode=nav] 静态地图 YAML 文件路径',
     )
     # 建图 PCD 保存路径
     declare_map_file_path = DeclareLaunchArgument(
         'map_file_path',
-        default_value='/home/hunter/maps/hunter_map.pcd',
+        default_value='/home/agilex/HunterEdge/maps/hunter_map.pcd',
         description='[use_autonomous_nav=true, autonomous_nav_mode=mapping] PCD 保存路径',
     )
 
@@ -128,8 +128,8 @@ def generate_launch_description():
         if use_auto.lower() != 'true':
             return []
         mode         = context.launch_configurations.get('autonomous_nav_mode', 'nav')
-        map_yaml     = context.launch_configurations.get('map_yaml_path', '/home/hunter/maps/hunter_map.yaml')
-        map_file     = context.launch_configurations.get('map_file_path', '/home/hunter/maps/hunter_map.pcd')
+        map_yaml     = context.launch_configurations.get('map_yaml_path', '/home/agilex/HunterEdge/maps/hunter_map.yaml')
+        map_file     = context.launch_configurations.get('map_file_path', '/home/agilex/HunterEdge/maps/hunter_map.pcd')
         return [
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(

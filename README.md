@@ -245,8 +245,8 @@ ros2 launch hunter_bringup hunter_full.launch.py
 | `use_data_agent` | `true` | 是否启动数据采集 Agent |
 | `use_autonomous_nav` | `false` | 是否启动自主导航全栈（建图/巡航） |
 | `autonomous_nav_mode` | `nav` | `nav`=导航巡航模式，`mapping`=建图模式 |
-| `map_yaml_path` | `/home/hunter/maps/hunter_map.yaml` | 导航模式地图 YAML 路径 |
-| `map_file_path` | `/home/hunter/maps/hunter_map.pcd` | 建图模式 PCD 保存路径 |
+| `map_yaml_path` | `/home/agilex/HunterEdge/maps/hunter_map.yaml` | 导航模式地图 YAML 路径 |
+| `map_file_path` | `/home/agilex/HunterEdge/maps/hunter_map.pcd` | 建图模式 PCD 保存路径 |
 
 ### 7.2 仅启动感知
 
@@ -276,13 +276,13 @@ ros2 launch hunter_bringup data_agent.launch.py
 ros2 launch hunter_bringup hunter_full.launch.py \
   use_autonomous_nav:=true \
   autonomous_nav_mode:=mapping \
-  map_file_path:=/home/hunter/maps/hunter_map.pcd
+  map_file_path:=/home/agilex/HunterEdge/maps/hunter_map.pcd
 
 # 全系统 + 自主航点巡航（加载已有地图）
 ros2 launch hunter_bringup hunter_full.launch.py \
   use_autonomous_nav:=true \
   autonomous_nav_mode:=nav \
-  map_yaml_path:=/home/hunter/maps/hunter_map.yaml
+  map_yaml_path:=/home/agilex/HunterEdge/maps/hunter_map.yaml
 ```
 
 > 💡 **【开发者视角】** 模块化启动便于逐模块联调；`hunter_full.launch.py` 的参数开关见上表（设计文档 §4.4）。

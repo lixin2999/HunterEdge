@@ -306,14 +306,14 @@ def generate_launch_description():
     # 导航模式下的静态地图 YAML 路径
     declare_map_yaml = DeclareLaunchArgument(
         'map_yaml_path',
-        default_value='/home/hunter/maps/hunter_map.yaml',
+        default_value='/home/agilex/HunterEdge/maps/hunter_map.yaml',
         description='[nav 模式] nav2_map_server 加载的地图 YAML 文件绝对路径',
     )
 
     # 建图模式下 PCD 保存路径（传递给 fast_lio2 参数）
     declare_map_file = DeclareLaunchArgument(
         'map_file_path',
-        default_value='/home/hunter/maps/hunter_map.pcd',
+        default_value='/home/agilex/HunterEdge/maps/hunter_map.pcd',
         description='[mapping 模式] FAST-LIO2 保存 PCD 文件的绝对路径',
     )
 

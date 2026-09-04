@@ -84,14 +84,14 @@ class FastLio2ParamInjector(Node):
         # 构造参数列表
         params = []
 
-        # pcd_save_en（bool）
+        # pcd_save.pcd_save_en（bool）—— fast_lio2 实际 declare 名为 "pcd_save.pcd_save_en"
         p_save = Parameter()
-        p_save.name = 'pcd_save_en'
+        p_save.name = 'pcd_save.pcd_save_en'
         p_save.value.type = ParameterType.PARAMETER_BOOL
         p_save.value.bool_value = self._pcd_save_en
         params.append(p_save)
 
-        # map_file_path（string）
+        # map_file_path（string）—— fast_lio2 顶层参数，无命名空间前缀
         if self._map_file_path:
             p_path = Parameter()
             p_path.name = 'map_file_path'
@@ -99,10 +99,10 @@ class FastLio2ParamInjector(Node):
             p_path.value.string_value = self._map_file_path
             params.append(p_path)
 
-        # pcd_save_interval（int）—— 仅建图模式写入
+        # pcd_save.interval（int）—— fast_lio2 实际 declare 名为 "pcd_save.interval"，仅建图模式写入
         if self._pcd_save_en:
             p_interval = Parameter()
-            p_interval.name = 'pcd_save_interval'
+            p_interval.name = 'pcd_save.interval'
             p_interval.value.type = ParameterType.PARAMETER_INTEGER
             p_interval.value.integer_value = self._interval
             params.append(p_interval)

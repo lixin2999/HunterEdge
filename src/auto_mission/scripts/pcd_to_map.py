@@ -12,7 +12,7 @@
 #   7. 发布 /pcd_to_map/status 话题上报状态：IDLE / CONVERTING / DONE / ERROR
 #
 # 参数：
-#   pcd_file        : PCD 文件绝对路径（默认 /home/hunter/maps/hunter_map.pcd）
+#   pcd_file        : PCD 文件绝对路径（默认 /home/agilex/HunterEdge/maps/hunter_map.pcd）
 #   map_output_dir  : PGM/YAML 输出目录（默认与 pcd_file 同目录）
 #   map_name        : 输出文件名前缀（默认 hunter_map）
 #   resolution      : 栅格分辨率，m/pixel（默认 0.05 m，与 local_costmap 一致）
@@ -282,7 +282,7 @@ class PcdToMap(Node):
         super().__init__('pcd_to_map')
 
         # ---- 参数声明 ----
-        self.declare_parameter('pcd_file',        '/home/hunter/maps/hunter_map.pcd')
+        self.declare_parameter('pcd_file',        '/home/agilex/HunterEdge/maps/hunter_map.pcd')
         self.declare_parameter('map_output_dir',  '')          # 空 = 与 pcd_file 同目录
         self.declare_parameter('map_name',        'hunter_map')
         self.declare_parameter('resolution',      0.05)
