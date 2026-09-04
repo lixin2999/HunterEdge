@@ -17,7 +17,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, GroupAction,
-                             IncludeLaunchDescription)
+                             IncludeLaunchDescription, OpaqueFunction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
@@ -119,20 +119,31 @@ def generate_launch_description():
                                condition=IfCondition(_nav_condition))
 
     # ---- 6b. 自主导航全栈（可选，use_autonomous_nav=true 时启动） ----
-    # 显式传入子模式和路径参数，因为 _isolated(scoped=True, forwarding=False) 会阻断参数透传。
-    # 注意：launch_arguments 的值必须是 substitution 列表形式 [LaunchConfiguration(...)]，
-    # 直接传 LaunchConfiguration 对象在 scoped GroupAction 里会因作用域隔离报 does not exist。
-    autonomous_nav = _isolated(
-        PythonLaunchDescriptionSource(
-            os.path.join(pkg_share, 'launch', 'hunter_autonomous_nav.launch.py')
-        ),
-        condition=IfCondition(use_autonomous_nav),
-        launch_arguments={
-            'mode':          [autonomous_nav_mode],
-            'map_yaml_path': [LaunchConfiguration('map_yaml_path')],
-            'map_file_path': [LaunchConfiguration('map_file_path')],
-        },
-    )
+    # 用 OpaqueFunction 在运行时读取父作用域的值，再构建 IncludeLaunchDescription。
+    # 原因：GroupAction(forwarding=False) 建立空作用域后立即对 launch_arguments 里的
+    # LaunchConfiguration 求值，此时父作用域已被清空，导致 does not exist 错误。
+    # OpaqueFunction 在 execute 阶段运行，此时父作用域的参数已完成 Declare，可正常读取。
+    def _launch_autonomous_nav(context, *args, **kwargs):
+        use_auto = context.launch_configurations.get('use_autonomous_nav', 'false')
+        if use_auto.lower() != 'true':
+            return []
+        mode         = context.launch_configurations.get('autonomous_nav_mode', 'nav')
+        map_yaml     = context.launch_configurations.get('map_yaml_path', '/home/hunter/maps/hunter_map.yaml')
+        map_file     = context.launch_configurations.get('map_file_path', '/home/hunter/maps/hunter_map.pcd')
+        return [
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(pkg_share, 'launch', 'hunter_autonomous_nav.launch.py')
+                ),
+                launch_arguments={
+                    'mode':          mode,
+                    'map_yaml_path': map_yaml,
+                    'map_file_path': map_file,
+                }.items(),
+            )
+        ]
+
+    autonomous_nav = OpaqueFunction(function=_launch_autonomous_nav)
 
     # ---- 7. Agent（数据采集，文档 14；remote/ota 为 systemd 服务） ----
     data_agent     = _isolated(src('data_agent', 'launch', 'data_agent.launch.py'),
