@@ -27,7 +27,7 @@ from launch_ros.actions import PushRosNamespace
 def _isolated(source, *, condition=None, launch_arguments=None):
     """将子 launch 包裹在 GroupAction 中，重置所有父级 LaunchConfiguration，
     避免 use_perception 等参数被透传到不认识它们的子包（如 realsense2_camera）。
-    launch_arguments: 可选的 dict，用于向子 launch 显式传参，例如 {'port_name': 'can0'}。"""
+    launch_arguments: 可选的 dict，用于向子 launch 显式传参，例如 {'port_name': 'can_car'}。"""
     kwargs = {}
     if condition is not None:
         kwargs['condition'] = condition
@@ -95,9 +95,9 @@ def generate_launch_description():
     imu_driver     = _isolated(src('ch10x_driver',     'launch', 'ch10x_driver.launch.py'))
 
     # ---- 2. CAN 驱动（hunter_base，文档 11） ----
-    # port_name 显式指定为 can0，覆盖 hunter_base 默认的 can_car
+    # port_name 显式指定为 can_car，覆盖 hunter_base 默认的 can_car
     can_driver     = _isolated(src('hunter_base',      'launch', 'hunter_base.launch.py'),
-                               launch_arguments={'port_name': 'can0'})
+                               launch_arguments={'port_name': 'can_car'})
 
     # ---- 3. 定位（fast_lio + EKF，文档 7） ----
     localization   = _isolated(local_src('localization.launch.py'))
