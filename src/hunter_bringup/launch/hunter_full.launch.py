@@ -91,7 +91,14 @@ def generate_launch_description():
 
     # ---- 1. 传感器驱动（文档 2.3 驱动层） ----
     lidar_driver   = _isolated(src('rslidar_sdk',      'launch', 'humble_start.py'))
-    camera_driver  = _isolated(src('realsense2_camera','launch', 'rs_launch.py'))
+    # publish_tf=false（V0.0.68 现场教训）：驱动自带的 camera_link 系与 URDF
+    # （文档 7.4：fixed base_link → camera_color_optical_frame）构成同一 frame
+    # 双父，TF 树分裂成 base_link / camera_link 两棵，sensor_fusion lookupTransform
+    # 报 "unconnected trees"。相机外参唯一来源是 URDF 静态 TF（文档 7.4 不含
+    # camera_link），驱动 TF 树无消费者，关闭即修复；副作用仅 RViz 失去
+    # realsense 原生 TF 视角，调试需要时可单独补静态发布器。
+    camera_driver  = _isolated(src('realsense2_camera','launch', 'rs_launch.py'),
+                               launch_arguments={'publish_tf': 'false'})
     imu_driver     = _isolated(src('ch10x_driver',     'launch', 'ch10x_driver.launch.py'))
 
     # ---- 2. CAN 驱动（hunter_base，文档 11） ----
