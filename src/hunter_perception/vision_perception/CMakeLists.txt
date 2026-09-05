@@ -12,6 +12,19 @@ find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(hunter_msgs REQUIRED)
+# 双 OpenCV 环境隔离（修复 setSize 断言，详见 release.md V0.0.67）：
+# 目标机 /usr/local 装有源码编译的 OpenCV 4.10.0（CUDA），CMake 默认优先选中它，
+# 节点随之按 4.10 编译链接；而系统 cv_bridge 是针对系统 OpenCV 4.5.4 构建的。
+# 同一进程混链两套 OpenCV（ldd 可见 410 与 4.5d 并存 + "may conflict" 警告）会发生
+# 符号交叉绑定，运行期在 4.10 的 setSize 上触发 matrix.cpp:246 `s >= 0` 断言，每帧必现。
+# 此处强制选中系统 OpenCV（与 cv_bridge 同源），保证进程内只存在一套 OpenCV。
+# 副作用：GPU 预处理分支（HAVE_OPENCV_CUDA）自动关闭，改走 CPU 预处理
+# （640x480@30fps 的 resize+cvtColor 负载极小）；TensorRT 推理仍走 GPU，不受影响。
+# 若未来要恢复 GPU 预处理，前置条件是将 cv_bridge 一并针对 /usr/local OpenCV
+# 重新编译（workspace 内 shadow 构建），确保全进程单一 OpenCV 版本。
+if(EXISTS "/usr/lib/aarch64-linux-gnu/cmake/opencv4")
+  set(OpenCV_DIR "/usr/lib/aarch64-linux-gnu/cmake/opencv4")
+endif()
 find_package(OpenCV REQUIRED)
 
 # 检测 OpenCV 是否包含 CUDA 模块（cudaimgproc / cudawarping）
