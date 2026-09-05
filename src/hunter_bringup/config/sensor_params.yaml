@@ -3,7 +3,7 @@
 
 lidar:
   model: "RS-Helios-16P"            # 文档 3.3.1
-  frame_id: "lidar"
+  frame_id: "rslidar"                # 与 URDF link（rslidar）、rslidar_sdk ros_frame_id 一致
   topic: "/lidar_points"
   rate: 10                          # 10Hz (600rpm)
   lines: 16                         # 16线

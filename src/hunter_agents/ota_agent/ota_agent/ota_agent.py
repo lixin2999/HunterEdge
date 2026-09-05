@@ -312,7 +312,7 @@ class OtaAgent:
 
     def _can_ok(self):
         try:
-            out = subprocess.run(["timeout", "1", "candump", "can_car", "-n", "1"],
+            out = subprocess.run(["timeout", "1", "candump", "can0", "-n", "1"],
                                  capture_output=True, text=True)
             return "211" in out.stdout
         except Exception:

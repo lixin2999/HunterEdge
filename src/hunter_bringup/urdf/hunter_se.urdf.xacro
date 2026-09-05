@@ -61,8 +61,8 @@
     </inertial>
   </link>
 
-  <!-- ========== lidar（LiDAR 光心，X前/Y左/Z上） ========== -->
-  <link name="lidar">
+  <!-- ========== rslidar（LiDAR 光心，X前/Y左/Z上；与 rslidar_sdk ros_frame_id 一致） ========== -->
+  <link name="rslidar">
     <visual>
       <geometry>
         <cylinder radius="0.05" length="0.08"/>
@@ -74,7 +74,7 @@
   </link>
   <joint name="lidar_joint" type="fixed">
     <parent link="base_link"/>
-    <child link="lidar"/>
+    <child link="rslidar"/>
     <origin xyz="${lidar_x} ${lidar_y} ${lidar_z}" rpy="0 0 0"/>
   </joint>
 

@@ -48,7 +48,7 @@ def generate_launch_description():
 
     # =====================================================================
     # 3. 静态 TF（文档 7.4）
-    #    base_link → lidar/camera_color_optical_frame/imu：由 robot_state_publisher 发布
+    #    base_link → rslidar/camera_color_optical_frame/imu：由 robot_state_publisher 发布
     #    odom → base_link：由 EKF publish_tf=true 发布（ekf_params.yaml）
     #    map → odom：由后续全局定位模块发布（本 launch 不含）
     # =====================================================================

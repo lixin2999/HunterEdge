@@ -2,7 +2,7 @@
 # hunter_can_test.sh — CAN 通信测试工具（文档 20.3 / 11.3）
 set -euo pipefail
 
-CAN_IF="${CAN_IF:-can_car}"
+CAN_IF="${CAN_IF:-can0}"
 BITRATE="${BITRATE:-500000}"
 
 usage() {
@@ -13,7 +13,7 @@ usage() {
   echo "  send    发送 0x111 停车指令"
   echo "  test    检测底盘反馈报文（0x211/0x221，文档附录A）"
   echo ""
-  echo "环境变量: CAN_IF（默认 can_car）、BITRATE（默认 500000）"
+  echo "环境变量: CAN_IF（默认 can0）、BITRATE（默认 500000）"
 }
 
 if [ "$#" -lt 1 ]; then
@@ -23,6 +23,8 @@ fi
 
 case "$1" in
   up)
+    echo "加载 gs_usb 内核模块（USB-CAN 适配器驱动，须在 ip link 前完成）..."
+    sudo modprobe gs_usb || true
     echo "配置 $CAN_IF @ ${BITRATE}bps ..."
     sudo ip link set "$CAN_IF" type can bitrate "$BITRATE" || true
     sudo ip link set "$CAN_IF" up

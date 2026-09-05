@@ -509,7 +509,7 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 ### 12.3 CAN 通信测试
 
 ```bash
-./hunter_can_test.sh up      # 配置 can_car @ 500Kbps
+./hunter_can_test.sh up      # 加载 gs_usb 并配置 can0 @ 500Kbps
 ./hunter_can_test.sh test    # 检测 0x211/0x221 底盘反馈报文
 ```
 
@@ -556,11 +556,12 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 
 ### 13.5 CAN 通信（设计文档 §11.3 / 附录 A）
 
-启动底盘通信前需配置 CAN 接口（can_car @ 500Kbps）：
+启动底盘通信前需先加载 gs_usb 驱动并配置 CAN 接口（can0 @ 500Kbps）：
 
 ```bash
-sudo ip link set can_car type can bitrate 500000
-sudo ip link set can_car up
+sudo modprobe gs_usb
+sudo ip link set can0 type can bitrate 500000
+sudo ip link set can0 up
 ```
 
 核心报文：`0x111` 运动控制、`0x211` 系统状态、`0x221` 运动反馈。
@@ -578,7 +579,7 @@ sudo ip link set can_car up
 
 | 故障现象 | 可能原因 | 排查步骤 |
 |----------|----------|----------|
-| CAN 无数据 | 接线 / 波特率 / 驱动 | 检查 CAN 线、`ip link show can_car`、`candump can_car` |
+| CAN 无数据 | 接线 / 波特率 / 驱动 | 检查 CAN 线、`ip link show can0`、`candump can0` |
 | LiDAR 无点云 | 网络 / 电源 / IP 配置 | `ping` LiDAR IP、检查供电、`rosnode list` |
 | 相机无图像 | USB 连接 / 权限 | 检查 USB、`ls /dev/video*`、权限配置 |
 | 定位漂移大 | IMU 标定 / 轮速 / 外参 | 检查 IMU 数据、外参文件、EKF 参数 |

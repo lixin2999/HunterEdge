@@ -1,4 +1,4 @@
-"""加载 HUNTER SE URDF/Xacro 并发布静态 TF（base_link → lidar/camera_color_optical_frame/imu）。
+"""加载 HUNTER SE URDF/Xacro 并发布静态 TF（base_link → rslidar/camera_color_optical_frame/imu）。
 
 依据文档 7.4 坐标系定义、附录 D 传感器安装示意。
 """

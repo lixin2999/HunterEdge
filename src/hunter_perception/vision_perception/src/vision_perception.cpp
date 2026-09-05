@@ -147,11 +147,17 @@ VisionPerception::on_shutdown(const rclcpp_lifecycle::State &)
 
 void VisionPerception::depthCallback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
-  // 消息元数据校验：驱动切换 profile / 异常瞬间可能发出损坏帧，
-  // 直接转换会让 OpenCV 以非法（负）尺寸创建 Mat 并抛 cv::Exception
+  // 消息元数据校验：驱动切换 profile / USB 链路抖动瞬间可能发出损坏帧，
+  // 直接转换会让 OpenCV 以非法（负）尺寸创建 Mat 并抛 cv::Exception。
+  // width/height 必须设上限，且乘法用 64 位：uint32 乘法会回绕，
+  // 超大损坏宽度（≥2^31）会把 step < width*3 判成 false 从而绕过校验，
+  // 随后 cv_bridge 以负 int 宽度构造 cv::Mat，触发
+  // matrix.cpp:246 "(-215) s >= 0 in function 'setSize'"（现场日志已复现）
+  constexpr uint32_t kMaxImageDim = 8192;
   if (!msg || msg->width == 0 || msg->height == 0 ||
-    msg->step < static_cast<uint32_t>(msg->width) * 2 ||
-    msg->data.size() < static_cast<size_t>(msg->step) * msg->height)
+    msg->width > kMaxImageDim || msg->height > kMaxImageDim ||
+    msg->step < static_cast<uint64_t>(msg->width) * 2 ||
+    msg->data.size() < static_cast<uint64_t>(msg->step) * msg->height)
   {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 5000,
@@ -196,10 +202,13 @@ void VisionPerception::colorCallback(const sensor_msgs::msg::Image::SharedPtr ms
   }
 
   // 消息元数据校验：损坏帧（width/height/step/data 不自洽）直接转换会让
-  // OpenCV 以非法（负）尺寸创建 Mat 并抛 cv::Exception
+  // OpenCV 以非法（负）尺寸创建 Mat 并抛 cv::Exception。
+  // 与深度回调相同：维度上限 + 64 位乘法，堵住 uint32 乘法回绕漏洞
+  constexpr uint32_t kMaxImageDim = 8192;
   if (msg->width == 0 || msg->height == 0 ||
-    msg->step < static_cast<uint32_t>(msg->width) * 3 ||
-    msg->data.size() < static_cast<size_t>(msg->step) * msg->height)
+    msg->width > kMaxImageDim || msg->height > kMaxImageDim ||
+    msg->step < static_cast<uint64_t>(msg->width) * 3 ||
+    msg->data.size() < static_cast<uint64_t>(msg->step) * msg->height)
   {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 5000,
