@@ -2,7 +2,7 @@
 # hunter_can_test.sh — CAN 通信测试工具（文档 20.3 / 11.3）
 set -euo pipefail
 
-CAN_IF="${CAN_IF:-can0}"
+CAN_IF="${CAN_IF:-can2}"
 BITRATE="${BITRATE:-500000}"
 
 usage() {
@@ -13,7 +13,7 @@ usage() {
   echo "  send    发送 0x111 停车指令"
   echo "  test    检测底盘反馈报文（0x211/0x221，文档附录A）"
   echo ""
-  echo "环境变量: CAN_IF（默认 can0）、BITRATE（默认 500000）"
+  echo "环境变量: CAN_IF（默认 can2）、BITRATE（默认 500000）"
 }
 
 if [ "$#" -lt 1 ]; then

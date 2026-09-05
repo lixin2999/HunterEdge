@@ -509,7 +509,7 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 ### 12.3 CAN 通信测试
 
 ```bash
-./hunter_can_test.sh up      # 配置 can0 @ 500Kbps（仅 USB-CAN 适配器需先 modprobe gs_usb）
+./hunter_can_test.sh up      # 配置 can2 @ 500Kbps
 ./hunter_can_test.sh test    # 检测 0x211/0x221 底盘反馈报文
 ```
 
@@ -556,16 +556,16 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 
 ### 13.5 CAN 通信（设计文档 §11.3 / 附录 A）
 
-启动底盘通信前需配置 CAN 接口（can0 @ 500Kbps）。说明：
-- 本车 CAN 为 Jetson 板载 mttcan 控制器（`parentdev c310000.mttcan`，内核自带），**无需 modprobe**；
-  仅当使用 USB-CAN 适配器（gs_usb 类）且接口不存在时才需 `sudo modprobe gs_usb`；
-- 接口 UP 状态下改波特率会报 `Device or resource busy`，需先 `sudo ip link set can0 down`；
-- 建议加 `restart-ms` 总线自动恢复：`sudo ip link set can0 type can restart-ms 100`。
+启动底盘通信前需配置 CAN 接口（can2 @ 500Kbps）。拓扑与说明：
+- AGX Xavier 与 Hunter SE 底盘通过 USB-CAN 适配器相连，适配器枚举为 **can2**（实测 candump 可见 0x211/0x221/0x231/0x241/0x251 等底盘反馈帧）；
+- can0 为 Jetson 板载 mttcan 控制器（`parentdev c310000.mttcan`），未接底盘线束，candump 静默属正常；
+- 接口 UP 状态下改波特率会报 `Device or resource busy`，需先 `sudo ip link set can2 down`；
+- 建议加总线故障自动恢复：`sudo ip link set can2 type can restart-ms 100`。
 
 ```bash
-sudo ip link set can0 type can bitrate 500000   # 若已为 500Kbps 可跳过
-sudo ip link set can0 up
-candump can0 -n 5                                # 期待 0x151/0x221/0x241 底盘心跳帧
+sudo ip link set can2 type can bitrate 500000   # 若已为 500Kbps 可跳过
+sudo ip link set can2 up
+candump can2 -n 5                                # 期待 0x211/0x221/0x241 等底盘反馈帧
 ```
 
 核心报文：`0x111` 运动控制、`0x211` 系统状态、`0x221` 运动反馈。
@@ -583,7 +583,7 @@ candump can0 -n 5                                # 期待 0x151/0x221/0x241 底�
 
 | 故障现象 | 可能原因 | 排查步骤 |
 |----------|----------|----------|
-| CAN 无数据 | 接线 / 波特率 / 驱动 | 检查 CAN 线、`ip link show can0`、`candump can0` |
+| CAN 无数据 | 接线 / 波特率 / 驱动 | 检查 CAN 线、`ip link show can2`、`candump can2` |
 | LiDAR 无点云 | 网络 / 电源 / IP 配置 | `ping` LiDAR IP、检查供电、`rosnode list` |
 | 相机无图像 | USB 连接 / 权限 | 检查 USB、`ls /dev/video*`、权限配置 |
 | 定位漂移大 | IMU 标定 / 轮速 / 外参 | 检查 IMU 数据、外参文件、EKF 参数 |
