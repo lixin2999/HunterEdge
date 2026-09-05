@@ -509,7 +509,7 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 ### 12.3 CAN 通信测试
 
 ```bash
-./hunter_can_test.sh up      # 加载 gs_usb 并配置 can0 @ 500Kbps
+./hunter_can_test.sh up      # 配置 can0 @ 500Kbps（仅 USB-CAN 适配器需先 modprobe gs_usb）
 ./hunter_can_test.sh test    # 检测 0x211/0x221 底盘反馈报文
 ```
 
@@ -556,12 +556,16 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 
 ### 13.5 CAN 通信（设计文档 §11.3 / 附录 A）
 
-启动底盘通信前需先加载 gs_usb 驱动并配置 CAN 接口（can0 @ 500Kbps）：
+启动底盘通信前需配置 CAN 接口（can0 @ 500Kbps）。说明：
+- 本车 CAN 为 Jetson 板载 mttcan 控制器（`parentdev c310000.mttcan`，内核自带），**无需 modprobe**；
+  仅当使用 USB-CAN 适配器（gs_usb 类）且接口不存在时才需 `sudo modprobe gs_usb`；
+- 接口 UP 状态下改波特率会报 `Device or resource busy`，需先 `sudo ip link set can0 down`；
+- 建议加 `restart-ms` 总线自动恢复：`sudo ip link set can0 type can restart-ms 100`。
 
 ```bash
-sudo modprobe gs_usb
-sudo ip link set can0 type can bitrate 500000
+sudo ip link set can0 type can bitrate 500000   # 若已为 500Kbps 可跳过
 sudo ip link set can0 up
+candump can0 -n 5                                # 期待 0x151/0x221/0x241 底盘心跳帧
 ```
 
 核心报文：`0x111` 运动控制、`0x211` 系统状态、`0x221` 运动反馈。

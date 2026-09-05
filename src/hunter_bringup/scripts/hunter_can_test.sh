@@ -23,8 +23,11 @@ fi
 
 case "$1" in
   up)
-    echo "加载 gs_usb 内核模块（USB-CAN 适配器驱动，须在 ip link 前完成）..."
-    sudo modprobe gs_usb || true
+    if ! ip link show "$CAN_IF" >/dev/null 2>&1; then
+      echo "接口 $CAN_IF 不存在，尝试加载 gs_usb（仅 USB-CAN 适配器需要；"
+      echo "Jetson 板载 mttcan 控制器内核自带，无需此步）..."
+      sudo modprobe gs_usb || echo "gs_usb 加载失败（若为板载 CAN 控制器可忽略）"
+    fi
     echo "配置 $CAN_IF @ ${BITRATE}bps ..."
     sudo ip link set "$CAN_IF" type can bitrate "$BITRATE" || true
     sudo ip link set "$CAN_IF" up
