@@ -2,8 +2,6 @@
 // 视觉感知节点实现（文档 5.2：OpenCV-CUDA 预处理 + TensorRT 推理 + 深度投影）
 #include "vision_perception/vision_perception.hpp"
 
-#include <cv_bridge/cv_bridge.h>
-
 #include <algorithm>
 #include <cmath>
 #include <exception>
@@ -24,6 +22,49 @@ std::string classifyName(int class_id)
     case 1: case 3: return "cyclist";       // bicycle, motorcycle
     default: return "obstacle";
   }
+}
+
+// sensor_msgs::Image → cv::Mat 转换（V0.0.68：替代 cv_bridge::toCvCopy）。
+// 背景：系统 cv_bridge（/opt/ros/humble/lib/libcv_bridge.so）是预编译库，
+// 其 ELF 依赖 libopencv_core.so.4.5d；而本节点按 /usr/local OpenCV 4.10.0（CUDA）
+// 编译链接。只要继续链接 cv_bridge，进程内必然混链 4.10 与 4.5d 两套 OpenCV，
+// cv::Mat 跨库传递会破坏不变量（matrix.cpp:246 setSize 断言，V0.0.67 已定位根因）。
+// 本实现与 toCvCopy 语义等价（深拷贝、输出连续存储、rgb8→bgr8 走 cvtColor、
+// step 行距正确处理），但全部符号落在 4.10 一套内；
+// 不支持的目标/源编码组合返回空 Mat，由调用方走告警路径。
+// msg->data 在回调生命周期内有效：先建零拷贝视图，再 clone/cvtColor 产出深拷贝。
+cv::Mat imageMsgToMat(
+  const sensor_msgs::msg::Image::SharedPtr & msg, const std::string & desired_encoding)
+{
+  // 元数据自洽兜底（回调入口的校验器已拦截异常帧，此处防御性复查）
+  if (msg->data.size() < static_cast<uint64_t>(msg->step) * msg->height) {
+    return {};
+  }
+
+  // 目标 BGR8：rgb8/bgr8 源（与 toCvCopy(msg, "bgr8") 语义一致）
+  if (desired_encoding == "bgr8") {
+    cv::Mat view(msg->height, msg->width, CV_8UC3, msg->data.data(), msg->step);
+    if (msg->encoding == "bgr8") {
+      return view.clone();
+    }
+    if (msg->encoding == "rgb8") {
+      cv::Mat bgr;
+      cv::cvtColor(view, bgr, cv::COLOR_RGB2BGR);
+      return bgr;
+    }
+    return {};
+  }
+
+  // 目标 16UC1：16UC1/mono16 源内存布局等价，直接深拷贝（与 toCvCopy(msg, "16UC1") 一致）
+  if (desired_encoding == "16UC1") {
+    if (msg->encoding == "16UC1" || msg->encoding == "mono16") {
+      cv::Mat view(msg->height, msg->width, CV_16UC1, msg->data.data(), msg->step);
+      return view.clone();
+    }
+    return {};
+  }
+
+  return {};
 }
 }  // namespace
 
@@ -151,7 +192,7 @@ void VisionPerception::depthCallback(const sensor_msgs::msg::Image::SharedPtr ms
   // 直接转换会让 OpenCV 以非法（负）尺寸创建 Mat 并抛 cv::Exception。
   // width/height 必须设上限，且乘法用 64 位：uint32 乘法会回绕，
   // 超大损坏宽度（≥2^31）会把 step < width*3 判成 false 从而绕过校验，
-  // 随后 cv_bridge 以负 int 宽度构造 cv::Mat，触发
+  // 随后转换层以负 int 宽度构造 cv::Mat（原 cv_bridge 路径），触发
   // matrix.cpp:246 "(-215) s >= 0 in function 'setSize'"（现场日志已复现）
   constexpr uint32_t kMaxImageDim = 8192;
   if (!msg || msg->width == 0 || msg->height == 0 ||
@@ -169,10 +210,16 @@ void VisionPerception::depthCallback(const sensor_msgs::msg::Image::SharedPtr ms
 
   std::lock_guard<std::mutex> lock(depth_mutex_);
   try {
-    depth_img_ = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_16UC1)->image;
+    // 替代 cv_bridge::toCvCopy（进程内只保留一套 OpenCV 4.10.0，见 imageMsgToMat 注释）
+    cv::Mat converted = imageMsgToMat(msg, "16UC1");
+    if (converted.empty()) {
+      // 编码不支持等转换失败：保留上一帧有效深度，不更新 depth_received_
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000, "深度图转换失败: %s", msg->encoding.c_str());
+      return;
+    }
+    depth_img_ = std::move(converted);
     depth_received_ = true;
-  } catch (const cv_bridge::Exception & e) {
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "深度图转换失败: %s", e.what());
   } catch (const cv::Exception & e) {
     // OpenCV 异常只丢帧，不允许逃出回调导致节点 abort
     RCLCPP_WARN_THROTTLE(
@@ -235,11 +282,11 @@ void VisionPerception::colorCallback(const sensor_msgs::msg::Image::SharedPtr ms
 void VisionPerception::processColorFrame(
   const sensor_msgs::msg::Image::SharedPtr msg, const rclcpp::Time & now)
 {
-  // 1. Image → cv::Mat
+  // 1. Image → cv::Mat（替代 cv_bridge::toCvCopy，保证进程内单一 OpenCV 4.10.0）
   cv::Mat color;
   try {
-    color = cv_bridge::toCvCopy(msg, "bgr8")->image;
-  } catch (const cv_bridge::Exception & e) {
+    color = imageMsgToMat(msg, "bgr8");
+  } catch (const cv::Exception & e) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "彩色图像转换失败: %s", e.what());
     return;
   }

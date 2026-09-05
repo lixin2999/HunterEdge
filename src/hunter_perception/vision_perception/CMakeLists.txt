@@ -10,22 +10,24 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
-find_package(cv_bridge REQUIRED)
 find_package(hunter_msgs REQUIRED)
-# 双 OpenCV 环境隔离（修复 setSize 断言，详见 release.md V0.0.67）：
-# 目标机 /usr/local 装有源码编译的 OpenCV 4.10.0（CUDA），CMake 默认优先选中它，
-# 节点随之按 4.10 编译链接；而系统 cv_bridge 是针对系统 OpenCV 4.5.4 构建的。
-# 同一进程混链两套 OpenCV（ldd 可见 410 与 4.5d 并存 + "may conflict" 警告）会发生
-# 符号交叉绑定，运行期在 4.10 的 setSize 上触发 matrix.cpp:246 `s >= 0` 断言，每帧必现。
-# 此处强制选中系统 OpenCV（与 cv_bridge 同源），保证进程内只存在一套 OpenCV。
-# 副作用：GPU 预处理分支（HAVE_OPENCV_CUDA）自动关闭，改走 CPU 预处理
-# （640x480@30fps 的 resize+cvtColor 负载极小）；TensorRT 推理仍走 GPU，不受影响。
-# 若未来要恢复 GPU 预处理，前置条件是将 cv_bridge 一并针对 /usr/local OpenCV
-# 重新编译（workspace 内 shadow 构建），确保全进程单一 OpenCV 版本。
-if(EXISTS "/usr/lib/aarch64-linux-gnu/cmake/opencv4")
-  set(OpenCV_DIR "/usr/lib/aarch64-linux-gnu/cmake/opencv4")
+# OpenCV 版本策略（V0.0.68，取代 V0.0.67 的"强制系统 4.5.4"方案）：
+# 目标机两套 OpenCV：/usr/local 源码编译的 4.10.0（含 CUDA，pkg-config/python cv2
+# 均为 4.10.0）与 apt 的 4.5.4（仅被预编译 cv_bridge 依赖，无 CUDA）。
+# 决策：节点全程使用 4.10.0，保留 GPU 预处理。
+# 硬约束不变：进程内绝不允许混链两套 OpenCV（V0.0.67 已定位为 setSize 断言根因）。
+# 唯一的 4.5d 入口是系统 cv_bridge（预编译库，NEED libopencv_*.so.4.5d，无法重定向），
+# 故本包已解除 cv_bridge 依赖，sensor_msgs→cv::Mat 转换由包内 imageMsgToMat() 等价实现；
+# 链接里不再出现 /opt/ros/humble/lib/libcv_bridge.so，realsense2_camera 等其他节点不受影响。
+# CACHE 写法保留教训：find_package(config 模式) 只保证消费 <pkg>_DIR 的 cache 条目，
+# 普通 set() 变量会被无视（现场已复现过一次）。
+if(NOT DEFINED CACHE{OpenCV_DIR} AND EXISTS "/usr/local/lib/cmake/opencv4")
+  set(OpenCV_DIR "/usr/local/lib/cmake/opencv4" CACHE PATH
+    "/usr/local OpenCV 4.10.0（CUDA）配置目录；不存在时请核查源码编译安装布局")
 endif()
 find_package(OpenCV REQUIRED)
+# 配置期可见性：configure 输出必须能一眼看出选中了哪套 OpenCV（防再犯）
+message(STATUS "vision_perception: OpenCV ${OpenCV_VERSION} 选自 ${OpenCV_DIR}")
 
 # 检测 OpenCV 是否包含 CUDA 模块（cudaimgproc / cudawarping）
 # 有些环境（无 GPU 或仅安装 CPU-only OpenCV）不包含这些模块
@@ -118,7 +120,6 @@ ament_target_dependencies(vision_perception_node
   rclcpp_lifecycle
   sensor_msgs
   nav_msgs
-  cv_bridge
   hunter_msgs
 )
 target_link_libraries(vision_perception_node
