@@ -107,22 +107,33 @@ bool TensorRTInference::infer(const cv::Mat & image, std::vector<BBox2D> & boxes
   }
 
   // 预处理（resize + BGR→RGB）
-  // 有 CUDA OpenCV 时走 GPU 路径（延迟更低），否则降级为 CPU 路径
+  // GPU→CPU 运行时降级（V0.0.68 现场教训）：GPU 路径失败（典型：
+  // "no kernel image is available" = OpenCV 编译时 CUDA_ARCH_BIN 未含本机
+  // 计算能力（现场实例：AGX Orin=8.7 的机器按 Xavier=7.2 编译）不得整帧
+  // 丢弃导致感知停摆，
+  // 自动降级 CPU 继续推理，仅提示一次；重编 OpenCV 后重启节点即自动恢复 GPU。
   cv::Mat rgb;
+  bool preprocessed = false;
 #ifdef HAVE_OPENCV_CUDA
-  {
-    cv::cuda::GpuMat gpu_in(image), gpu_resized, gpu_rgb;
-    cv::cuda::resize(gpu_in, gpu_resized, cv::Size(input_w_, input_h_));
-    cv::cuda::cvtColor(gpu_resized, gpu_rgb, cv::COLOR_BGR2RGB);
-    gpu_rgb.download(rgb);
+  if (!cuda_preprocess_degraded_) {
+    try {
+      cv::cuda::GpuMat gpu_in(image), gpu_resized, gpu_rgb;
+      cv::cuda::resize(gpu_in, gpu_resized, cv::Size(input_w_, input_h_));
+      cv::cuda::cvtColor(gpu_resized, gpu_rgb, cv::COLOR_BGR2RGB);
+      gpu_rgb.download(rgb);
+      preprocessed = true;
+    } catch (const cv::Exception & e) {
+      cuda_preprocess_degraded_ = true;
+      std::cerr << "[TensorRT] OpenCV CUDA 预处理不可用，永久降级 CPU（本提示仅一次）: "
+                << e.what() << std::endl;
+    }
   }
-#else
-  {
+#endif
+  if (!preprocessed) {
     cv::Mat resized;
     cv::resize(image, resized, cv::Size(input_w_, input_h_));
     cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
   }
-#endif
   rgb.convertTo(rgb, CV_32FC3, 1.0f / 255.0f);
 
   const int h = input_h_;

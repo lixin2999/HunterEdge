@@ -88,6 +88,9 @@ private:
 
   float conf_threshold_;
   float nms_threshold_;
+
+  // GPU 预处理运行时失败后置 true，永久降级 CPU 路径（进程内标志，重启即重试）
+  bool cuda_preprocess_degraded_ = false;
 };
 
 }  // namespace vision_perception
