@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <mutex>
 #include <utility>
 
@@ -146,12 +147,30 @@ VisionPerception::on_shutdown(const rclcpp_lifecycle::State &)
 
 void VisionPerception::depthCallback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
+  // 消息元数据校验：驱动切换 profile / 异常瞬间可能发出损坏帧，
+  // 直接转换会让 OpenCV 以非法（负）尺寸创建 Mat 并抛 cv::Exception
+  if (!msg || msg->width == 0 || msg->height == 0 ||
+    msg->step < static_cast<uint32_t>(msg->width) * 2 ||
+    msg->data.size() < static_cast<size_t>(msg->step) * msg->height)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "深度图消息无效（width=%u height=%u step=%u data=%zu），跳过",
+      msg ? msg->width : 0, msg ? msg->height : 0,
+      msg ? msg->step : 0, msg ? msg->data.size() : 0);
+    return;
+  }
+
   std::lock_guard<std::mutex> lock(depth_mutex_);
   try {
     depth_img_ = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_16UC1)->image;
     depth_received_ = true;
   } catch (const cv_bridge::Exception & e) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "深度图转换失败: %s", e.what());
+  } catch (const cv::Exception & e) {
+    // OpenCV 异常只丢帧，不允许逃出回调导致节点 abort
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000, "深度图 OpenCV 异常（已跳过本帧）: %s", e.what());
   }
 }
 
@@ -176,6 +195,37 @@ void VisionPerception::colorCallback(const sensor_msgs::msg::Image::SharedPtr ms
     return;
   }
 
+  // 消息元数据校验：损坏帧（width/height/step/data 不自洽）直接转换会让
+  // OpenCV 以非法（负）尺寸创建 Mat 并抛 cv::Exception
+  if (msg->width == 0 || msg->height == 0 ||
+    msg->step < static_cast<uint32_t>(msg->width) * 3 ||
+    msg->data.size() < static_cast<size_t>(msg->step) * msg->height)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "彩色图像消息无效（width=%u height=%u step=%u data=%zu encoding=%s），跳过",
+      msg->width, msg->height, msg->step, msg->data.size(), msg->encoding.c_str());
+    return;
+  }
+
+  // 帧处理全流程兜底：任何 OpenCV/标准异常都只丢弃当前帧，
+  // 不允许异常逃出回调导致节点 abort（感知崩溃会连带触发整车故障降级）
+  try {
+    processColorFrame(msg, now);
+  } catch (const cv::Exception & e) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "OpenCV 异常，已跳过本帧（节点继续运行）: %s", e.what());
+  } catch (const std::exception & e) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "帧处理异常，已跳过本帧（节点继续运行）: %s", e.what());
+  }
+}
+
+void VisionPerception::processColorFrame(
+  const sensor_msgs::msg::Image::SharedPtr msg, const rclcpp::Time & now)
+{
   // 1. Image → cv::Mat
   cv::Mat color;
   try {

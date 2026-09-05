@@ -3,7 +3,9 @@
 #ifndef DATA_AGENT__DATA_AGENT_HPP_
 #define DATA_AGENT__DATA_AGENT_HPP_
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -21,7 +23,7 @@
 namespace data_agent
 {
 
-class DataAgent : public rclcpp::Node
+class DataAgent : public rclcpp::Node, public RdKafka::DeliveryReportCb
 {
 public:
   explicit DataAgent(const rclcpp::NodeOptions & options);
@@ -45,6 +47,11 @@ private:
   bool kafkaInit();
   bool kafkaProduce(const std::string & topic, const std::string & payload);
   void kafkaReconnect();   // 指数退避重连（文档 14.6）
+  // 链路可用判定：producer 存在 + 投递已被证实可用 + 本地队列未积压。
+  // 注意：produce() 成功只代表消息进入本地队列，不等于送达 broker
+  bool kafkaReady();
+  // 投递报告回调（librdkafka 内部线程调用，异步证实消息是否真正送达）
+  void dr_cb(RdKafka::Message & msg) override;
 
   // SQLite 缓存（文档 14.6）
   bool sqliteInit();
@@ -73,7 +80,11 @@ private:
 
   // Kafka / SQLite
   RdKafka::Producer * producer_;
-  bool kafka_connected_;
+  std::atomic<bool> kafka_connected_;  // 由投递报告回调异步更新（跨线程）
+  int kafka_queue_limit_;              // 本地队列积压上限（条），超过转 SQLite 缓存
+  int kafka_flush_timeout_ms_;         // 退出时 flush 超时（毫秒）
+  std::atomic<uint64_t> dr_ok_count_{0};    // 投递成功计数
+  std::atomic<uint64_t> dr_fail_count_{0};  // 投递失败计数
   sqlite3 * db_;
 
   // 订阅

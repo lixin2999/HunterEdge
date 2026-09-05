@@ -48,6 +48,9 @@ private:
   void colorCallback(const sensor_msgs::msg::Image::SharedPtr msg);
   void depthCallback(const sensor_msgs::msg::Image::SharedPtr msg);
   void checkTimeout();
+  // 帧处理主流程（由 colorCallback 调用；异常在回调处兜底，避免节点 abort）
+  void processColorFrame(
+    const sensor_msgs::msg::Image::SharedPtr msg, const rclcpp::Time & now);
 
   // 2D→3D 投影（文档 5.2.1：相机内参 + 深度图）
   bool projectTo3D(const BBox2D & box, const cv::Mat & depth, Detection3D & det);

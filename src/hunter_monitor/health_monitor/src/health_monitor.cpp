@@ -17,19 +17,24 @@ namespace health_monitor
 namespace
 {
 // 传感器话题频率监控（文档 15.3：低于阈值持续 duration 秒判定异常）
-void checkTopicFrequency(
+// 返回本窗口实测频率（窗口未满 1s 返回 -1.0）
+double checkTopicFrequency(
   TopicMonitor & mon, const rclcpp::Time & now, rclcpp::Logger logger,
-  rclcpp::Clock & clock)
+  rclcpp::Clock & clock, bool in_grace)
 {
   const double dt = (now - mon.window_start).seconds();
   if (dt < 1.0) {
-    return;
+    return -1.0;
   }
   const double freq = mon.msg_count / dt;
   mon.msg_count = 0;
   mon.window_start = now;
 
   if (freq < mon.min_rate) {
+    // 启动宽限期内话题未上线属正常（各节点启动有先后），不计异常
+    if (in_grace) {
+      return freq;
+    }
     if (!mon.anomaly) {
       mon.anomaly = true;
       mon.anomaly_since = now.seconds();
@@ -45,6 +50,7 @@ void checkTopicFrequency(
     mon.anomaly = false;
     mon.anomaly_since = -1.0;
   }
+  return freq;
 }
 }  // namespace
 
@@ -62,6 +68,7 @@ HealthMonitor::HealthMonitor(const rclcpp::NodeOptions & options)
   declare_parameter("report_interval", 1.0);
   declare_parameter("restart_limit", 3);        // 文档 15.2
   declare_parameter("restart_window", 300.0);   // 5 分钟
+  declare_parameter("startup_grace_period", 15.0);  // 启动宽限期：期间不判异常/不计重启
   declare_parameter("warning_temp", 85.0);      // 文档 3.5
   declare_parameter("critical_temp", 95.0);     // 文档 3.5
   // 传感器频率阈值（文档 15.3）
@@ -79,10 +86,12 @@ HealthMonitor::HealthMonitor(const rclcpp::NodeOptions & options)
   report_interval_ = get_parameter("report_interval").as_double();
   restart_limit_ = static_cast<int>(get_parameter("restart_limit").as_int());
   restart_window_ = get_parameter("restart_window").as_double();
+  startup_grace_period_ = get_parameter("startup_grace_period").as_double();
   warning_temp_ = get_parameter("warning_temp").as_double();
   critical_temp_ = get_parameter("critical_temp").as_double();
 
   const rclcpp::Time now = this->now();
+  start_time_ = now;  // 启动宽限期起点
   // 传感器频率监控（文档 15.3 阈值：LiDAR<8Hz/2s、Camera<10Hz/2s、IMU<50Hz/1s、CAN<5Hz/1s）
   lidar_mon_ = {"lidar",
     get_parameter("lidar_min_rate").as_double(),
@@ -153,10 +162,26 @@ void HealthMonitor::checkHealth()
   const rclcpp::Time now = this->now();
 
   // 1. 传感器频率监控（文档 15.3）
-  checkTopicFrequency(lidar_mon_, now, get_logger(), *get_clock());
-  checkTopicFrequency(camera_mon_, now, get_logger(), *get_clock());
-  checkTopicFrequency(imu_mon_, now, get_logger(), *get_clock());
-  checkTopicFrequency(can_mon_, now, get_logger(), *get_clock());
+  // 启动宽限期内 lidar/camera/imu 不判异常；CAN 是安全链路，不享受宽限期
+  const bool in_grace = (now - start_time_).seconds() < startup_grace_period_;
+  const double lidar_freq =
+    checkTopicFrequency(lidar_mon_, now, get_logger(), *get_clock(), in_grace);
+  const double camera_freq =
+    checkTopicFrequency(camera_mon_, now, get_logger(), *get_clock(), in_grace);
+  const double imu_freq =
+    checkTopicFrequency(imu_mon_, now, get_logger(), *get_clock(), in_grace);
+  checkTopicFrequency(can_mon_, now, get_logger(), *get_clock(), false);
+
+  // 记录各话题是否真实在线过（供 checkNodes 区分"首次上线"与"异常后重启"）
+  if (lidar_freq >= lidar_mon_.min_rate) {
+    node_ever_alive_["lidar"] = true;
+  }
+  if (camera_freq >= camera_mon_.min_rate) {
+    node_ever_alive_["camera"] = true;
+  }
+  if (imu_freq >= imu_mon_.min_rate) {
+    node_ever_alive_["imu"] = true;
+  }
 
   // 2. 资源采集
   const double cpu = readCpuUsage();
@@ -220,24 +245,51 @@ void HealthMonitor::checkNodes()
     {"can", !can_mon_.anomaly},
   };
 
+  // 启动宽限期：各节点/驱动启动有先后，期间不做存活告警、不计重启，
+  // 避免把"启动后首次上线"误判为"崩溃恢复 → 重启一次"（此前启动日志中的
+  // lidar/camera/imu 疑似崩溃 + 重启第 1 次即为此误报）
+  if ((this->now() - start_time_).seconds() < startup_grace_period_) {
+    for (const auto & [name, alive] : node_status) {
+      (void)alive;
+      node_was_alive_[name] = true;
+    }
+    return;
+  }
+
   for (const auto & [name, alive] : node_status) {
     auto it = node_was_alive_.find(name);
     const bool was_alive = (it != node_was_alive_.end()) ? it->second : true;
+    auto ever_it = node_ever_alive_.find(name);
+    const bool ever_alive = (ever_it != node_ever_alive_.end()) ? ever_it->second : false;
 
     if (!alive && was_alive) {
-      RCLCPP_WARN(get_logger(), "%s 节点/话题异常（疑似崩溃）", name.c_str());
-    } else if (alive && !was_alive) {
-      // 异常恢复 → 视为一次重启
-      restart_count_[name]++;
-      RCLCPP_WARN(
-        get_logger(), "%s 节点重启（第 %d 次，阈值 %d 次）",
-        name.c_str(), restart_count_[name], restart_limit_);
-      if (restart_count_[name] > restart_limit_) {
-        // 文档 15.2：5 分钟内重启超过 3 次 → 标记故障，不再重启，上报
-        RCLCPP_ERROR(
-          get_logger(), "%s 节点在 %.0fs 内重启超过 %d 次，标记为故障",
-          name.c_str(), restart_window_, restart_limit_);
+      if (ever_alive) {
+        RCLCPP_WARN(get_logger(), "%s 节点/话题异常（疑似崩溃）", name.c_str());
+      } else {
+        RCLCPP_WARN(
+          get_logger(), "%s 启动宽限期结束后仍未检测到话题（疑似未启动）", name.c_str());
       }
+    } else if (alive && !was_alive) {
+      if (ever_alive) {
+        // 曾真实在线 → 掉线后恢复，视为一次重启
+        restart_count_[name]++;
+        RCLCPP_WARN(
+          get_logger(), "%s 节点重启（第 %d 次，阈值 %d 次）",
+          name.c_str(), restart_count_[name], restart_limit_);
+        if (restart_count_[name] > restart_limit_) {
+          // 文档 15.2：5 分钟内重启超过 3 次 → 标记故障，不再重启，上报
+          RCLCPP_ERROR(
+            get_logger(), "%s 节点在 %.0fs 内重启超过 %d 次，标记为故障",
+            name.c_str(), restart_window_, restart_limit_);
+        }
+      } else {
+        // 从未在线 → 首次上线，不计重启
+        RCLCPP_INFO(get_logger(), "%s 话题首次上线", name.c_str());
+      }
+    }
+
+    if (alive) {
+      node_ever_alive_[name] = true;
     }
     node_was_alive_[name] = alive;
   }

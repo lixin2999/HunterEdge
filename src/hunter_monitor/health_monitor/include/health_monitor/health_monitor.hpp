@@ -57,6 +57,7 @@ private:
   double report_interval_;
   int restart_limit_;      // 文档 15.2：5 分钟内重启 > 3 次
   double restart_window_;
+  double startup_grace_period_;  // 启动宽限期：期间不判传感器异常/不计重启
   double warning_temp_;    // 文档 3.5：85℃
   double critical_temp_;   // 文档 3.5：95℃
 
@@ -83,6 +84,8 @@ private:
   // 节点重启计数（文档 15.2）
   std::map<std::string, int> restart_count_;
   std::map<std::string, bool> node_was_alive_;
+  std::map<std::string, bool> node_ever_alive_;  // 是否真实在线过（区分"首次上线"与"重启"）
+  rclcpp::Time start_time_;                      // 节点启动时刻（宽限期起点）
 
   // CPU 采样（计算使用率需两次采样）
   unsigned long long prev_cpu_total_;

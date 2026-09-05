@@ -42,6 +42,8 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   declare_parameter("hard_turn", 0.8);
   declare_parameter("comm_loss_duration", 10.0);
   declare_parameter("cache_max_hours", 24.0);
+  declare_parameter("kafka_queue_limit", 50);         // 本地队列积压上限（条），超过转 SQLite 缓存
+  declare_parameter("kafka_flush_timeout_ms", 5000);  // 退出时等待投递的超时（毫秒）
 
   vehicle_id_ = get_parameter("vehicle_id").as_string();
   kafka_brokers_ = get_parameter("kafka_brokers").as_string();
@@ -53,6 +55,8 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   hard_turn_ = get_parameter("hard_turn").as_double();
   comm_loss_duration_ = get_parameter("comm_loss_duration").as_double();
   cache_max_hours_ = get_parameter("cache_max_hours").as_double();
+  kafka_queue_limit_ = static_cast<int>(get_parameter("kafka_queue_limit").as_int());
+  kafka_flush_timeout_ms_ = static_cast<int>(get_parameter("kafka_flush_timeout_ms").as_int());
 
   // Kafka topic（文档 14.2.2：hunter.{vehicle_id}.telemetry / .event）
   telemetry_topic_ = "hunter." + vehicle_id_ + ".telemetry";
@@ -105,7 +109,14 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
 DataAgent::~DataAgent()
 {
   if (producer_) {
-    producer_->flush(1000);
+    // 退出前尽力投递队列中的残留消息（文档 14.6）
+    const RdKafka::ErrorCode err = producer_->flush(kafka_flush_timeout_ms_);
+    const int remaining = producer_->outq_len();
+    if (remaining > 0) {
+      RCLCPP_WARN(
+        get_logger(), "Kafka 退出时仍有 %d 条消息未送达（flush: %s），这部分消息将丢失",
+        remaining, RdKafka::err2str(err).c_str());
+    }
     delete producer_;
     producer_ = nullptr;
   }
@@ -160,17 +171,45 @@ void DataAgent::packAndPublish()
 {
   const std::string json = buildTelemetryJson();
 
-  if (kafka_connected_) {
+  if (kafkaReady()) {
     if (!kafkaProduce(telemetry_topic_, json)) {
-      // 上报失败 → 断线缓存 + 重连
-      kafka_connected_ = false;
+      // produce 失败（如本地队列满）→ 断线缓存
       sqliteCache(json);
-      kafkaReconnect();
     }
   } else {
-    // 断线 → 本地缓存 + 指数退避重连
+    // 链路未证实/已积压 → 本地缓存 + 重连
     sqliteCache(json);
     kafkaReconnect();
+  }
+}
+
+bool DataAgent::kafkaReady()
+{
+  if (!producer_ || !kafka_connected_.load()) {
+    return false;
+  }
+  // 本地队列积压超过上限 → 视为链路不可用（消息滞留队列最终会被
+  // message.timeout 丢弃，及时转 SQLite 缓存兜底）
+  return producer_->outq_len() < kafka_queue_limit_;
+}
+
+// 投递报告回调（librdkafka 内部线程调用）：
+// produce() 成功只代表消息进入本地队列，只有这里才能证实是否真正送达
+void DataAgent::dr_cb(RdKafka::Message & msg)
+{
+  if (msg.err() == RdKafka::ERR_NO_ERROR) {
+    dr_ok_count_.fetch_add(1, std::memory_order_relaxed);
+    if (!kafka_connected_.load()) {
+      RCLCPP_INFO(get_logger(), "Kafka 投递恢复（累计送达 %lu 条）",
+        static_cast<unsigned long>(dr_ok_count_.load()));
+    }
+    kafka_connected_.store(true);
+  } else {
+    dr_fail_count_.fetch_add(1, std::memory_order_relaxed);
+    kafka_connected_.store(false);
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 10000,
+      "Kafka 投递失败：%s（转本地缓存）", msg.errstr().c_str());
   }
 }
 
@@ -279,8 +318,10 @@ void DataAgent::reportEvent(const std::string & type, const std::string & level)
 
   RCLCPP_WARN(get_logger(), "事件触发：%s (%s)", type.c_str(), level.c_str());
 
-  if (kafka_connected_) {
-    kafkaProduce(event_topic_, json);
+  if (kafkaReady()) {
+    if (!kafkaProduce(event_topic_, json)) {
+      sqliteCache(json);  // produce 失败时事件也缓存
+    }
   } else {
     sqliteCache(json);  // 断线时事件也缓存
   }
@@ -311,12 +352,28 @@ bool DataAgent::kafkaInit()
     delete conf;
     return false;
   }
+  // 投递报告回调：只有它能证实消息是否真正送达 broker
+  if (conf->set("dr_cb", this, errstr) != RdKafka::Conf::CONF_OK) {
+    RCLCPP_ERROR(get_logger(), "Kafka dr_cb 配置失败: %s", errstr.c_str());
+    delete conf;
+    return false;
+  }
+  // broker 不可达时消息最多在本地队列滞留 60s，超时触发投递失败回调，
+  // 避免消息无限积压（配合 kafka_queue_limit_ 提前转 SQLite 缓存）
+  if (conf->set("message.timeout.ms", "60000", errstr) != RdKafka::Conf::CONF_OK) {
+    RCLCPP_WARN(get_logger(), "Kafka message.timeout.ms 配置失败: %s", errstr.c_str());
+  }
+  if (conf->set("reconnect.backoff.max.ms", "10000", errstr) != RdKafka::Conf::CONF_OK) {
+    RCLCPP_WARN(get_logger(), "Kafka reconnect.backoff.max.ms 配置失败: %s", errstr.c_str());
+  }
   producer_ = RdKafka::Producer::create(conf, errstr);
   delete conf;
   if (!producer_) {
     RCLCPP_ERROR(get_logger(), "Kafka 生产者创建失败: %s", errstr.c_str());
     return false;
   }
+  // 连通性由 dr_cb 证实后再置位（新建 producer 后需重新证实）
+  kafka_connected_.store(false);
   return true;
 }
 
@@ -325,32 +382,36 @@ bool DataAgent::kafkaProduce(const std::string & topic, const std::string & payl
   if (!producer_) {
     return false;
   }
+  // 先 poll 触发投递回调（更新连通性状态），再投递
+  producer_->poll(0);
   const RdKafka::ErrorCode err = producer_->produce(
     topic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
     const_cast<char *>(payload.c_str()), payload.size(),
     nullptr, 0,   // key, key_len
     0, nullptr);  // timestamp, msg_opaque
   if (err != RdKafka::ERR_NO_ERROR) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 10000, "Kafka produce 失败: %s",
+      RdKafka::err2str(err).c_str());
     return false;
   }
-  producer_->poll(0);
   return true;
 }
 
 void DataAgent::kafkaReconnect()
 {
   if (producer_) {
-    // librdkafka 内部自动重连（文档 14.6：指数退避 1s/2s/4s/8s，最大 30s）
-    kafka_connected_ = true;
+    // librdkafka 内部自动重连（文档 14.6：指数退避 1s/2s/4s/8s，最大 30s），
+    // 连通性由投递报告回调证实，此处不再直接置位 kafka_connected_
+    producer_->poll(0);
     return;
   }
   // 指数退避重连（文档 14.6）
   reconnect_backoff_ = std::min(reconnect_backoff_ * 2.0, 30.0);
   RCLCPP_INFO(get_logger(), "Kafka 重连尝试（当前退避 %.1fs）", reconnect_backoff_);
   if (kafkaInit()) {
-    kafka_connected_ = true;
     reconnect_backoff_ = 1.0;
-    RCLCPP_INFO(get_logger(), "Kafka 重连成功");
+    RCLCPP_INFO(get_logger(), "Kafka 重连成功（等待投递证实）");
   }
 }
 

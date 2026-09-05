@@ -14,6 +14,7 @@ health_monitor:
     report_interval: 1.0        # 文档 14.5：健康上报 1Hz
     restart_limit: 3            # 文档 15.2：5 分钟内重启 > 3 次 → 故障
     restart_window: 300.0       # 5 分钟
+    startup_grace_period: 15.0  # 启动宽限期：期间不判传感器异常/不计重启（各节点启动有先后）
 
     warning_temp: 85.0          # 文档 3.5：85℃ 降频告警
     critical_temp: 95.0         # 文档 3.5：95℃ 保护性降载

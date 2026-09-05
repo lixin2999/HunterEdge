@@ -2,6 +2,8 @@
 data_agent:
   ros__parameters:
     vehicle_id: "hunter_001"                    # 车辆唯一标识
+    # ⚠️ 部署时必须改为真实 broker 地址。当前为占位域名，无法 DNS 解析，
+    #    日志表现为：Failed to resolve 'platform.example.com:9093'
     kafka_brokers: "platform.example.com:9093"  # Kafka 地址（SASL_SSL）
     db_path: "/data/data_agent/telemetry.db"    # SQLite 缓存路径
 
@@ -16,3 +18,7 @@ data_agent:
     # 网络异常（文档 14.6）
     comm_loss_duration: 10.0  # Kafka 断开 > 10s 触发事件
     cache_max_hours: 24.0     # 本地缓存最多 24 小时
+
+    # 链路兜底（produce() 成功 ≠ 送达，靠投递回调 + 队列积压上限判定）
+    kafka_queue_limit: 50        # 本地队列积压超过 50 条（约 5s）→ 转 SQLite 缓存
+    kafka_flush_timeout_ms: 5000 # 退出时等待投递的超时（毫秒）
