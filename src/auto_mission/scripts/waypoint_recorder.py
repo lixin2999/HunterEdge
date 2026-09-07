@@ -62,6 +62,11 @@ class WaypointRecorder(Node):
         self._waypoints: list[str] = []   # 格式："x,y,yaw,label"
         self._lock = threading.Lock()
 
+        # 点击坐标系一致性检查：
+        # 自动巡航反馈源为 FAST-LIO2 /Odometry（世界系 camera_init），
+        # rviz2 Fixed Frame 若不是 camera_init，点击坐标将与巡航反馈错位
+        self._clicked_frame: str | None = None
+
         # 从文件加载已有航点（保留用户之前保存的内容）
         self._load_existing()
 
@@ -115,6 +120,22 @@ class WaypointRecorder(Node):
         x = msg.point.x
         y = msg.point.y
         yaw = self._yaw_default
+
+        # 坐标系一致性检查：自动巡航反馈使用 FAST-LIO2 世界系 camera_init
+        fid = msg.header.frame_id
+        if self._clicked_frame is None:
+            self._clicked_frame = fid
+            if fid != 'camera_init':
+                self.get_logger().warn(
+                    f'点击坐标系为 "{fid}"，而自动巡航反馈使用 FAST-LIO2 世界系 '
+                    f'"camera_init"；请将 rviz2 Fixed Frame 设为 camera_init，'
+                    f'否则巡航航点将错位！'
+                )
+        elif fid != self._clicked_frame:
+            self.get_logger().warn(
+                f'点击坐标系变化：{self._clicked_frame} → {fid}，'
+                f'航点将混用不同坐标系，请检查 rviz2 设置！'
+            )
 
         with self._lock:
             idx = len(self._waypoints)

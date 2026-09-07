@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V1.1（开发指南）
+> **文档版本**：V1.2（开发指南）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -28,7 +28,7 @@
 
 ## 1. 项目简介
 
-**HunterEdge** 是 HUNTER 自动驾驶平台的**车辆端（边缘智能端）**软件工程。系统运行于基于 **HUNTER SE 阿克曼 UGV 底盘**与 **EDU Pro Kit 传感器套件**构建的自动驾驶车辆上，核心计算平台为 **NVIDIA Jetson AGX Xavier 32GB**（详见设计文档 §1.5、§3.2）。
+**HunterEdge** 是 HUNTER 自动驾驶平台的**车辆端（边缘智能端）**软件工程。系统运行于基于 **HUNTER SE 阿克曼 UGV 底盘**与 **EDU Pro Kit 传感器套件**构建的自动驾驶车辆上，核心计算平台为 **NVIDIA Jetson AGX Orin Developer Kit 64GB**（设计文档基线为 AGX Xavier 32GB，现场实机为 AGX Orin，以实机为准，详见 §2.2；设计文档 §1.5、§3.2）。
 
 根据设计文档 §1.2，系统定位为 HUNTER 平台的**边缘智能端**，承担以下核心职能：
 
@@ -71,18 +71,21 @@
 | 工作温度 | -10℃ ~ 50℃ |
 | 防护等级 | IPX4（底盘主体） |
 
-### 2.2 计算平台 — NVIDIA Jetson AGX Xavier 32GB（设计文档 §3.2）
+### 2.2 计算平台 — NVIDIA Jetson AGX Orin Developer Kit（实机；设计文档 §3.2 基线为 AGX Xavier 32GB）
 
-| 参数 | 规格 |
+> ⚠️ **【设备差异警示（V0.0.68/69 现场教训）】** 实机为 **AGX Orin Developer Kit 64GB**（`cat /proc/device-tree/model` → `NVIDIA Jetson AGX Orin Developer Kit`），**不是**设计文档基线的 AGX Xavier。两者 GPU 架构与 CUDA 计算能力不同（**Orin = 8.7 / Xavier = 7.2**），部署 GPU 组件（OpenCV CUDA 源码编译、TensorRT engine）时**勿照抄教程或设计文档中的 Xavier 参数**，必须先按实机确认。
+
+| 参数 | 规格（实机 AGX Orin：官方规格 + 现场实测） |
 |------|------|
-| CPU | 8核 NVIDIA Carmel ARM v8.2 @ 2.26GHz |
-| GPU | 512-core Volta GPU + 64 Tensor Cores |
-| AI 算力 | 32 TOPS（INT8） |
-| 内存 | 32GB 256-bit LPDDR4x |
-| 存储 | 32GB eMMC 5.1（可扩展 NVMe SSD） |
-| 接口 | 千兆以太网、USB 3.1×4、HDMI/DP、CSI、UART、CAN×2、PCIe Gen4 x8 |
-| 功耗模式 | 10W / 15W / 30W / 50W（默认 MODE_15W，§3.5；附录 B 推荐 MODE_30W） |
-| 操作系统 | Ubuntu 22.04.5 LTS + JetPack 6.1.2 |
+| CPU | 12 核 NVIDIA Cortex-A78AE @ 2.2GHz |
+| GPU | 2048-core Ampere GPU + 64 Tensor Cores（**计算能力 8.7**；trtexec 实测 16 SMs） |
+| AI 算力 | 275 TOPS（INT8） |
+| 内存 | 64GB 256-bit LPDDR5（trtexec 实测约 62GB 可用） |
+| 设备识别 | `/proc/device-tree/model`；`trtexec` 输出 `Device 0: "Orin"`、`Compute Capability: 8.7` |
+| 功耗模式 | 以 `sudo nvpmodel -q` 实际档位为准（Orin 档位与 Xavier 不同，勿按 Xavier 档位表执行） |
+| 操作系统 | Ubuntu 22.04.5 LTS + JetPack 6（实测内核 5.15.148-tegra / CUDA 12.6 / TensorRT 10.3.0） |
+
+> 设计文档基线 AGX Xavier 32GB（8 核 Carmel / 512-core Volta / 32 TOPS / 10W-15W-30W-50W）仅作历史追溯保留，不作为部署依据。
 
 ### 2.3 传感器（EDU Pro Kit，设计文档 §3.3）
 
@@ -99,22 +102,24 @@
 
 ## 3. 软件环境与版本
 
-完整版本清单（设计文档 §4.1）：
+完整版本清单（设计文档 §4.1 + 现场实测修正）：
 
 | 组件 | 版本 | 说明 |
 |------|------|------|
-| 操作系统 | Ubuntu 22.04.5 LTS（Jammy Jellyfish） | JetPack 6.1.2 自带 |
-| Linux 内核 | 5.15.136-tegra | NVIDIA L4T R36.4.4 |
-| CUDA | 12.6.68 | GPU 计算 |
+| 操作系统 | Ubuntu 22.04.5 LTS（Jammy Jellyfish） | JetPack 6 自带 |
+| Linux 内核 | 5.15.148-tegra | 实测值；JetPack 6 / L4T R36.x（Orin 特征） |
+| CUDA | 12.6 | GPU 计算（实机 Orin：计算能力 8.7） |
 | cuDNN | 9.3.0 | 深度学习加速 |
-| TensorRT | 10.3.0 | 模型推理优化 |
-| OpenCV | 4.5.4（with CUDA） | 图像处理 |
+| TensorRT | 10.3.0 | 模型推理优化；`.engine` 与 GPU 绑定，**须在目标机生成** |
+| OpenCV | **4.10.0（源码编译 with CUDA，/usr/local，CUDA_ARCH_BIN=8.7）** | 视觉节点专用（编译方法见 §5.3）；apt 4.5.4 仅供 cv_bridge 等旧组件，不得与视觉节点混链 |
 | ROS2 | Humble Hawksbill | 机器人中间件 |
 | Python | 3.10.12 | 系统默认 |
 | CMake | 3.22.1 | 构建工具 |
 | GCC | 11.4.0 | C++ 编译器 |
 
-> 💡 **【开发者视角】** 视觉感知依赖 TensorRT + OpenCV CUDA，仅 NVIDIA Jetson 环境可用；CPU 部分算法可跨平台编译，但完整系统需在车载 Jetson 上运行。
+> ⚠️ **【单一 OpenCV 铁律（V0.0.67/68 现场教训）】** 同一进程绝不允许混链两套 OpenCV（4.10 与 4.5.4 并存会破坏 `cv::Mat` 不变量，每帧必现 `setSize` 断言崩溃）。`vision_perception` 已**解耦 cv_bridge**（自实现 `imageMsgToMat()` 完成消息转换），其 CMake 强制 `OpenCV_DIR=/usr/local/lib/cmake/opencv4`；configure 日志必须包含指纹 `vision_perception: OpenCV 4.10.0 选自 /usr/local/lib/cmake/opencv4`，`ldd` 检查只允许 `so.410`、无 `4.5d`、无 `libcv_bridge`（验收命令见 §6）。
+
+> 💡 **【开发者视角】** 视觉感知依赖 TensorRT + OpenCV CUDA，仅 NVIDIA Jetson 环境可用；CPU 部分算法可跨平台编译，但完整系统需在车载 Jetson 上运行。TensorRT `.engine` 与目标 GPU 绑定，**必须在目标机上用 trtexec 生成**（命令见 §6）。
 
 ---
 
@@ -129,7 +134,7 @@
 | `hunter_bringup` | 全系统/模块化启动 launch、参数 config、行为树、URDF | §4.2 / §4.4 |
 | `hunter_drivers/ch10x_driver` | CH10X IMU 驱动 | §3.3.3 |
 | `hunter_perception/lidar_perception` | 激光感知（地面分割+欧式聚类+跟踪） | §5.1 |
-| `hunter_perception/vision_perception` | 视觉感知（YOLOv8+TensorRT） | §5.2 |
+| `hunter_perception/vision_perception` | 视觉感知（YOLOv8+TensorRT；已解耦 cv_bridge，强制链接 /usr/local OpenCV 4.10.0 CUDA，GPU/CPU 自适应预处理） | §5.2 |
 | `hunter_agents/data_agent` | 数据采集上传（Kafka+MinIO） | §14 |
 | `hunter_agents/ota_agent` | OTA 升级（systemd 服务） | §12 |
 | `hunter_agents/remote_agent` | 远程操控（WebRTC，systemd 服务） | §13 |
@@ -199,6 +204,32 @@ git clone https://github.com/wyf-yfw/TensorRT_YOLO_ROS2.git yolo_trt_ros     # Y
 
 > ⚠️ **【运维视角】** 上述第三方仓库地址/分支以各项目官方文档为准；`ugv_sdk`、`hunter_ros2` 安装见 §5.1（源自设计文档 §11.6）。`navigation2`、`robot_localization`、`realsense2_camera` 建议用上文 `apt` 安装。
 
+### 5.3 车载环境 OpenCV 4.10.0 CUDA 源码编译（必做；设计文档未覆盖，V0.0.69 实测定案）
+
+`vision_perception` 的 GPU 预处理（`cv::cuda::GpuMat` 上下传 / `cuda::resize` / `cuda::cvtColor`）依赖带 CUDA 模块的 OpenCV 4.10.0，安装于 `/usr/local`（源码目录示例 `~/opencv_build`）。**编译 ARCH 必须匹配实机 GPU**（Orin=8.7 / Xavier=7.2），先确认设备再选参数：
+
+```bash
+# ① 确认设备（决定 CUDA_ARCH_BIN，勿照抄教程）
+cat /proc/device-tree/model        # → NVIDIA Jetson AGX Orin Developer Kit ⇒ ARCH=8.7
+
+# ② 配置（Orin 全量 CUDA 编译约 1~2 小时；FFMPEG/GTK3/Python 绑定均需保留）
+cd ~/opencv_build/opencv-4.10.0/build
+cmake -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCUDA_ARCH_BIN=8.7 -DCUDA_ARCH_PTX=8.7 \
+      -DWITH_CUDA=ON -DWITH_FFMPEG=ON -DWITH_GTK=ON \
+      -DBUILD_opencv_python3=ON \
+      -DOPENCV_EXTRA_MODULES_PATH=~/opencv_build/opencv_contrib-4.10.0/modules ..
+# ③ 编译安装；若此前 sudo 操作残留 root 属主文件导致 configure 报 Permission denied，先修复属主
+sudo chown -R $USER:$USER ~/opencv_build
+make -j12 && sudo make install
+# ④ 验证：CUDA 内核须包含 sm_87（旧库曾误编 sm_72，GPU 调用报 -217 no kernel image）
+cuobjdump --list-elf /usr/local/lib/libopencv_cudawarping.so.410   # 应见 sm_87.cubin
+python3 -c "import cv2; print(cv2.__version__)"                    # 应为 4.10.0
+```
+
+> ⚠️ **【教训】** ARCH 与设备不符时，GPU 内核运行报 `error (-217) no kernel image is available for execution on the device`；节点代码已内置一次性降级 CPU 兜底（感知不断流，见 §13.8），但**环境必须按上表重编修正**，重启节点后自动恢复 GPU。`sudo make install` 在旧 build 目录执行可完整保留既有配置（FFMPEG/GTK3/Python 绑定）；`CUDA_ARCH_PTX=8.7` 保留 JIT 回退能力。
+
 ---
 
 ## 6. 编译步骤
@@ -217,6 +248,18 @@ colcon build --packages-select hunter_msgs hunter_bringup lidar_perception
 ```
 
 > 💡 **【开发者视角】** `--symlink-install` 使 Python 脚本与 launch 文件在源码修改后无需重新编译；若修改了 `.msg` 或 C++ 头文件，则需重新 `colcon build` 该包。
+
+**vision_perception 专项（V0.0.68 起）**：
+
+- CMake 强制 `OpenCV_DIR=/usr/local/lib/cmake/opencv4`（EXISTS 守卫 + CACHE 写法），configure 日志必须出现 `vision_perception: OpenCV 4.10.0 选自 /usr/local/lib/cmake/opencv4` 与 `GPU preprocessing enabled`（无 CUDA OpenCV 时自动走 CPU 路径并打印 `CPU preprocessing`，不算错误）；
+- symlink-install 工作区重编该包须先清净：`rm -rf build/vision_perception install/vision_perception && colcon build --packages-select vision_perception`；
+- 编后自检：`ldd install/vision_perception/lib/vision_perception/vision_perception_node | grep opencv` → 全部 `so.410`、零 `4.5d`、无 `libcv_bridge`（命中即为混链根因修复态）。
+
+**TensorRT 引擎（`.engine` 与 GPU/设备绑定）**：换机、重装 JetPack 或重编 OpenCV 后需在目标机重新生成：
+
+```bash
+trtexec --onnx=yolov8s.onnx --saveEngine=/data/models/yolov8s.engine --fp16
+```
 
 ---
 
@@ -286,6 +329,19 @@ ros2 launch hunter_bringup hunter_full.launch.py \
 ```
 
 > 💡 **【开发者视角】** 模块化启动便于逐模块联调；`hunter_full.launch.py` 的参数开关见上表（设计文档 §4.4）。
+
+### 7.6 坐标系与 TF 树（V0.0.70 修订）
+
+系统 TF 由两类发布者构成，**相机驱动自身 TF 已关闭**，不存在双父：
+
+| TF 段 | 发布者 | 说明 |
+|-------|--------|------|
+| `base_link → rslidar` / `camera_color_optical_frame` / `imu` | `robot_state_publisher`（URDF 静态外参，文档 7.4/附录D） | 相机外参唯一来源（`camera_color_joint`：xyz 0.40/0/0.30，rpy 0/-π/2/π/2） |
+| `odom → base_link` | EKF（`ekf_params.yaml` 中 `publish_tf: true`） | 定位输出 |
+| `map → odom` | 后续全局定位模块（当前未接入） | — |
+
+- `realsense2_camera` 驱动在 `hunter_full.launch.py` 中固定传入 **`publish_tf: 'false'`**：驱动自建 `camera_link` 树与 URDF 对 `camera_color_optical_frame` 构成同 frame 双父，TF 树分裂为 `base_link` / `camera_link` 两棵，sensor_fusion `lookupTransform` 必败（报 `TF unconnected trees`，V0.0.70 现场问题）；驱动 TF 无任何消费者（相机外参唯一来源是 URDF；`align_depth` 在驱动内部完成不依赖 ROS TF），关闭无副作用，仅 RViz 少显示 realsense 原生 TF 视角；
+- 验证：`ros2 run tf2_ros tf2_echo base_link camera_color_optical_frame` 应输出 translation (0.40, 0.00, 0.30)、rotation 对应 rpy (0, −π/2, π/2)；调试可用 `ros2 run tf2_tools view_frames` 导出 frames.pdf 确认全树单棵连通。
 
 ---
 
@@ -533,7 +589,7 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 |------|--------|
 | 感知→控制端到端延迟 | < 200ms |
 | 系统 CPU 占用 | ~87%（8 核总占比） |
-| 系统 GPU 占用 | ~55%（Volta GPU） |
+| 系统 GPU 占用 | ~55%（Orin Ampere GPU） |
 | 内存使用 | ~10GB / 32GB |
 
 > 视觉感知（TensorRT + OpenCV CUDA）为 GPU 密集模块；高负载下注意散热与降频。
@@ -551,13 +607,14 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 
 ### 13.4 散热与功耗模式（设计文档 §3.5 / 附录 B）
 
-- AGX Xavier 默认功耗模式 **MODE_15W**（15W TDP），附录 B 推荐 **MODE_30W**（平衡性能与散热）；
+- 实机为 **AGX Orin**，功耗档位以 `sudo nvpmodel -q` 实际输出为准（设计文档的 Xavier 档位表仅作历史基线，勿直接执行）；
+- GPU 密集任务（TensorRT + OpenCV CUDA 预处理）建议使用高性能档并确认散热正常；
 - 温度 > 85℃ 降频告警，> 95℃ 触发保护性降载；依据场景选定功耗模式。
 
 ### 13.5 CAN 通信（设计文档 §11.3 / 附录 A）
 
 启动底盘通信前需配置 CAN 接口（can2 @ 500Kbps）。拓扑与说明：
-- AGX Xavier 与 Hunter SE 底盘通过 USB-CAN 适配器相连，适配器枚举为 **can2**（实测 candump 可见 0x211/0x221/0x231/0x241/0x251 等底盘反馈帧）；
+- AGX Orin 与 Hunter SE 底盘通过 USB-CAN 适配器相连，适配器枚举为 **can2**（实测 candump 可见 0x211/0x221/0x231/0x241/0x251 等底盘反馈帧）；
 - can0 为 Jetson 板载 mttcan 控制器（`parentdev c310000.mttcan`），未接底盘线束，candump 静默属正常；
 - 接口 UP 状态下改波特率会报 `Device or resource busy`，需先 `sudo ip link set can2 down`；
 - 建议加总线故障自动恢复：`sudo ip link set can2 type can restart-ms 100`。
@@ -569,6 +626,8 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 ```
 
 核心报文：`0x111` 运动控制、`0x211` 系统状态、`0x221` 运动反馈。
+
+> ⚠️ **【已知待办】** can2 配置（bitrate / restart-ms）**重启后不保留**：每次开机后需重新执行上行配置命令；持久化方案（启动脚本或 `/etc/network/interfaces.d`）尚未落地。
 
 ### 13.6 systemd 服务与非 ROS 进程（设计文档 §12 / §13）
 
@@ -590,6 +649,11 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | 控制抖动 | 控制参数 / 延迟 | 调整 RPP 参数、检查控制频率 |
 | 系统卡顿 | GPU / CPU / 温度 | `tegrastats` 查看资源、降温、降频 |
 | 无法连平台 | 网络 / 证书 / Kafka | 检查 4G/WiFi、证书有效期、Kafka 配置 |
+| 视觉节点每帧崩溃（`setSize` 断言） | OpenCV 4.10 / 4.5.4 **混链**（同进程两套 OpenCV，破坏 `cv::Mat` 不变量） | `ldd vision_perception_node \| grep opencv`：只允许 `so.410`、无 `4.5d`、无 `libcv_bridge`；异常时按 §6 专项重编（禁止在视觉进程重新引入 cv_bridge） |
+| 视觉 0Hz，日志 `resize.cu:175 error (-217) no kernel image` | OpenCV CUDA 编译 ARCH 与实机 GPU 不符（如 sm_72 用于 Orin） | `cuobjdump --list-elf /usr/local/lib/libopencv_cudawarping.so.410` 应见 `sm_87`；按 §5.3 以 `CUDA_ARCH_BIN=8.7` 重编后重启节点即恢复 GPU（期间节点自动降级 CPU，感知不断流） |
+| sensor_fusion 报 `TF unconnected trees` | 相机 frame 双父（驱动 TF + URDF 并存，TF 树分裂） | 确认 `hunter_full.launch.py` 相机驱动为 `publish_tf: 'false'`；`ros2 run tf2_ros tf2_echo base_link camera_color_optical_frame` 验证外参；必要时 `tf2_tools view_frames` 看全树 |
+| 启动时一次性 `彩色图像超时 x.x s` | 启动竞态（视觉节点激活早于彩色流就绪） | 仅出现一次属良性，可忽略；反复出现才按"相机无图像"排查 |
+| 一次性 `[TensorRT] Using an engine plan file across different models of devices` | `.engine` 非本机/本设备型号生成（换机或文件被旧引擎覆盖） | 不阻塞运行（话题 15Hz 正常）；目标机重生成：`trtexec --onnx=<绝对路径>/yolov8s.onnx --saveEngine=/data/models/yolov8s.engine --fp16` 后重启视觉节点 |
 
 ---
 
@@ -608,5 +672,5 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 
 ---
 
-*HunterEdge 开发指南 · 文档版本 V1.1 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》*
+*HunterEdge 开发指南 · 文档版本 V1.2 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.70 现场实测修正*
 

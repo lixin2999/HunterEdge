@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <sstream>
 
 namespace auto_mission
@@ -60,6 +61,34 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
   // ---- Nav2 action 客户端 ----
   nav_action_client_ = rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(
     this, "/navigate_to_pose");
+
+  // ---- 建图模式自动巡航设施 ----
+  // /cmd_vel：mapping 模式下 Nav2 全栈未启动，无竞争发布者；
+  // hunter_base 订阅 /cmd_vel 并按 bicycle model 换算阿克曼转向角。
+  cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
+
+  // FAST-LIO2 里程计（camera_init 系，10Hz）——与 rviz "Publish Point"
+  // 点击航点严格同源，巡航反馈直接使用该位姿，避免 EKF 系折算偏差。
+  lio_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+    "/Odometry", rclcpp::SensorDataQoS(),
+    [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
+      std::lock_guard<std::mutex> lk(data_mutex_);
+      latest_lio_odom_ = *msg;
+      last_lio_odom_arrive_ = this->now();
+    });
+
+  start_cruise_srv_ = create_service<std_srvs::srv::Trigger>(
+    "/auto_mission/start_mapping_cruise",
+    std::bind(&AutoMissionNode::startCruiseCallback, this,
+      std::placeholders::_1, std::placeholders::_2));
+  stop_cruise_srv_ = create_service<std_srvs::srv::Trigger>(
+    "/auto_mission/stop_mapping_cruise",
+    std::bind(&AutoMissionNode::stopCruiseCallback, this,
+      std::placeholders::_1, std::placeholders::_2));
+
+  cruise_timer_ = create_wall_timer(
+    std::chrono::milliseconds(static_cast<int64_t>(1000.0 / std::max(1.0, cruise_cmd_rate_))),
+    std::bind(&AutoMissionNode::cruiseControlStep, this));
 
   // ---- 初始化时间戳（防止启动时误判感知超时） ----
   last_perception_stamp_ = this->now();
@@ -106,6 +135,22 @@ void AutoMissionNode::declareParameters()
   // 航点（yaml 中以列表形式提供，每条格式："x,y,yaw,label"）
   declare_parameter("waypoints", std::vector<std::string>{});
 
+  // ---- 建图模式自动巡航 ----
+  // params_file：autonomous_nav_params.yaml 路径，start_mapping_cruise 服务
+  // 触发时从此文件重新读取 waypoints（waypoint_recorder 边建图边写入）
+  declare_parameter("params_file", "");
+  declare_parameter("cruise_max_speed", 1.0);
+  declare_parameter("cruise_turn_speed", 0.4);
+  declare_parameter("cruise_min_speed", 0.2);
+  declare_parameter("cruise_reach_dist", 0.6);
+  declare_parameter("cruise_brake_dist", 2.0);
+  declare_parameter("cruise_kp_yaw", 1.2);
+  declare_parameter("cruise_max_yaw_rate", 0.5);
+  declare_parameter("cruise_yaw_slow_deg", 45.0);
+  declare_parameter("cruise_min_turn_radius", 1.9);
+  declare_parameter("cruise_cmd_rate", 20.0);
+  declare_parameter("cruise_odom_timeout", 1.0);
+
   // 读取
   mission_mode_           = get_parameter("mission_mode").as_string();
   warn_obstacle_dist_     = get_parameter("warn_obstacle_dist").as_double();
@@ -119,6 +164,18 @@ void AutoMissionNode::declareParameters()
   goal_timeout_           = get_parameter("goal_timeout").as_double();
   obstacle_wait_timeout_  = get_parameter("obstacle_wait_timeout").as_double();
   max_velocity_           = get_parameter("max_velocity").as_double();
+  params_file_            = get_parameter("params_file").as_string();
+  cruise_max_speed_       = get_parameter("cruise_max_speed").as_double();
+  cruise_turn_speed_      = get_parameter("cruise_turn_speed").as_double();
+  cruise_min_speed_       = get_parameter("cruise_min_speed").as_double();
+  cruise_reach_dist_      = get_parameter("cruise_reach_dist").as_double();
+  cruise_brake_dist_      = get_parameter("cruise_brake_dist").as_double();
+  cruise_kp_yaw_          = get_parameter("cruise_kp_yaw").as_double();
+  cruise_max_yaw_rate_    = get_parameter("cruise_max_yaw_rate").as_double();
+  cruise_yaw_slow_deg_    = get_parameter("cruise_yaw_slow_deg").as_double();
+  cruise_min_turn_radius_ = get_parameter("cruise_min_turn_radius").as_double();
+  cruise_cmd_rate_        = get_parameter("cruise_cmd_rate").as_double();
+  cruise_odom_timeout_    = get_parameter("cruise_odom_timeout").as_double();
 
   // 最大速度合规检查（文档规定 ≤ 2.0 m/s）
   if (max_velocity_ > 2.0) {
@@ -136,29 +193,132 @@ void AutoMissionNode::loadWaypoints()
   const auto raw = get_parameter("waypoints").as_string_array();
   waypoints_.clear();
   for (const auto & entry : raw) {
-    std::istringstream ss(entry);
-    std::string token;
-    std::vector<std::string> parts;
-    while (std::getline(ss, token, ',')) {
-      parts.push_back(token);
-    }
-    if (parts.size() < 3) {
-      RCLCPP_WARN(get_logger(), "航点格式错误（需 x,y,yaw[,label]）：%s", entry.c_str());
-      continue;
-    }
     Waypoint wp;
-    try {
-      wp.x   = std::stod(parts[0]);
-      wp.y   = std::stod(parts[1]);
-      wp.yaw = std::stod(parts[2]);
-      wp.label = (parts.size() >= 4) ? parts[3] : ("wp" + std::to_string(waypoints_.size()));
-    } catch (const std::exception & e) {
-      RCLCPP_WARN(get_logger(), "航点解析失败：%s → %s", entry.c_str(), e.what());
+    if (!parseWaypoint(entry, wp)) {
       continue;
     }
     waypoints_.push_back(wp);
   }
   RCLCPP_INFO(get_logger(), "共加载 %zu 个航点", waypoints_.size());
+}
+
+// ==========================================================================
+// 单条航点解析："x,y,yaw[,label]"，label 可含中文（不含逗号）
+// ==========================================================================
+bool AutoMissionNode::parseWaypoint(const std::string & entry, Waypoint & wp)
+{
+  std::istringstream ss(entry);
+  std::string token;
+  std::vector<std::string> parts;
+  while (std::getline(ss, token, ',')) {
+    parts.push_back(token);
+  }
+  if (parts.size() < 3) {
+    RCLCPP_WARN(get_logger(), "航点格式错误（需 x,y,yaw[,label]）：%s", entry.c_str());
+    return false;
+  }
+  try {
+    wp.x   = std::stod(parts[0]);
+    wp.y   = std::stod(parts[1]);
+    wp.yaw = std::stod(parts[2]);
+    wp.label = (parts.size() >= 4) ? parts[3] : "wp";
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(get_logger(), "航点解析失败：%s → %s", entry.c_str(), e.what());
+    return false;
+  }
+  return true;
+}
+
+// ==========================================================================
+// 从 params_file_ 重新读取 waypoints（热重载）
+//
+// 使用行扫描状态机而非引入 yaml-cpp 依赖：waypoint_recorder 保存的文件
+// 结构固定为 auto_mission_node → ros__parameters → waypoints 下的 "- item"
+// 列表（yaml block 风格），扫描 'waypoints:' 关键字后的连续 "- " 行即可。
+// ==========================================================================
+bool AutoMissionNode::reloadWaypointsFromFile(std::string & msg)
+{
+  if (params_file_.empty()) {
+    msg = "params_file 参数为空，无法热重载航点（launch 需传入 params_file）";
+    RCLCPP_ERROR(get_logger(), "[巡航] %s", msg.c_str());
+    return false;
+  }
+  std::ifstream in(params_file_);
+  if (!in.is_open()) {
+    msg = "无法打开航点文件：" + params_file_;
+    RCLCPP_ERROR(get_logger(), "[巡航] %s", msg.c_str());
+    return false;
+  }
+
+  std::vector<std::string> entries;
+  bool in_waypoints = false;
+  std::string line;
+  while (std::getline(in, line)) {
+    // 去注释（行首 # 或空格后的 #）
+    const auto hash_pos = line.find('#');
+    if (hash_pos != std::string::npos &&
+        line.find_first_not_of(" \t") == hash_pos)
+    {
+      line = line.substr(0, hash_pos);
+    }
+    const auto content = line.substr(line.find_first_not_of(" \t") == std::string::npos ?
+                                     std::string::npos : line.find_first_not_of(" \t"));
+    if (content.empty()) {
+      continue;
+    }
+    if (in_waypoints) {
+      if (content.rfind("- ", 0) == 0) {
+        std::string item = content.substr(2);
+        // 去除可能的 yaml 引号（含特殊字符时 yaml 会加引号）
+        if (item.size() >= 2 &&
+            ((item.front() == '\'' && item.back() == '\'') ||
+             (item.front() == '\"' && item.back() == '\"')))
+        {
+          item = item.substr(1, item.size() - 2);
+        }
+        if (!item.empty()) {
+          entries.push_back(item);
+        }
+      } else {
+        // 列表结束（出现新的 key 或 dedent 到列表层级之外）
+        in_waypoints = false;
+      }
+    } else if (content.rfind("waypoints:", 0) == 0) {
+      in_waypoints = true;
+    }
+  }
+  in.close();
+
+  if (entries.empty()) {
+    msg = "航点文件中未找到有效 waypoints：" + params_file_ +
+          "（请先用 rviz2 Publish Point 点击航点）";
+    RCLCPP_ERROR(get_logger(), "[巡航] %s", msg.c_str());
+    return false;
+  }
+
+  std::vector<Waypoint> parsed;
+  for (const auto & e : entries) {
+    Waypoint wp;
+    if (parseWaypoint(e, wp)) {
+      parsed.push_back(wp);
+    }
+  }
+  if (parsed.empty()) {
+    msg = "waypoints 条目全部解析失败（共 " + std::to_string(entries.size()) + " 条）";
+    RCLCPP_ERROR(get_logger(), "[巡航] %s", msg.c_str());
+    return false;
+  }
+
+  waypoints_ = parsed;
+  std::ostringstream oss;
+  oss << "热重载成功，共 " << waypoints_.size() << " 个航点：";
+  for (size_t i = 0; i < waypoints_.size(); ++i) {
+    oss << "\n  [" << i << "] " << waypoints_[i].label
+        << " (" << waypoints_[i].x << ", " << waypoints_[i].y << ")";
+  }
+  msg = oss.str();
+  RCLCPP_INFO(get_logger(), "[巡航] %s", msg.c_str());
+  return true;
 }
 
 // ==========================================================================
@@ -199,6 +359,247 @@ void AutoMissionNode::estopCallback(const std_msgs::msg::Bool::SharedPtr msg)
 }
 
 // ==========================================================================
+// 建图模式自动巡航：20Hz /cmd_vel 控制（含安全约束）
+//
+// 反馈源：FAST-LIO2 /Odometry（camera_init 系）——与 rviz "Publish Point"
+// 点击航点严格同源；安全：复用 NAVIGATING 的障碍物 warn/stop 阈值与 /estop。
+// 阿克曼约束：|w| ≤ v / R_min（HUNTER-SE 最小转弯半径 1.9m）。
+// ==========================================================================
+void AutoMissionNode::cruiseControlStep()
+{
+  // ---- 非巡航运行态：必要时补一帧零速后静默 ----
+  if (mission_mode_ != "mapping" || !cruise_active_ || state_ != MissionState::MAPPING) {
+    if (cruise_cmd_published_) {
+      publishCruiseCmd(0.0, 0.0);
+      cruise_cmd_published_ = false;
+    }
+    return;
+  }
+
+  // ---- 快照（减少锁占用时间） ----
+  nav_msgs::msg::Odometry lio;
+  rclcpp::Time lio_arrive(0, 0, RCL_SYSTEM_TIME);
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    lio = latest_lio_odom_;
+    lio_arrive = last_lio_odom_arrive_;
+  }
+
+  // ---- 暂停（遥控接管 / CRITICAL）：停车等待，状态保持 MAPPING ----
+  if (mapping_paused_.load()) {
+    publishCruiseCmd(0.0, 0.0);
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+      "[巡航] 已暂停（遥控接管或系统异常），停车等待中");
+    return;
+  }
+
+  // ---- FAST-LIO2 定位新鲜度 ----
+  const double lio_age = (lio_arrive.seconds() <= 0.0) ?
+    1e9 : (this->now() - lio_arrive).seconds();
+  if (lio_age > cruise_odom_timeout_) {
+    publishCruiseCmd(0.0, 0.0);
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+      "[巡航] FAST-LIO2 /Odometry 超时（>%.1fs），停车等待", cruise_odom_timeout_);
+    return;
+  }
+
+  // ---- 感知存活（障碍物兜底依赖融合结果） ----
+  if (!isPerceptionAlive()) {
+    publishCruiseCmd(0.0, 0.0);
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+      "[巡航] /perception/fused_objects 超时，停车等待");
+    return;
+  }
+
+  // ---- 障碍物检查（与 NAVIGATING 相同阈值） ----
+  const double obs_dist = nearestObstacleDist();
+  if (obs_dist < stop_obstacle_dist_) {
+    publishCruiseCmd(0.0, 0.0);
+    RCLCPP_ERROR(get_logger(),
+      "[巡航→ESTOP] 障碍物距离 %.2fm < 急停阈值 %.2fm，触发 ESTOP",
+      obs_dist, stop_obstacle_dist_);
+    triggerEstop("建图巡航中障碍物过近");
+    return;
+  }
+  if (obs_dist < warn_obstacle_dist_) {
+    publishCruiseCmd(0.0, 0.0);
+    if (!cruise_obstacle_wait_) {
+      cruise_obstacle_wait_ = true;
+      cruise_obstacle_wait_start_ = this->now();
+    } else if ((this->now() - cruise_obstacle_wait_start_).seconds() > obstacle_wait_timeout_) {
+      RCLCPP_ERROR(get_logger(),
+        "[巡航] 障碍物等待超时（%.0fs），触发 ESTOP", obstacle_wait_timeout_);
+      triggerEstop("建图巡航中障碍物长时间未清除");
+      return;
+    }
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      "[巡航] 障碍物距离 %.2fm < 警告阈值 %.2fm，停车避让中",
+      obs_dist, warn_obstacle_dist_);
+    return;
+  }
+  cruise_obstacle_wait_ = false;
+
+  // ---- 目标航点 ----
+  if (waypoints_.empty() || current_wp_idx_ >= waypoints_.size()) {
+    publishCruiseCmd(0.0, 0.0);
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "[巡航] 无有效目标航点，停车");
+    return;
+  }
+  const Waypoint & wp = waypoints_[current_wp_idx_];
+
+  // ---- 位姿（camera_init 系，与航点同源） ----
+  const double px = lio.pose.pose.position.x;
+  const double py = lio.pose.pose.position.y;
+  const auto & q = lio.pose.pose.orientation;
+  const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+
+  const double dx = wp.x - px;
+  const double dy = wp.y - py;
+  const double dist = std::hypot(dx, dy);
+
+  // ---- 到达判定（距离阈值 ≥ 阿克曼停车精度） ----
+  if (dist < cruise_reach_dist_) {
+    RCLCPP_INFO(get_logger(), "[巡航] 到达航点 [%zu] %s（距离 %.2fm）",
+                current_wp_idx_, wp.label.c_str(), dist);
+    std_msgs::msg::Int32 idx_msg;
+    idx_msg.data = static_cast<int32_t>(current_wp_idx_);
+    waypoint_idx_pub_->publish(idx_msg);
+
+    const size_t next = current_wp_idx_ + 1;
+    if (next >= waypoints_.size()) {
+      publishCruiseCmd(0.0, 0.0);
+      cruise_active_ = false;
+      RCLCPP_INFO(get_logger(),
+        "[巡航] 全部 %zu 个航点巡航完成，车辆停车，建图继续进行。"
+        "完成后 Ctrl+C 保存地图（或调用 /fast_lio2/map_save）",
+        waypoints_.size());
+      return;
+    }
+    current_wp_idx_ = next;
+    publishCruiseCmd(0.0, 0.0);   // 切换目标先停车一拍，下一拍重新起步
+    return;
+  }
+
+  // ---- 朝向目标的 P 控制律 ----
+  const double bearing = std::atan2(dy, dx);
+  const double yaw_err = wrapAngle(bearing - yaw);
+  const double aerr = std::fabs(yaw_err);
+
+  double v = cruise_max_speed_;
+  if (aerr > cruise_yaw_slow_deg_ * M_PI / 180.0) {
+    v = std::min(v, cruise_turn_speed_);          // 大航向偏差降速
+  }
+  if (dist < cruise_brake_dist_) {
+    // 接近目标线性减速，但不低于 cruise_min_speed_（避免临门蠕动）
+    v = std::min(v, std::max(cruise_min_speed_,
+          cruise_max_speed_ * dist / cruise_brake_dist_));
+  }
+
+  double w = cruise_kp_yaw_ * yaw_err;
+  // 角速度硬上限
+  w = std::clamp(w, -cruise_max_yaw_rate_, cruise_max_yaw_rate_);
+  // 阿克曼几何约束：转弯半径 R = v/|w| ≥ R_min（HUNTER-SE 无法原地转向）
+  if (v > 0.05) {
+    const double w_geom = v / cruise_min_turn_radius_;
+    w = std::clamp(w, -w_geom, w_geom);
+  }
+  publishCruiseCmd(v, w);
+
+  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+    "[巡航] 目标[%zu/%zu] %s 距离=%.2fm 航向偏差=%.1f° v=%.2f w=%.2f 障碍=%.2fm",
+    current_wp_idx_ + 1, waypoints_.size(), wp.label.c_str(),
+    dist, aerr * 180.0 / M_PI, v, w, obs_dist);
+}
+
+void AutoMissionNode::publishCruiseCmd(double v, double w)
+{
+  geometry_msgs::msg::Twist cmd;
+  cmd.linear.x = v;
+  cmd.angular.z = w;
+  cmd_vel_pub_->publish(cmd);
+  cruise_cmd_published_ = true;
+}
+
+double AutoMissionNode::wrapAngle(double a)
+{
+  return std::remainder(a, 2.0 * M_PI);
+}
+
+
+// ==========================================================================
+// 服务回调：启动建图巡航（热重载航点 + 定位可用性检查）
+// ==========================================================================
+void AutoMissionNode::startCruiseCallback(
+  const std_srvs::srv::Trigger::Request::SharedPtr,
+  std_srvs::srv::Trigger::Response::SharedPtr resp)
+{
+  if (mission_mode_ != "mapping") {
+    resp->success = false;
+    resp->message = "当前为 " + mission_mode_ + " 模式，自动巡航仅在建图模式可用";
+    RCLCPP_WARN(get_logger(), "[巡航] %s", resp->message.c_str());
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    if (estop_signal_) {
+      resp->success = false;
+      resp->message = "/estop 急停信号激活中，禁止启动巡航";
+      RCLCPP_WARN(get_logger(), "[巡航] %s", resp->message.c_str());
+      return;
+    }
+  }
+
+  // 热重载航点（waypoint_recorder 边建图边写入 yaml）
+  std::string msg;
+  if (!reloadWaypointsFromFile(msg)) {
+    resp->success = false;
+    resp->message = "航点热重载失败：" + msg;
+    return;
+  }
+
+  // FAST-LIO2 定位可用性
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    const double age = (last_lio_odom_arrive_.seconds() <= 0.0) ?
+      1e9 : (this->now() - last_lio_odom_arrive_).seconds();
+    if (age > cruise_odom_timeout_) {
+      resp->success = false;
+      resp->message = "FAST-LIO2 /Odometry 无有效数据，无法启动巡航；请确认 fast_lio2 正常输出";
+      RCLCPP_ERROR(get_logger(), "[巡航] FAST-LIO2 /Odometry 无有效数据（age=%.1fs）", age);
+      return;
+    }
+  }
+
+  current_wp_idx_ = 0;
+  cruise_obstacle_wait_ = false;
+  cruise_active_ = true;
+  std::ostringstream oss;
+  oss << "自动巡航已启动，共 " << waypoints_.size() << " 个航点，"
+      << "直行速度上限 " << cruise_max_speed_ << " m/s";
+  resp->success = true;
+  resp->message = oss.str();
+  RCLCPP_INFO(get_logger(), "[巡航] %s", resp->message.c_str());
+}
+
+void AutoMissionNode::stopCruiseCallback(
+  const std_srvs::srv::Trigger::Request::SharedPtr,
+  std_srvs::srv::Trigger::Response::SharedPtr resp)
+{
+  if (!cruise_active_) {
+    resp->success = true;
+    resp->message = "当前没有进行中的自动巡航";
+    return;
+  }
+  cruise_active_ = false;
+  publishCruiseCmd(0.0, 0.0);
+  resp->success = true;
+  resp->message = "自动巡航已停止，车辆安全停车（FAST-LIO2 建图继续进行）";
+  RCLCPP_INFO(get_logger(), "[巡航] %s", resp->message.c_str());
+}
+
+// ==========================================================================
 // 主循环（10Hz）
 // ==========================================================================
 void AutoMissionNode::mainLoop()
@@ -220,7 +621,34 @@ void AutoMissionNode::mainLoop()
   if (estop_snap && state_ != MissionState::ESTOP) {
     RCLCPP_ERROR(get_logger(), "[急停] 收到 /estop=true，立即终止所有导航任务");
     cancelCurrentGoal();
+    if (cruise_active_) {
+      cruise_active_ = false;
+      mapping_paused_.store(false);
+      publishCruiseCmd(0.0, 0.0);
+      RCLCPP_WARN(get_logger(), "[急停] 建图巡航已终止，恢复后需重新调用 start_mapping_cruise");
+    }
     state_ = MissionState::ESTOP;
+    publishStatus();
+    return;
+  }
+
+  // ---------- 建图模式：状态保持 MAPPING，巡航由 20Hz cruise timer 驱动 ----------
+  // 注意：非 AUTO/CRITICAL 仅暂停巡航（mapping_paused_ → 停车），不切换状态，
+  // 避免 pcd_to_map 把"遥控接管/临时异常"误判为 MAPPING→非MAPPING 的建图结束
+  // 信号而提前触发地图转换。急停仍会切 ESTOP（急停 = 终止建图，语义一致）。
+  if (mission_mode_ == "mapping") {
+    const bool pause = (behavior.mode != "AUTO") || (health.overall_status == "CRITICAL");
+    mapping_paused_.store(pause);
+    if (pause) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+        "[建图] 非 AUTO/health=CRITICAL，暂停巡航（状态保持 MAPPING），可随时遥控接管");
+    }
+    if (state_ != MissionState::MAPPING) {
+      state_ = MissionState::MAPPING;
+      RCLCPP_INFO(get_logger(),
+        "[建图] 进入建图模式，FAST-LIO2 在线建图中，不下发导航目标"
+        "（自动巡航请调用 /auto_mission/start_mapping_cruise 服务）");
+    }
     publishStatus();
     return;
   }
@@ -245,16 +673,6 @@ void AutoMissionNode::mainLoop()
         "[降级] SystemHealth=CRITICAL，停止导航，安全停车");
       cancelCurrentGoal();
       state_ = MissionState::IDLE;
-    }
-    publishStatus();
-    return;
-  }
-
-  // ---------- 建图模式：AUTO+MAPPING 直接停在 MAPPING 状态 ----------
-  if (mission_mode_ == "mapping") {
-    if (state_ != MissionState::MAPPING) {
-      state_ = MissionState::MAPPING;
-      RCLCPP_INFO(get_logger(), "[建图] 进入建图模式，FAST-LIO2 在线建图中，不下发导航目标");
     }
     publishStatus();
     return;

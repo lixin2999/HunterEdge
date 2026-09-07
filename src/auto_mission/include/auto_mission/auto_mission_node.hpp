@@ -9,15 +9,16 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
-
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/int32.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_srvs/srv/trigger.hpp"
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/action/follow_waypoints.hpp"
@@ -88,6 +89,19 @@ private:
   void cancelCurrentGoal();
   void triggerEstop(const std::string & reason);
 
+  // ---- 建图模式自动巡航（mapping auto cruise）----
+  void startCruiseCallback(
+    const std_srvs::srv::Trigger::Request::SharedPtr req,
+    std_srvs::srv::Trigger::Response::SharedPtr resp);
+  void stopCruiseCallback(
+    const std_srvs::srv::Trigger::Request::SharedPtr req,
+    std_srvs::srv::Trigger::Response::SharedPtr resp);
+  bool parseWaypoint(const std::string & entry, Waypoint & wp);
+  bool reloadWaypointsFromFile(std::string & msg);   // 重新读取 params_file 的 waypoints
+  void cruiseControlStep();                          // 20Hz 巡航控制（含安全约束）
+  void publishCruiseCmd(double v, double w);
+  static double wrapAngle(double a);                 // 归一化到 [-π, π]
+
   // ---- Nav2 action 回调 ----
   void goalResponseCallback(
     const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr & handle);
@@ -112,6 +126,13 @@ private:
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr waypoint_idx_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr estop_pub_;
 
+  // ---- 建图模式自动巡航 ----
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr lio_odom_sub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_cruise_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_cruise_srv_;
+  rclcpp::TimerBase::SharedPtr cruise_timer_;
+
   rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr nav_action_client_;
 
   rclcpp::TimerBase::SharedPtr main_timer_;
@@ -123,6 +144,11 @@ private:
   hunter_msgs::msg::DetectedObjectArray latest_fused_objects_;
   hunter_msgs::msg::SystemHealth latest_health_;
   bool estop_signal_{false};
+
+  // ---- 建图模式自动巡航缓存 ----
+  nav_msgs::msg::Odometry latest_lio_odom_;   // FAST-LIO2 /Odometry（camera_init 系）
+  rclcpp::Time last_lio_odom_arrive_{0, 0, RCL_SYSTEM_TIME};  // 最近一次到达时刻（本节点时钟）
+  std::atomic<bool> mapping_paused_{false};   // 非 AUTO / CRITICAL → 暂停巡航（保持 MAPPING）
 
   rclcpp::Time last_perception_stamp_;   // 感知数据最后到达时间
 
@@ -150,7 +176,7 @@ private:
 
   // ---- 参数 ----
   // 模式
-  std::string mission_mode_;           // "waypoint_loop" | "external"
+  std::string mission_mode_;           // "mapping"（建图）| "nav"（自主导航）
   // 安全距离
   double warn_obstacle_dist_{2.0};     // 减速阈值（m）
   double stop_obstacle_dist_{0.8};     // 急停阈值（m）
@@ -168,6 +194,26 @@ private:
   double obstacle_wait_timeout_{30.0}; // 障碍物等待超时（s）
   // 最大速度（仅日志/合规性检查；实际限速由 Nav2 params 控制）
   double max_velocity_{2.0};
+
+  // ---- 建图模式自动巡航参数 ----
+  std::string params_file_;              // autonomous_nav_params.yaml 路径（launch 传入，供热重载）
+  double cruise_max_speed_{1.0};         // 巡航直行最大速度（m/s），建图建议 ≤1.0
+  double cruise_turn_speed_{0.4};        // 大航向偏差时的限速（m/s）
+  double cruise_min_speed_{0.2};         // 接近航点时的最低速度（m/s），避免蠕动
+  double cruise_reach_dist_{0.6};        // 到达判定距离（m），≥阿克曼停车精度
+  double cruise_brake_dist_{2.0};        // 进入减速区的距离（m）
+  double cruise_kp_yaw_{1.2};            // 航向 P 增益
+  double cruise_max_yaw_rate_{0.5};      // 最大角速度（rad/s），硬上限
+  double cruise_yaw_slow_deg_{45.0};     // 航向偏差超过此值降速（度）
+  double cruise_min_turn_radius_{1.9};   // HUNTER-SE 最小转弯半径（m），|w| ≤ v/R
+  double cruise_cmd_rate_{20.0};         // /cmd_vel 发布频率（Hz），需 > 2×(1/cmd_vel_timeout)
+  double cruise_odom_timeout_{1.0};      // /Odometry 超时（s），超时停车
+
+  // ---- 建图模式自动巡航状态 ----
+  bool cruise_active_{false};            // 巡航已启动（start 服务触发）
+  bool cruise_cmd_published_{false};     // 本轮巡航是否发过指令（停止时补一帧零速）
+  rclcpp::Time cruise_obstacle_wait_start_{0, 0, RCL_SYSTEM_TIME};
+  bool cruise_obstacle_wait_{false};
 
   // ---- goal 发送时间（超时检测） ----
   rclcpp::Time goal_send_time_;

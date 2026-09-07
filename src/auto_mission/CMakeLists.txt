@@ -15,6 +15,7 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(hunter_msgs REQUIRED)
 find_package(tf2 REQUIRED)
@@ -29,6 +30,7 @@ set(DEPS
   geometry_msgs
   nav_msgs
   sensor_msgs
+  std_srvs
   nav2_msgs
   hunter_msgs
   tf2

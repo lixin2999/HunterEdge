@@ -1,13 +1,19 @@
 """hunter_autonomous_nav.launch.py — HUNTER 自主建图/导航一体启动文件
 
 支持两种运行模式（通过参数 mode 切换）：
-  mode:=mapping  — 建图模式（全自动，无需手动操作）
+  mode:=mapping  — 建图模式（车辆由人工遥控驾驶扫描，系统侧流程自动）
       启动：fast_lio2 参数覆盖（pcd_save_en=true、map_file_path 自动注入）
-            + auto_mission_node(mapping 状态)
+            + auto_mission_node(mapping 状态，不下发导航目标——车辆由人工遥控)
             + pcd_to_map 节点（监听建图结束信号，自动完成 PCD→PGM+YAML 转换）
             + waypoint_recorder 节点（订阅 /clicked_point，自动写入 yaml）
-      结束：切换到 nav 模式时 pcd_to_map 自动检测并触发转换，
-            无需手动执行任何命令
+      操作：人工遥控（REMOTE 模式）驾驶遍历全部目标区域；rviz2 用 Publish Point
+            （快捷键 P）点击记录巡检航点（User_Manual §4.4）。
+      结束：在启动终端按 Ctrl+C → fast_lio2 退出时才把全部点云写入
+            map_file_path（PCD 仅在节点退出瞬间写盘，运行中文件不存在属正常）；
+            pcd_to_map 检测 /auto_mission/status MAPPING→非MAPPING 跳变后
+            自动触发转换，无需手动执行任何命令。
+      也可不退出节点，手动保存当前快照：
+            ros2 service call /fast_lio2/map_save std_srvs/srv/Trigger
 
   mode:=nav      — 定位导航模式（默认）
       启动：fast_lio2 参数覆盖（pcd_save_en=false）
@@ -235,6 +241,9 @@ def _mapping_nodes(context, *args, **kwargs):
         parameters=[
             auto_params_file,
             {'mission_mode': 'mapping'},
+            # start_mapping_cruise 服务触发时从此文件热重载 waypoints
+            # （waypoint_recorder 在建图过程中持续写入同一文件）
+            {'params_file': auto_params_file},
             {'use_sim_time': use_sim_time == 'true'},
         ],
     )
