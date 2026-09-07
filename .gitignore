@@ -29,6 +29,7 @@ release.md
 User_Manual.md
 *.docx
 *.pdf
+Deployment_Guide.md
 
 #编码规则
 *.cursorrules
