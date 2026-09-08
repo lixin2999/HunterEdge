@@ -28,7 +28,8 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    - Cell Size: 2
+    - Class: rviz_default_plugins/Grid
+      Cell Size: 2
       Color: 80; 80; 80
       Enabled: true
       Line Style: Lines
