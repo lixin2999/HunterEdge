@@ -5,15 +5,15 @@
   在原始 navigate_to_pose.xml 基础上新增：
     1. 定位有效性前置检查（TransformAvailable：map → base_link）
     2. 障碍物感知超时检查（TimeExpired 哨兵，感知数据停止后快速失效）
-    3. 障碍物动态减速行为（SpeedController：障碍物近时自动降低最大速度）
+    3. （V0.0.82 移除 SpeedController：本 fork 该节点为按速度调 tick 周期的装饰器、
+        无障碍物限速语义；动态减速由 RPP cost-regulation 机制承担）
     4. 路径受阻时的后退恢复（BackUp 替代 Spin，适合阿克曼底盘前进后退）
     5. GoalUpdated 响应：外部实时更新目标点时立即中断重规划
 
   BT 节点说明（全部来自 bt_navigator plugin_lib_names，无自定义插件）：
-    TransformAvailable       — 检查指定坐标系变换是否可用（定位有效性代理）
+    TransformAvailable       — 检查指定坐标系变换是否可用（端口：child/parent）
     ComputePathToPose        — SmacPlannerHybrid 全局规划
-    FollowPath               — RPP 局部跟踪控制
-    SpeedController          — 根据距离障碍物动态缩放线速度上限
+    FollowPath               — RPP 局部跟踪控制（自带近障碍降速/近终点减速）
     GoalUpdated              — 外部目标点是否已更新（条件节点）
     BackUp                   — 直线后退恢复（阿克曼车适用，替代原 Spin）
     Wait                     — 原地等待
@@ -29,7 +29,6 @@
     • 感知数据超时（TimeExpired 2s）→ 触发 ClearLocalCostmap 并 Wait，
       等待感知恢复，防止代价地图信息过期后盲目通行
     • BackUp 距离限制为 0.3 m（阿克曼最小转弯半径 1.9 m，小幅后退足以脱困）
-    • SpeedController：障碍物距离 ≥ 3m 正常速度；< 3m 按比例降至 0.4 m/s 下限
     • 最大全局重试次数 6（与原始行为树保持一致）
   =====================================================================
 -->
@@ -43,11 +42,14 @@
     -->
     <Sequence name="LocalizationGuard">
 
-      <!-- 定位有效性检查：map → base_link TF 必须可用 -->
+      <!-- 定位有效性检查：map → base_link TF 必须可用
+           ⚠ 本 fork TransformAvailableCondition 端口名为 child/parent（见
+           nav2_behavior_tree .../condition/transform_available_condition.hpp:65），
+           写成 child_frame/parent_frame 会报 "Possible typo? ... port" 加载失败 -->
       <TransformAvailable
         name="CheckMapToBaseLink"
-        child_frame="base_link"
-        parent_frame="map"/>
+        child="base_link"
+        parent="map"/>
 
       <!--
         第 1 层：外层恢复节点（最多重试 6 次）
@@ -63,7 +65,7 @@
           <!--
             感知数据保鲜检查：距上次代价地图更新超过 2s 则暂停规划，
             清除局部代价地图并等待感知数据恢复。
-            使用 TimeExpired 作为哨兵（time_val=2.0s）。
+            使用 TimeExpired 作为哨兵（seconds=2.0s）。
             若感知恢复（TimeExpired 返回 FAILURE），流水线继续执行。
           -->
           <ReactiveFallback name="PerceptionFreshnessGuard">
@@ -76,7 +78,7 @@
               <ClearEntireCostmap
                 name="ClearLocalCostmap-Perception"
                 service_name="local_costmap/clear_entirely_local_costmap"/>
-              <Wait wait_duration="2.0"/>
+              <Wait wait_duration="2"/>
             </Sequence>
           </ReactiveFallback>
 
@@ -97,22 +99,17 @@
           </RateController>
 
           <!--
-            局部路径跟踪 + 动态减速
-            SpeedController 根据最近障碍物距离动态调整线速度上限：
-              • min_rate=0.4 m/s（障碍物极近时），max_rate=2.0 m/s（空旷时）
-              • distance_traveled_threshold 和 time_travel_threshold 保持与 RPP 前视距离一致
+            局部路径跟踪
+            注（V0.0.82）：原 SpeedController 包装已移除——本 fork 的 SpeedController
+            端口为 min_rate/max_rate/min_speed/max_speed（按平滑速度调整子树 tick 周期，
+            见 speed_controller.hpp:56），并无 min_distance/max_distance/time_allowance
+            端口（写了加载即报 "Possible typo? port"），也不具备"障碍物距离→限速"语义。
+            障碍物动态减速由 RPP 自带机制覆盖：use_cost_regulated_linear_velocity_scaling
+            （近障碍自动降速）+ approach_velocity_scaling（接近终点减速）。
           -->
           <RecoveryNode number_of_retries="1" name="FollowPathRecovery">
 
-            <SpeedController
-              name="ObstacleSpeedController"
-              min_rate="0.4"
-              max_rate="2.0"
-              min_distance="0.5"
-              max_distance="3.0"
-              time_allowance="10.0">
-              <FollowPath path="{path}" controller_id="FollowPath"/>
-            </SpeedController>
+            <FollowPath path="{path}" controller_id="FollowPath"/>
 
             <!-- 跟踪失败：清除局部代价地图 + 后退恢复（阿克曼适用，距离小于 0.3m） -->
             <Sequence name="TrackingRecovery">
@@ -143,7 +140,7 @@
             <!-- 后退脱困（0.3m，0.2m/s，适合阿克曼底盘） -->
             <BackUp backup_dist="0.3" backup_speed="0.2"/>
             <!-- 等待：障碍物可能短暂通过 -->
-            <Wait wait_duration="5.0"/>
+            <Wait wait_duration="5"/>
           </RoundRobin>
         </ReactiveFallback>
 

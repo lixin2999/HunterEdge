@@ -466,7 +466,7 @@ NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
 
 - **定位门控**：`TransformAvailable(map→base_link)` 前置检查，定位不可用时立即阻断导航；
 - **感知保鲜**：`TimeExpired(2s)` 哨兵，感知超时时清除局部代价地图并等待恢复；
-- **动态减速**：`SpeedController(0.4~2.0 m/s)`，障碍物距离 < 3m 时按比例降速；
+- ~~动态减速~~（V0.0.82 移除 `SpeedController`：本 fork 该节点为按平滑速度调子树 tick 周期的装饰器，无"障碍物距离→限速"语义）；障碍物减速由 RPP `use_cost_regulated_linear_velocity_scaling`（近障碍自动降速）+ approach 减速承担；
 - **阿克曼后退**：`BackUp(0.3m)` 替代 `Spin`（原地旋转），适合阿克曼底盘脱困。
 
 ### 10.7 新增/修改文件清单
