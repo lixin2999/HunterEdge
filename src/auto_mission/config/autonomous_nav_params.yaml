@@ -71,7 +71,7 @@ auto_mission_node:
     # 速度约束（仅合规性检查，实际限速由 nav2_params.yaml controller/velocity_smoother 控制）
     # 文档规定：HUNTER-SE 最大速度 ≤ 2.0 m/s
     # -------------------------------------------------------------------------
-    max_velocity: 1.5                # 建议巡航速度（m/s），≤ 2.0
+    max_velocity: 0.8                # 巡航速度（m/s），与 controller desired_linear_vel 一致
 
     # -------------------------------------------------------------------------
     # 建图模式自动巡航（mapping auto cruise）

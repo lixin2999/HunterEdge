@@ -111,10 +111,21 @@ controller_server:
       regulated_linear_scaling_min_speed: 0.2
       max_robot_pose_search_dist: 5.0
       transform_tolerance: 0.1
-      # 速度限制（文档 10.2.3）
-      desired_linear_vel: 2.0                  # max_velocity 2.0 m/s
-      max_linear_accel: 1.0                    # 文档 10.2.3
-      max_linear_decel: -1.5                   # 文档 10.2.3
+      # 速度限制（文档 10.2.3；V0.0.82 实车事故调降：2.0m/s 在 RPP 纯跟踪
+      # 架构（无局部避障语义）下刹不住、避障盲区数米，统一降为 0.8）
+      desired_linear_vel: 0.8                  # 原 2.0，V0.0.82 降速
+      max_linear_accel: 0.5                    # 原 1.0，减小起步冲击
+      max_linear_decel: -2.5                   # 原 -1.5，增强制动能力（0.8m/s 0.32s 停住）
+      # V0.0.82 显式声明碰撞检测（本 fork 默认 true，参数存在性见
+      # regulated_pure_pursuit_controller.cpp:89——检测到投影碰撞即终止
+      # FollowPath 进入 BT 恢复，依赖局部 costmap 有障碍数据）
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.5   # 0.8m/s 投影 1.2s ≈ 1m 前瞻
+      use_cost_regulated_linear_velocity_scaling: true  # 近障碍代价降速（依赖障碍层数据）
+      cost_scaling_dist: 0.6
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 3.0
+      max_angular_accel: 1.5                   # 默认 3.2，阿克曼降角加速度防甩尾
 
     general_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"   # 必填：缺失即 FATAL "Can not get 'plugin' param value for general_goal_checker"
@@ -131,7 +142,7 @@ controller_server:
 global_costmap:
   global_costmap:
     ros__parameters:
-      update_frequency: 1.0                    # 文档 8.3：更新频率 1Hz
+      update_frequency: 2.0                    # V0.0.82：原 1.0，配合 BT 2Hz 重规划
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
@@ -143,26 +154,43 @@ global_costmap:
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true    # Humble：map_server 以 transient_local 发 /map，默认 volatile 订阅将收不到地图
+      # V0.0.82 双障碍源冗余：原单一 lidar_cloud（lidar_perception 聚类输出）
+      # 为单点故障——地面分割/聚类异常时障碍层全空 → 全局无避障。补第二源
+      # /scan（pointcloud_to_laserscan 高度切片直出，不经聚类，且带清障能力）
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"   # 必填：loadPlugins() 缺失即 FATAL "Can not get 'plugin' param"
         enabled: true
-        observation_sources: lidar
-        lidar:
+        observation_sources: [lidar_cloud, scan]
+        lidar_cloud:
           topic: /perception/lidar/obstacle_cloud
           data_type: "PointCloud2"
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
+          marking: true
+          clearing: false
+          obstacle_range: 5.0
+          raytrace_range: 6.0
+          expected_update_rate: 0.5             # 10Hz 数据，0.5s 无更新仅告警不断链
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+          marking: true
+          clearing: true                        # 射线清障：障碍移除后痕迹自动消退
+          inf_is_valid: true                    # use_inf 投影的 inf 视为该方向无障碍
+          obstacle_range: 5.0
+          raytrace_range: 6.0
+          expected_update_rate: 0.5
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.35                 # 文档 8.3 原值 0.3 < footprint 内切半径 0.33，Nav2 强烈警告，取 0.35
+        inflation_radius: 0.40                 # V0.0.82：原 0.35，加大缓冲（≥内切半径 0.33+余量）
         cost_scaling_factor: 3.0
 
 # ---- 局部代价地图（文档 8.3） ----
 local_costmap:
   local_costmap:
     ros__parameters:
-      update_frequency: 5.0                    # 文档 8.3：更新频率 5Hz
-      publish_frequency: 2.0
+      update_frequency: 10.0                   # V0.0.82：原 5.0，高速/贴近障碍场景更快反应
+      publish_frequency: 5.0                   # 原 2.0
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
@@ -171,18 +199,34 @@ local_costmap:
       height: 10
       footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
       plugins: ["obstacle_layer", "inflation_layer"]
+      # V0.0.82 双障碍源冗余（与 global_costmap 一致）：单一聚类点云源为
+      # 单点故障；/scan 直采源带清障（clearing），感知链任一环异常时另一源兜底
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"   # 必填：loadPlugins() 缺失即 FATAL "Can not get 'plugin' param"
         enabled: true
-        observation_sources: lidar
-        lidar:
+        observation_sources: [lidar_cloud, scan]
+        lidar_cloud:
           topic: /perception/lidar/obstacle_cloud
           data_type: "PointCloud2"
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
+          marking: true
+          clearing: false
+          obstacle_range: 5.0
+          raytrace_range: 6.0
+          expected_update_rate: 0.5
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          inf_is_valid: true
+          obstacle_range: 5.0
+          raytrace_range: 6.0
+          expected_update_rate: 0.5
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.35                 # 文档 8.3 原值 0.2 < footprint 内切半径 0.33（实测 FATAL 前警告），取 0.35
+        inflation_radius: 0.40                 # V0.0.82：原 0.35，加大缓冲
         cost_scaling_factor: 3.0
 
 # ---- 行为树导航器（文档 2.3 nav2_bt_navigator） ----
@@ -202,18 +246,18 @@ bt_navigator:
     # 默认行为树由 bt_navigator 自行解析：可选手动覆盖参数名为
     # default_nav_to_pose_bt_xml / default_nav_through_poses_bt_xml（未设置即用默认）。
 
-# ---- 速度平滑器（文档 10.2.3 速度限制） ----
+# ---- 速度平滑器（文档 10.2.3 速度限制；V0.0.82 与 controller/safety_guard 对齐） ----
 velocity_smoother:
   ros__parameters:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [2.0, 0.0, 2.5]     # 文档 10.2.3：max_velocity 2.0
-    min_velocity: [-0.5, 0.0, -2.5]   # 文档 10.2.3：min_velocity -0.5
-    max_accel: [1.0, 0.0, 3.0]        # 文档 10.2.3：max_accel 1.0
-    max_decel: [-1.5, 0.0, -3.0]      # 文档 10.2.3：max_decel -1.5
+    max_velocity: [0.8, 0.0, 1.0]     # 原 [2.0,0,2.5]；V0.0.82 降速（与 RPP desired_linear_vel 一致）
+    min_velocity: [-0.5, 0.0, -1.0]   # 倒车仅恢复行为 BackUp 使用（0.2m/s）
+    max_accel: [0.5, 0.0, 2.0]        # 原 [1.0,0,3.0]，减小起步冲击
+    max_decel: [-2.5, 0.0, -2.5]      # 原 [-1.5,0,-3.0]，增强制动
     odom_topic: "/localization/odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
-    velocity_timeout: 1.0
+    velocity_timeout: 0.5             # 原 1.0：断流 0.5s 即零速（下游 safety_guard 同周期看门狗双保险）
 

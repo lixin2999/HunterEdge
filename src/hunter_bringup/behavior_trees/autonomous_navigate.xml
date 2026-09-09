@@ -83,10 +83,13 @@
           </ReactiveFallback>
 
           <!--
-            全局路径规划（1Hz 重规划）
+            全局路径规划（V0.0.82：1Hz → 2Hz 重规划）
+            实车教训：RPP 是纯路径跟随器、不具备局部避障语义，动态障碍
+            完全依赖全局重规划绕行。1Hz × 高速 = 数米级反应盲区；
+            2Hz + 降速 0.8m/s + safety_guard 碰撞闸三层兜底。
             失败时先尝试清除全局代价地图，再重规划一次
           -->
-          <RateController hz="1.0">
+          <RateController hz="2.0">
             <RecoveryNode number_of_retries="1" name="ComputePathRecovery">
               <ComputePathToPose
                 goal="{goal}"

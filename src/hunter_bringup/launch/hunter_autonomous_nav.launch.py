@@ -162,8 +162,10 @@ def _nav2_params_with_bt(context, *args, **kwargs):
 
     # ---- velocity_smoother ----
     # 输入 cmd_vel→cmd_vel_nav（接 controller_server / behavior_server），
-    # 输出 cmd_vel_smoothed→cmd_vel（hunter_base 订阅 /cmd_vel）。
-    # 旧版缺这对重映射：controller 指令到不了底盘 → 车辆不动 → Failed to make progress。
+    # 输出 cmd_vel_smoothed→cmd_vel_pre_safety（V0.0.82：不再直达底盘，
+    # 而是先过 hunter_safety/safety_guard 碰撞闸——scan 碰撞急停/限速、
+    # 阿克曼曲率钳制、速度硬限、estop 透传，再由 safety_guard 发布 /cmd_vel）。
+    # 旧版缺重映射：controller 指令到不了底盘 → 车辆不动 → Failed to make progress。
     velocity_smoother = Node(
         package='nav2_velocity_smoother',
         executable='velocity_smoother',
@@ -172,8 +174,30 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         parameters=[nav2_params_file],
         remappings=[
             ('cmd_vel', 'cmd_vel_nav'),
-            ('cmd_vel_smoothed', 'cmd_vel'),
+            ('cmd_vel_smoothed', 'cmd_vel_pre_safety'),
         ],
+    )
+
+    # ---- safety_guard（碰撞防护与运动学安全约束，V0.0.82） ----
+    # 速度指令链：controller/behavior → velocity_smoother → safety_guard → 底盘。
+    # 仅导航模式启动（mapping 模式 auto_mission cruise 直发 /cmd_vel，避免双发布者）。
+    safety_guard = Node(
+        package='hunter_safety',
+        executable='safety_guard',
+        name='safety_guard',
+        output='screen',
+        remappings=[('cmd_vel_in', '/cmd_vel_pre_safety')],
+        parameters=[{
+            'wheelbase': 0.65,          # HunterV2Params::wheelbase（AGX_V2 实车）
+            'min_turn_radius': 1.9,     # 与 Smac minimum_turning_radius 一致
+            'max_linear_vel': 0.8,      # 与 nav2_params.yaml desired_linear_vel 一致
+            'stop_dist': 0.6,           # scan 行进方向扇区急停距离（m）
+            'slow_dist': 1.2,           # scan 行进方向扇区减速距离（m）
+            'sector_half_deg': 60.0,    # 检测扇区半角（°）
+            'scan_timeout': 0.5,        # /scan 断流 fail-safe（s）
+            'cmd_timeout': 0.5,         # 上游指令断流看门狗（s）
+            'use_sim_time': use_sim_time == 'true',
+        }],
     )
 
     # ---- 全局定位（map→odom）：AMCL + 3D→2D 激光投影 ----
@@ -289,6 +313,7 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         behavior_server,
         bt_navigator,
         velocity_smoother,
+        safety_guard,
         lifecycle_manager,
         auto_mission,
         pcd_to_map_nav,

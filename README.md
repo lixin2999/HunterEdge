@@ -144,6 +144,7 @@
 | `hunter_monitor/health_monitor` | 系统监控与健康管理 | §15 |
 | `decision_making` | 模式仲裁决策（AUTO/REMOTE/ESTOP 状态机） | §13.5 |
 | `auto_mission` | AUTO 模式自主任务调度（航点巡航/安全守护/建图控制） | 自主导航扩展 |
+  | `hunter_safety/safety_guard` | 碰撞防护与运动学安全约束（scan 碰撞闸/阿克曼曲率钳制/分级预警，速度链末级） | §10.8 |
 
 ### 4.2 第三方依赖包（外部依赖，需按 §5 安装）
 
@@ -414,7 +415,10 @@ hunter_full.launch.py (use_autonomous_nav:=true)
         ├── fast_lio2_param_injector  ← 自动注入 pcd_save_en=false
         ├── map_server                ← 加载静态 PGM 地图
         ├── Nav2 全栈                 ← 使用 autonomous_navigate.xml 扩展行为树
-        └── auto_mission_node         ← 状态机（航点巡航/安全守护）
+        ├── auto_mission_node         ← 状态机（航点巡航/安全守护）
+        └── safety_guard              ← 碰撞闸（V0.0.85：scan 急停/限速 + 阿克曼
+                                          曲率钳制 + 速度硬限，速度链末级，发布 /cmd_vel 至底盘）
+
 ```
 
 ### 10.2 AUTO 进入条件（全部满足才允许导航）
@@ -447,7 +451,7 @@ NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
 | `localize_cov_threshold` | 0.5 | 定位协方差迹收敛阈值 |
 | `localize_wait_timeout` | 10 s | 等待定位收敛超时 |
 | `perception_timeout` | 2 s | 感知数据超时阈值 |
-| `max_velocity` | 1.5 m/s | 巡航速度（≤ 2.0 m/s 合规限制） |
+| `max_velocity` | 0.8 m/s | 巡航速度（V0.0.85 全链降速，与 RPP desired_linear_vel 一致） |
 | `loop_waypoints` | `true` | 完成所有航点后是否循环 |
 | `goal_timeout` | 60 s | 单点导航超时 |
 | `obstacle_wait_timeout` | 30 s | 障碍物等待超时后触发 ESTOP |
@@ -468,8 +472,30 @@ NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
 - **感知保鲜**：`TimeExpired(2s)` 哨兵，感知超时时清除局部代价地图并等待恢复；
 - ~~动态减速~~（V0.0.82 移除 `SpeedController`：本 fork 该节点为按平滑速度调子树 tick 周期的装饰器，无"障碍物距离→限速"语义）；障碍物减速由 RPP `use_cost_regulated_linear_velocity_scaling`（近障碍自动降速）+ approach 减速承担；
 - **阿克曼后退**：`BackUp(0.3m)` 替代 `Spin`（原地旋转），适合阿克曼底盘脱困。
+- **重规划提速**（V0.0.85）：RateController 1.0→2.0Hz——RPP 为纯路径跟随器、
+  无局部避障语义，动态障碍全靠全局重规划绕行，1Hz×高速=数米级盲区；配合全链降速 0.8m/s。
 
-### 10.7 新增/修改文件清单
+### 10.8 碰撞防护与安全约束（V0.0.85 新增 hunter_safety/safety_guard）
+
+速度指令链最后一级物理安全闸，串联于 `velocity_smoother` 与底盘之间
+（launch 重映射 cmd_vel_smoothed→cmd_vel_pre_safety，safety_guard 发布 /cmd_vel），
+数据源为 /scan（pointcloud_to_laserscan 直出），**不依赖感知融合链**，与决策层
+（auto_mission OBSTACLE_AVOID/ESTOP）、模式仲裁（decision_making）互为冗余：
+
+| 能力 | 触发条件 | 动作 |
+|------|----------|------|
+| 碰撞急停 | 行进方向 ±60° 扇区最近障碍 < stop_dist(0.6m) | 立即零速 COLLISION_STOP |
+| 碰撞限速 | 最近障碍 < slow_dist(1.2m) | 线性限速至 max×(d−stop)/(slow−stop)，SLOWDOWN |
+| 感知 fail-safe | /scan 超时 0.5s 或未到达 | 零速（宁可停车不盲走）SCAN_TIMEOUT |
+| 指令看门狗 | 上游速度指令断流 >0.5s | 零速心跳 CMD_TIMEOUT |
+| 急停透传 | /estop=true | 零速（弥补 Nav2 goal 取消延迟窗口）ESTOP_PASS |
+| 阿克曼曲率钳制 | 恒生效 | \|w\| ≤ \|v\|/1.9（δ≤0.33rad，杜绝打满转向） |
+| 速度硬限 | 恒生效 | \|v\| ≤ 0.8m/s（第二重限速） |
+
+分级预警：/safety/state（std_msgs/String）2Hz 心跳，格式 状态|原因；
+仅导航模式启动（mapping 模式 auto_mission cruise 直发 /cmd_vel，避免双发布者）。
+
+### 10.9 新增/修改文件清单
 
 ```
 src/
@@ -487,6 +513,10 @@ src/
 │       ├── waypoint_recorder.py                ← 航点自动采集
 │       ├── pcd_to_map.py                       ← PCD→PGM 自动转换
 │       └── fast_lio2_param_injector.py         ← pcd_save 参数自动注入
+  ├── hunter_safety/                              ← 新增包（V0.0.85 碰撞防护）
+  │   ├── CMakeLists.txt / package.xml
+  │   ├── launch/safety_guard.launch.py           ← 独立调试启动
+  │   └── src/safety_guard.cpp                    ← scan 碰撞闸/曲率钳制/预警实现
 └── hunter_bringup/
     ├── behavior_trees/
     │   └── autonomous_navigate.xml             ← 扩展行为树（新增）

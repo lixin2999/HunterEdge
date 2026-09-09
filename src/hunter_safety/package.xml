@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hunter_safety</name>
+  <version>0.0.82</version>
+  <description>
+    HUNTER 碰撞防护与运动学安全约束节点（safety_guard）。
+    串联在 velocity_smoother 与底盘之间：扫描碰撞闸（stop/slowdown）、
+    阿克曼曲率钳制（δ=atan(L·w/v) ≤ atan(L/R_min)）、速度硬限、
+    感知超时 fail-safe、急停透传与 /safety/state 分级预警。
+    数据源为 /scan（pointcloud_to_laserscan 直出），不依赖感知融合链，
+    与决策层（auto_mission/decision_making）互为冗余。
+  </description>
+  <maintainer email="dev@hunter.local">HUNTER Development Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
