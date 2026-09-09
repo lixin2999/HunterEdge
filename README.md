@@ -372,7 +372,7 @@ ros2 launch hunter_bringup hunter_full.launch.py \
 | `/auto_mission/current_waypoint` | `std_msgs/Int32` | 事件 | 当前执行的航点索引 |
 | `/pcd_to_map/status` | `std_msgs/String` | 事件 | PCD→地图转换状态（IDLE/CONVERTING/DONE/ERROR） |
 | `/navigate_to_pose` (action) | `nav2_msgs/NavigateToPose` | — | Nav2 单点导航 action 接口（方式B 外部下发） |
-| `/safety/state` | `std_msgs/String` | 2Hz | safety_guard 分级预警心跳（状态|原因；OK/SLOWDOWN/COLLISION_STOP/SCAN_TIMEOUT/CMD_TIMEOUT/ESTOP_PASS/TEST_ABORTED） |
+| `/safety/state` | `std_msgs/String` | 2Hz | safety_guard 分级预警心跳（状态|原因；OK/SLOWDOWN/COLLISION_STOP/SCAN_TIMEOUT/CMD_TIMEOUT/ESTOP_PASS/TEST_ABORTED/MAP_EDGE_SLOWDOWN/MAP_EDGE_STOP） |
 | `/safety/test_mode` | `std_msgs/Bool` | 事件 | 自动驾驶测试模式开关（true 开启 0.1m/s 限速+严阈值+异常自动中止） |
 | `/cmd_vel_nav` | `geometry_msgs/Twist` | 20Hz | controller_server 原始速度指令（safety_guard 测试模式监控其断流） |
 
@@ -498,6 +498,16 @@ NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
 | 测试模式碰撞急停 | 测试模式开启时同扇区 < test_stop_dist(1.0m) | 立即零速 COLLISION_STOP【测试模式】 |
 | 测试模式减速 | 测试模式开启时同扇区 < test_slow_dist(2.0m) | 限速 ≤0.1m/s（test_max_linear_vel） |
 | 测试模式异常中止 | 疑似碰撞卡死（指令>0.05m/s 而反馈≈0 持续 1s）/ goal ABORTED / goal 活跃但 /cmd_vel_nav 断流 >2s | 零速锁存 TEST_ABORTED + /estop=true + 取消全部导航目标 |
+| 地图边界减速（V0.0.87） | 车辆距未建图(unknown)/界外栅格 < map_edge_slow_dist(1.5m) | 线性限速至 max×(d−stop)/(slow−stop)，MAP_EDGE_SLOWDOWN |
+| 地图边界停车（V0.0.87） | 车辆距未建图(unknown)/界外栅格 < map_edge_stop_dist(0.5m) | 立即零速 MAP_EDGE_STOP（回到已建图区域自动恢复）；测试模式下升级为中止锁存 TEST_ABORTED |
+
+> **地图边界约束（V0.0.87 三层防线）**：保证车辆行驶范围、预设航点、导航点与
+> 规划路径均在已采集地图区域内——① Nav2 规划层：`global_costmap
+> track_unknown_space: true` + Smac `allow_unknown: false`，全局规划路径不穿越
+> 未采集区域；② 任务层：auto_mission 发送航点前校验（矩形边界+0.5m 边距+
+> 非 unknown 栅格），越界航点自动跳过；③ 执行层：safety_guard 地图边界监护
+> （/map + /amcl_pose 距离场，上表最后两行），行驶中越界零速兜底。建图模式
+> 无 /map 与 AMCL，③ 自动不介入。
 
 分级预警：/safety/state（std_msgs/String）2Hz 心跳，格式 状态|原因；
 仅导航模式启动（mapping 模式 auto_mission cruise 直发 /cmd_vel，避免双发布者）。
@@ -510,10 +520,16 @@ ros2 topic pub --once /safety/test_mode std_msgs/msg/Bool "{data: false}"  # 关
 ```
 
 开启后 0.1m/s 限速巡航、±60° 扇区 <1.0m 急停/<2.0m 减速（较常规 0.6/1.2m 更早介入），
-并自动监控三类异常——疑似碰撞卡死、控制器断流、Nav2 goal ABORTED——任一发生立即
+并自动监控四类异常——疑似碰撞卡死、控制器断流、Nav2 goal ABORTED、
+**地图越界（V0.0.87，距未建图/界外栅格 <0.5m）**——任一发生立即
 零速锁存（TEST_ABORTED）并发布 /estop=true（auto_mission 取消全部导航任务）；
 锁存后即使外部把 /estop 清回 false 也保持零速，必须重新发布 true 才能解除
 （视为人工确认现场安全）。
+
+地图边界监护（V0.0.87）运行时参数（launch 注入，默认全开）：
+`enable_map_fence`（开关）、`map_edge_stop_dist`（0.5m 零速阈值）、
+`map_edge_slow_dist`（1.5m 减速阈值）；监护在 /map 与 /amcl_pose 均就绪后生效，
+启动日志输出 `[边界监护] 已就绪：栅格 WxH @0.050m/cell ...`。
 
 ### 10.9 新增/修改文件清单
 
@@ -648,6 +664,9 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 
 - **默认最高速度 2.0 m/s**，可通过平台配置调整（最高不超过底盘 4.8 m/s）；
 - `/cmd_vel` 超时 > 500ms 自动停车；CAN 通信丢失 > 100ms 底盘自动制动；
+- **地图边界约束（V0.0.87）**：自主巡航行驶范围不得超过已采集地图区域——
+  Nav2 规划层不穿越未建图区域（track_unknown_space + allow_unknown=false）、
+  航点发送前校验、safety_guard 边界监护行驶中限速/零速兜底（§10.8）；
 - 自动驾驶运行时需有安全员监控，可随时急停。
 
 ### 13.3 传感器标定要求（设计文档 §20.2）

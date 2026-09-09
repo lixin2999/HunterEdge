@@ -70,6 +70,10 @@ planner_server:
       tolerance: 0.25                          # 文档 9.2：目标点容差
       max_iterations: 1000000                  # 文档 9.2：最大搜索迭代次数
       max_planning_time: 2.0
+      allow_unknown: false                     # V0.0.87 显式声明（Humble 默认 false）：配合
+                                               # global_costmap track_unknown_space: true，
+                                               # 规划路径不穿越未采集(unknown)区域——
+                                               # 行驶路径恒在已采集地图范围内
       motion_model_for_search: "DUBIN"         # V0.0.82：改纯前进。REEDS_SHEPP 允许路径含倒车段，
                                                # 但本 fork RPP 不支持倒车跟随（无 allow_reversing 参数），
                                                # 倒车段会令控制器死磕 → Failed to make progress；
@@ -149,6 +153,12 @@ global_costmap:
       resolution: 0.1                          # 文档 8.3：分辨率 0.1m
       width: 100                               # 文档 8.3：100m × 100m（Nav2 Humble 要求 integer）
       height: 100
+      # V0.0.87 越界防护（地图边界约束第①层）：保留静态地图中未采集区域为
+      # NO_INFORMATION（默认 false 会把 unknown 当作自由空间 → 规划器可穿越
+      # 未建图区域）。配合 Smac allow_unknown=false：全局规划路径不进入
+      # 未采集区域；目标点在未采集区域/地图外时规划直接失败（BT 快速回报），
+      # 不再出现"路径悄悄伸到地图边缘外"的情况
+      track_unknown_space: true
       footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:

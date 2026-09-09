@@ -9,7 +9,10 @@
     阿克曼曲率钳制（δ=atan(L·w/v) ≤ atan(L/R_min)）、速度硬限、
     感知超时 fail-safe、急停透传与 /safety/state 分级预警；
     V0.0.86 新增自动驾驶测试模式（/safety/test_mode）：0.1m/s 限速、
-    更严碰撞阈值、异常（碰撞卡死/控制器断流/goal ABORTED）自动中止。
+    更严碰撞阈值、异常（碰撞卡死/控制器断流/goal ABORTED）自动中止；
+    V0.0.87 新增地图边界监护（/map + /amcl_pose）：车辆距未建图(unknown)/
+    界外栅格过近自动限速/零速，测试模式下越界自动中止，保证行驶范围
+    不超出已采集地图区域。
     数据源为 /scan（pointcloud_to_laserscan 直出），不依赖感知融合链，
     与决策层（auto_mission/decision_making）互为冗余。
   </description>

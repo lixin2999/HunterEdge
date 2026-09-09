@@ -197,6 +197,10 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'scan_timeout': 0.5,        # /scan 断流 fail-safe（s）
             'cmd_timeout': 0.5,         # 上游指令断流看门狗（s）
             'enable_test_mode': False,  # V0.0.86 测试模式启动默认关（运行时经 /safety/test_mode 开关）
+            # V0.0.87 地图边界监护（/map + /amcl_pose；建图模式无源自动不介入）
+            'enable_map_fence': True,   # 行驶范围不得超出已采集地图区域（行驶中最后防线）
+            'map_edge_stop_dist': 0.5,  # 距未建图/界外栅格 <0.5m 零速（测试模式下自动中止）
+            'map_edge_slow_dist': 1.5,  # 距未建图/界外栅格 <1.5m 线性限速
             'use_sim_time': use_sim_time == 'true',
         }],
     )

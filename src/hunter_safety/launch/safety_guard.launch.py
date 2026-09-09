@@ -27,6 +27,10 @@ def generate_launch_description():
                 'scan_timeout': 0.5,        # /scan 断流 fail-safe（s）
                 'cmd_timeout': 0.5,         # 上游指令断流看门狗（s）
                 'enable_test_mode': False,  # V0.0.86 测试模式启动默认关（运行时经 /safety/test_mode 开关）
+                # V0.0.87 地图边界监护（单独调试时需 map_server + AMCL 已运行）
+                'enable_map_fence': True,
+                'map_edge_stop_dist': 0.5,
+                'map_edge_slow_dist': 1.5,
                 'use_sim_time': False,
             }],
         ),

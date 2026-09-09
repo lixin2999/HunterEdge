@@ -1,5 +1,5 @@
 // Copyright 2026 HUNTER Development Team
-// safety_guard — 碰撞防护与运动学安全约束节点（V0.0.86）
+// safety_guard — 碰撞防护与运动学安全约束节点（V0.0.87）
 //
 // 定位：串联在 velocity_smoother 与底盘（hunter_base 订阅 /cmd_vel）之间的
 // 【最后一道物理安全闸】，独立于感知融合链（直接消费 /scan），与决策层
@@ -24,6 +24,15 @@
 //      发布 /estop=true（latched，auto_mission 取消全部导航任务）+
 //      async_cancel_all_goals() 取消 /navigate_to_pose 活动目标；
 //      中止状态需人工重新发布 /safety/test_mode true 解除。
+//   9. 地图边界监护（V0.0.87）：车辆行驶范围不得超出已采集地图区域——
+//      订阅 /map（transient_local）+ /amcl_pose（map 系位姿），构建"到最近
+//      未建图(unknown)/界外栅格"的距离场（Chamfer 3-4 两遍扫描，一次性），
+//      运行时 O(1) 查询分级介入：距边界 < map_edge_stop_dist(0.5m) → 零速
+//      （测试模式升级为中止锁存）；< map_edge_slow_dist(1.5m) → 线性限速
+//      （/safety/state 新增 MAP_EDGE_STOP / MAP_EDGE_SLOWDOWN）。建图模式无
+//      /map 与 AMCL，监护自动静默不介入（建图巡航安全由 cruise_* 与人工保障）。
+//      规划层（Nav2 track_unknown_space + allow_unknown=false）与任务层
+//      （auto_mission 航点校验）为前两道防线，本监护为行驶中最后一道。
 //
 // 仅在导航模式（hunter_autonomous_nav mode:=nav）启动：mapping 模式下
 // auto_mission cruise 直接发布 /cmd_vel（自带低速与急停逻辑），本节点若
@@ -39,10 +48,13 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "action_msgs/msg/goal_status_array.hpp"
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -79,6 +91,10 @@ public:
     declare_parameter<double>("stall_fb_vel_max", 0.02);   // 判"没在动"的最大反馈速度（m/s）
     declare_parameter<double>("plan_fail_timeout", 2.0);   // 控制器指令断流判定（s）
     declare_parameter<bool>("estop_hold_on_abort", true);  // 中止时是否发布 /estop=true
+    // V0.0.87 地图边界监护
+    declare_parameter<bool>("enable_map_fence", true);     // 边界监护开关
+    declare_parameter<double>("map_edge_stop_dist", 0.5);  // 距未建图/界外栅格停车距离（m）
+    declare_parameter<double>("map_edge_slow_dist", 1.5);  // 距未建图/界外栅格减速距离（m）
 
     wheelbase_ = get_parameter("wheelbase").as_double();
     min_turn_radius_ = get_parameter("min_turn_radius").as_double();
@@ -99,6 +115,9 @@ public:
     stall_fb_vel_max_ = get_parameter("stall_fb_vel_max").as_double();
     plan_fail_timeout_ = get_parameter("plan_fail_timeout").as_double();
     estop_hold_on_abort_ = get_parameter("estop_hold_on_abort").as_bool();
+    enable_map_fence_ = get_parameter("enable_map_fence").as_bool();
+    map_edge_stop_dist_ = get_parameter("map_edge_stop_dist").as_double();
+    map_edge_slow_dist_ = get_parameter("map_edge_slow_dist").as_double();
 
     if (min_turn_radius_ <= wheelbase_ * 0.2) {
       RCLCPP_WARN(get_logger(),
@@ -113,6 +132,15 @@ public:
       RCLCPP_WARN(get_logger(),
         "test_stop_dist ≥ test_slow_dist，修正 test_slow_dist=test_stop+0.5");
       test_slow_dist_ = test_stop_dist_ + 0.5;
+    }
+    if (!enable_map_fence_) {
+      RCLCPP_WARN(get_logger(),
+        "地图边界监护已关闭（enable_map_fence=false）：越界防护仅剩 Nav2 规划层"
+        "（track_unknown_space）与 auto_mission 航点校验，行驶中无兜底");
+    } else if (map_edge_stop_dist_ >= map_edge_slow_dist_) {
+      RCLCPP_WARN(get_logger(),
+        "map_edge_stop_dist ≥ map_edge_slow_dist，修正 map_edge_slow_dist=stop+0.5");
+      map_edge_slow_dist_ = map_edge_stop_dist_ + 0.5;
     }
 
     // ---- 订阅 ----
@@ -150,6 +178,24 @@ public:
       [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
         std::lock_guard<std::mutex> lk(data_mutex_);
         last_feedback_speed_ = msg->twist.twist.linear.x;
+      });
+
+    // V0.0.87 地图边界监护数据源：
+    //   /map —— map_server 以 transient_local 发布一次（volatile 订阅会漏收，
+    //   同 V0.0.82 auto_mission 教训）；缓存后构建"到最近未建图(unknown)/
+    //   界外栅格"距离场，静态地图仅构建一次；
+    //   /amcl_pose —— AMCL map 系位姿（仅导航模式存在；update_min_d=0.15m
+    //   低速下数 Hz，监护足够）。建图模式两者皆无 → 监护自动不介入。
+    map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      "/map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
+      std::bind(&SafetyGuard::mapCallback, this, std::placeholders::_1));
+    amcl_pose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      "/amcl_pose", rclcpp::SensorDataQoS(),
+      [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(data_mutex_);
+        fence_pose_x_ = msg->pose.pose.position.x;
+        fence_pose_y_ = msg->pose.pose.position.y;
+        fence_pose_received_ = true;
       });
 
     // V0.0.86 自动驾驶测试模式：运行时开关（人工/上位机发布 true/false）
@@ -200,18 +246,21 @@ public:
     RCLCPP_INFO(get_logger(),
       "safety_guard 启动：v_max=%.2fm/s, R_min=%.2fm（|w|≤|v|/R_min）, "
       "stop=%.2fm, slow=%.2fm, 扇区±%.0f°, scan超时%.2fs；"
-      "测试模式=%s（限速%.2fm/s, 急停%.1fm, 减速%.1fm, 卡死判定%.1fs, 断流判定%.1fs）",
+      "测试模式=%s（限速%.2fm/s, 急停%.1fm, 减速%.1fm, 卡死判定%.1fs, 断流判定%.1fs）；"
+      "地图边界监护=%s（停车%.2fm, 减速%.2fm，/map+/amcl_pose 就绪后生效）",
       max_linear_vel_, min_turn_radius_, stop_dist_, slow_dist_,
       sector_half_rad_ * 180.0 / M_PI, scan_timeout_,
       test_mode_ ? "ON" : "OFF",
       test_max_linear_vel_, test_stop_dist_, test_slow_dist_,
-      stall_timeout_, plan_fail_timeout_);
+      stall_timeout_, plan_fail_timeout_,
+      enable_map_fence_ ? "ON" : "OFF", map_edge_stop_dist_, map_edge_slow_dist_);
   }
 
 private:
   enum class State
   {
-    OK, SLOWDOWN, COLLISION_STOP, SCAN_TIMEOUT, CMD_TIMEOUT, ESTOP, TEST_ABORTED
+    OK, SLOWDOWN, COLLISION_STOP, SCAN_TIMEOUT, CMD_TIMEOUT, ESTOP, TEST_ABORTED,
+    MAP_EDGE_SLOWDOWN, MAP_EDGE_STOP
   };
 
   static const char * stateName(State s)
@@ -224,6 +273,8 @@ private:
       case State::CMD_TIMEOUT: return "CMD_TIMEOUT";
       case State::ESTOP: return "ESTOP_PASS";
       case State::TEST_ABORTED: return "TEST_ABORTED";
+      case State::MAP_EDGE_SLOWDOWN: return "MAP_EDGE_SLOWDOWN";
+      case State::MAP_EDGE_STOP: return "MAP_EDGE_STOP";
     }
     return "UNKNOWN";
   }
@@ -385,6 +436,42 @@ private:
         "m，限速 " + std::to_string(v_allow).substr(0, 5) + "m/s" + test_tag;
     }
 
+    // 5.5 V0.0.87 地图边界监护：行驶范围不得超出已采集（已建图）地图区域。
+    // 与碰撞闸同构分级——减速区线性限速、停车区零速；测试模式越界升级为
+    // 中止锁存（越界即异常，人工确认后重开）。距离场/位姿未就绪（建图模式、
+    // 启动早期、AMCL 未输出）时不介入，由规划层与航点校验兜底。
+    if (enable_map_fence_) {
+      const double edge_d = mapEdgeDistance();
+      if (edge_d >= 0.0) {
+        if (edge_d < map_edge_stop_dist_) {
+          publishCmd(0.0, 0.0);
+          const std::string pos = "距未建图/界外栅格 " +
+            std::to_string(edge_d).substr(0, 5) + "m < 停车距离 " +
+            std::to_string(map_edge_stop_dist_).substr(0, 4) + "m";
+          if (test_active) {
+            const std::string reason = "地图越界：" + pos;
+            abortTest(reason);
+            transition(State::TEST_ABORTED, reason + "（测试模式自动中止）");
+          } else {
+            transition(State::MAP_EDGE_STOP,
+              pos + "，零速（回到已建图区域自动恢复）");
+          }
+          return;
+        }
+        if (edge_d < map_edge_slow_dist_) {
+          double v_edge = v_lim * (edge_d - map_edge_stop_dist_) /
+            (map_edge_slow_dist_ - map_edge_stop_dist_);
+          v_edge = std::max(v_edge, 0.0);
+          if (v_edge < v_allow) {
+            v_allow = v_edge;
+            next = State::MAP_EDGE_SLOWDOWN;
+            detail = "距未建图/界外栅格 " + std::to_string(edge_d).substr(0, 5) +
+              "m，限速 " + std::to_string(v_allow).substr(0, 5) + "m/s" + test_tag;
+          }
+        }
+      }
+    }
+
     // 6. 速度硬限 + 碰撞限速（测试模式 0.1m/s）
     double v_out = std::clamp(v_in, -v_lim, v_lim);
     v_out = std::clamp(v_out, -v_allow, v_allow);
@@ -507,6 +594,100 @@ private:
     }
   }
 
+  // V0.0.87 地图边界监护：/map 回调——构建"到最近未建图(unknown)/界外栅格"
+  // 的近似欧氏距离场。unknown/界外格种子 0，已建图格取到最近种子的 Chamfer
+  // 3-4 距离（两遍扫描，误差 <8%，对 0.5/1.5m 阈值足够）。地图静态（
+  // map_server 仅发布一次）→ 构建一次性 O(width×height)，常规 0.05m 地图
+  // 数万格毫秒级；运行时 O(1) 查询。
+  void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
+  {
+    const int w = static_cast<int>(msg->info.width);
+    const int h = static_cast<int>(msg->info.height);
+    if (w <= 0 || h <= 0 || msg->info.resolution <= 0.0f) {
+      RCLCPP_WARN(get_logger(), "[边界监护] 收到异常 /map（尺寸/分辨率非法），忽略");
+      return;
+    }
+    std::vector<float> dist(static_cast<size_t>(w) * h,
+      std::numeric_limits<float>::infinity());
+    const int8_t * data = msg->data.data();
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        if (data[static_cast<size_t>(y) * w + x] == -1) {
+          dist[static_cast<size_t>(y) * w + x] = 0.0f;   // unknown（未建图）→ 种子
+        }
+      }
+    }
+    // Chamfer 3-4 两遍距离变换（整数格距：直邻 3、对角 4，最后统一换算米）
+    constexpr int CH = 3, CD = 4;
+    for (int y = 0; y < h; ++y) {              // 正扫：左/上/左上/右上
+      for (int x = 0; x < w; ++x) {
+        const size_t i = static_cast<size_t>(y) * w + x;
+        if (dist[i] == 0.0f) {
+          continue;
+        }
+        float d = dist[i];
+        if (x > 0) {                           d = std::min(d, dist[i - 1] + CH); }
+        if (y > 0) {                           d = std::min(d, dist[i - w] + CH); }
+        if (x > 0 && y > 0) {                  d = std::min(d, dist[i - w - 1] + CD); }
+        if (x < w - 1 && y > 0) {              d = std::min(d, dist[i - w + 1] + CD); }
+        dist[i] = d;
+      }
+    }
+    for (int y = h - 1; y >= 0; --y) {         // 反扫：右/下/右下/左下
+      for (int x = w - 1; x >= 0; --x) {
+        const size_t i = static_cast<size_t>(y) * w + x;
+        if (dist[i] == 0.0f) {
+          continue;
+        }
+        float d = dist[i];
+        if (x < w - 1) {                       d = std::min(d, dist[i + 1] + CH); }
+        if (y < h - 1) {                       d = std::min(d, dist[i + w] + CH); }
+        if (x < w - 1 && y < h - 1) {          d = std::min(d, dist[i + w + 1] + CD); }
+        if (x > 0 && y < h - 1) {              d = std::min(d, dist[i + w - 1] + CD); }
+        dist[i] = d;
+      }
+    }
+    const float scale = static_cast<float>(msg->info.resolution) / 3.0f;
+    for (auto & d : dist) {
+      if (std::isfinite(d)) {
+        d *= scale;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lk(data_mutex_);
+      fence_dist_ = std::move(dist);
+      fence_w_ = w;
+      fence_h_ = h;
+      fence_origin_x_ = msg->info.origin.position.x;
+      fence_origin_y_ = msg->info.origin.position.y;
+      fence_res_ = msg->info.resolution;
+      fence_ready_ = true;
+    }
+    RCLCPP_INFO(get_logger(),
+      "[边界监护] 已就绪：栅格 %dx%d @%.3fm/cell，车辆距未建图/界外区域 "
+      "<%.2fm 零速、<%.2fm 限速（数据源 /map + /amcl_pose）",
+      w, h, msg->info.resolution, map_edge_stop_dist_, map_edge_slow_dist_);
+  }
+
+  // 查询机器人当前位置到最近未建图(unknown)/地图界外栅格的距离（m）。
+  // 返回 -1.0 = 监护不可用（地图未就绪或 /amcl_pose 未到达，调用方不介入）；
+  // 位姿在栅格界外 → 0（直接视为越界）。
+  double mapEdgeDistance()
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    if (!fence_ready_ || !fence_pose_received_) {
+      return -1.0;
+    }
+    const int cx = static_cast<int>(std::floor(
+        (fence_pose_x_ - fence_origin_x_) / fence_res_));
+    const int cy = static_cast<int>(std::floor(
+        (fence_pose_y_ - fence_origin_y_) / fence_res_));
+    if (cx < 0 || cx >= fence_w_ || cy < 0 || cy >= fence_h_) {
+      return 0.0;
+    }
+    return fence_dist_[static_cast<size_t>(cy) * fence_w_ + cx];
+  }
+
   // 参数
   double wheelbase_{0.65};
   double min_turn_radius_{1.9};
@@ -529,6 +710,22 @@ private:
   double stall_fb_vel_max_{0.02};
   double plan_fail_timeout_{2.0};
   bool estop_hold_on_abort_{true};
+
+  // V0.0.87 地图边界监护参数
+  bool enable_map_fence_{true};
+  double map_edge_stop_dist_{0.5};
+  double map_edge_slow_dist_{1.5};
+  // 距离场与位姿缓存（data_mutex_ 保护；fence_dist_ 下标 = cy*w+cx）
+  bool fence_ready_{false};
+  bool fence_pose_received_{false};
+  int fence_w_{0};
+  int fence_h_{0};
+  double fence_origin_x_{0.0};
+  double fence_origin_y_{0.0};
+  double fence_res_{0.05};
+  double fence_pose_x_{0.0};
+  double fence_pose_y_{0.0};
+  std::vector<float> fence_dist_;
 
   // 状态
   State state_{State::CMD_TIMEOUT};
@@ -559,6 +756,9 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr test_mode_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr plan_cmd_sub_;
   rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr nav_status_sub_;
+  // V0.0.87 地图边界监护
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr amcl_pose_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_out_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr estop_pub_;

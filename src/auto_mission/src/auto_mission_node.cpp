@@ -1062,7 +1062,8 @@ void AutoMissionNode::navigatorStateResponse(
 }
 
 // ==========================================================================
-// /map 回调：缓存静态地图边界（航点越界校验用，V0.0.82）
+// /map 回调：缓存静态地图边界（航点越界校验用，V0.0.82；V0.0.87 起同时
+// 用于目标点未建图(unknown)栅格校验——矩形界内仍可能有建图空洞）
 // ==========================================================================
 void AutoMissionNode::mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg)
 {
@@ -1081,18 +1082,45 @@ void AutoMissionNode::mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr m
 }
 
 // ==========================================================================
-// 航点是否落在静态地图边界内（含安全边距）；地图未就绪时放行（退回旧行为）
+// 航点是否落在已采集地图区域内：V0.0.82 矩形边界+安全边距；V0.0.87 增加
+// 未建图(unknown)栅格校验（落点在 unknown 上必报 "Goal pose is out of
+// costmap!" 死局）。地图未就绪时放行（退回旧行为）
 // ==========================================================================
 bool AutoMissionNode::waypointInsideMap(const Waypoint & wp)
 {
+  return waypointMapCheckDetail(wp).empty();
+}
+
+// 航点地图校验明细：空串=通过；否则为拒绝原因（供日志区分处置方式）
+std::string AutoMissionNode::waypointMapCheckDetail(const Waypoint & wp)
+{
   std::lock_guard<std::mutex> lk(data_mutex_);
   if (!latest_map_) {
-    return true;
+    return "";
   }
-  return wp.x >= map_min_x_ + waypoint_map_margin_ &&
-         wp.x <= map_max_x_ - waypoint_map_margin_ &&
-         wp.y >= map_min_y_ + waypoint_map_margin_ &&
-         wp.y <= map_max_y_ - waypoint_map_margin_;
+  const bool outside_rect =
+    wp.x < map_min_x_ + waypoint_map_margin_ || wp.x > map_max_x_ - waypoint_map_margin_ ||
+    wp.y < map_min_y_ + waypoint_map_margin_ || wp.y > map_max_y_ - waypoint_map_margin_;
+  if (outside_rect) {
+    return "静态地图矩形边界外";
+  }
+  // V0.0.87：目标点栅格必须为已采集区域（occupancy != -1）。矩形界内仍可能
+  // 存在未建图空洞（建图边缘不齐/遮挡盲区），V0.0.87 起 global_costmap
+  // track_unknown_space=true 保留 unknown，该处目标/路径必被 Nav2 拒绝。
+  const int cx = static_cast<int>(std::floor(
+      (wp.x - latest_map_->info.origin.position.x) / latest_map_->info.resolution));
+  const int cy = static_cast<int>(std::floor(
+      (wp.y - latest_map_->info.origin.position.y) / latest_map_->info.resolution));
+  if (cx < 0 || cx >= static_cast<int>(latest_map_->info.width) ||
+    cy < 0 || cy >= static_cast<int>(latest_map_->info.height))
+  {
+    return "静态地图矩形边界外";
+  }
+  const size_t cell = static_cast<size_t>(cy) * latest_map_->info.width + cx;
+  if (latest_map_->data[cell] == -1) {
+    return "目标点落在未建图(unknown)栅格上";
+  }
+  return "";
 }
 
 // ==========================================================================
@@ -1127,17 +1155,20 @@ void AutoMissionNode::sendNextWaypoint()
     return;
   }
 
-  // ---- 航点越界校验（V0.0.82） ----
-  // 目标超出静态地图边界时，SmacPlannerHybrid 必报 "Goal pose is out of costmap!"
-  // → BT 恢复行为循环倒车/等待 → fail_count 耗尽（实车：航点 (5,5)/(0,5) 的 y=5
-  // 超出地图 y≤3.85）。发送前校验，越界航点自动轮转到下一个边界内的航点；
-  // 全部越界则回 IDLE 防止跳过风暴。
-  if (!waypointInsideMap(waypoints_[current_wp_idx_])) {
+  // ---- 航点越界校验（V0.0.82 矩形边界 / V0.0.87 未建图栅格） ----
+  // 目标超出静态地图边界或落在未建图(unknown)栅格上时，SmacPlannerHybrid
+  // 必报 "Goal pose is out of costmap!" → BT 恢复行为循环倒车/等待 →
+  // fail_count 耗尽（实车：航点 (5,5)/(0,5) 的 y=5 超出地图 y≤3.85）。
+  // 发送前校验，越界航点自动轮转到下一个边界内的航点；全部越界则回 IDLE
+  // 防止跳过风暴。
+  const std::string map_check = waypointMapCheckDetail(waypoints_[current_wp_idx_]);
+  if (!map_check.empty()) {
     RCLCPP_ERROR(get_logger(),
-      "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 在静态地图边界外"
-      "（x[%.2f, %.2f] y[%.2f, %.2f]，安全边距 %.2fm），跳过该航点",
+      "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 不在已采集地图区域内"
+      "（%s；边界 x[%.2f, %.2f] y[%.2f, %.2f]，安全边距 %.2fm），跳过该航点",
       current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
       waypoints_[current_wp_idx_].x, waypoints_[current_wp_idx_].y,
+      map_check.c_str(),
       map_min_x_, map_max_x_, map_min_y_, map_max_y_, waypoint_map_margin_);
     bool found_valid = false;
     for (size_t step = 1; step <= waypoints_.size(); ++step) {
@@ -1150,8 +1181,8 @@ void AutoMissionNode::sendNextWaypoint()
     }
     if (!found_valid) {
       RCLCPP_ERROR(get_logger(),
-        "[sendNextWaypoint] 全部航点均在静态地图边界外，停止巡航回 IDLE；"
-        "请重新记录航点（建图模式 rviz Publish Point）或修正 waypoints 配置");
+        "[sendNextWaypoint] 全部航点均不在已采集地图区域内（边界外或未建图栅格），"
+        "停止巡航回 IDLE；请重新记录航点（建图模式 rviz Publish Point）或修正 waypoints 配置");
       state_ = MissionState::IDLE;
       return;
     }

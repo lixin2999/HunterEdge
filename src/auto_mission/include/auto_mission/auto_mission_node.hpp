@@ -1,6 +1,7 @@
 // Copyright 2026 HUNTER Development Team
 // AUTO 模式自主任务调度节点头文件
-// 功能：航点巡航任务管理、AUTO 进入条件守护、障碍物安全约束（减速/避让/急停）
+// 功能：航点巡航任务管理、AUTO 进入条件守护、障碍物安全约束（减速/避让/急停）、
+//       航点地图越界校验（矩形边界+安全边距+未建图栅格，V0.0.82/0.0.87）
 #ifndef AUTO_MISSION__AUTO_MISSION_NODE_HPP_
 #define AUTO_MISSION__AUTO_MISSION_NODE_HPP_
 
@@ -76,7 +77,7 @@ private:
   void fusedObjectsCallback(const hunter_msgs::msg::DetectedObjectArray::SharedPtr msg);
   void systemHealthCallback(const hunter_msgs::msg::SystemHealth::SharedPtr msg);
   void estopCallback(const std_msgs::msg::Bool::SharedPtr msg);
-  void mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg);  // /map 边界缓存（航点越界校验，V0.0.82）
+  void mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg);  // /map 边界缓存（航点越界校验，V0.0.82/0.0.87）
 
   // ---- 主循环（10Hz 定时器） ----
   void mainLoop();
@@ -92,7 +93,8 @@ private:
   void cancelCurrentGoal();
   void triggerEstop(const std::string & reason);
   bool tryReleaseSelfEstop();  // 自触发急停（障碍物类）解除：危险消除后发布 /estop=false
-  bool waypointInsideMap(const Waypoint & wp);  // 航点是否在静态地图边界内（含安全边距）
+  bool waypointInsideMap(const Waypoint & wp);  // 航点在已采集地图区域内（边界+边距+非未建图栅格，V0.0.82/0.0.87）
+  std::string waypointMapCheckDetail(const Waypoint & wp);  // 越界原因（空=通过）：矩形边界外 / 未建图(unknown)栅格
 
   // ---- Nav2 就绪门控（bt_navigator lifecycle 状态） ----
   void queryNavigatorState();    // 异步查询 bt_navigator 状态（1Hz 节流，不阻塞主循环）
@@ -182,7 +184,8 @@ private:
   int wp_fail_count_{0};           // 连续失败计数
   bool goal_in_flight_{false};     // 是否有 goal 在飞
 
-  // ---- 静态地图边界缓存（/map transient_local，V0.0.82 航点越界校验） ----
+  // ---- 静态地图边界缓存（/map transient_local；V0.0.82 矩形边界校验，
+  //      V0.0.87 增加未建图(unknown)栅格校验） ----
   nav_msgs::msg::OccupancyGrid::ConstSharedPtr latest_map_;
   double map_min_x_{0.0};
   double map_max_x_{0.0};
