@@ -51,6 +51,7 @@ controller_server:
       max_linear_decel: -1.5                   # 文档 10.2.3
 
     general_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"   # 必填：缺失即 FATAL "Can not get 'plugin' param value for general_goal_checker"
       stateful: true
       xy_goal_tolerance: 0.1                   # 文档 10.2.3：目标距离容差
       yaw_goal_tolerance: 0.15                 # 文档 10.2.3：目标角度容差
@@ -87,7 +88,7 @@ global_costmap:
           max_obstacle_height: 2.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.3                  # 文档 8.3：膨胀半径 0.3m
+        inflation_radius: 0.35                 # 文档 8.3 原值 0.3 < footprint 内切半径 0.33，Nav2 强烈警告，取 0.35
         cost_scaling_factor: 3.0
 
 # ---- 局部代价地图（文档 8.3） ----
@@ -115,7 +116,7 @@ local_costmap:
           max_obstacle_height: 2.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.2                  # 文档 8.3：膨胀半径 0.2m
+        inflation_radius: 0.35                 # 文档 8.3 原值 0.2 < footprint 内切半径 0.33（实测 FATAL 前警告），取 0.35
         cost_scaling_factor: 3.0
 
 # ---- 行为树导航器（文档 2.3 nav2_bt_navigator） ----
