@@ -7,10 +7,13 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(nav2_msgs REQUIRED)
+find_package(action_msgs REQUIRED)
 
 add_executable(safety_guard src/safety_guard.cpp)
 target_include_directories(safety_guard PUBLIC
@@ -19,10 +22,13 @@ target_include_directories(safety_guard PUBLIC
 target_compile_features(safety_guard PUBLIC c_std_17 cxx_std_17)
 ament_target_dependencies(safety_guard
   rclcpp
+  rclcpp_action
   geometry_msgs
   sensor_msgs
   std_msgs
   nav_msgs
+  nav2_msgs
+  action_msgs
 )
 
 install(TARGETS safety_guard

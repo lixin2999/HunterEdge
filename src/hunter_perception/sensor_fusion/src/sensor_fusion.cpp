@@ -51,6 +51,10 @@ SensorFusion::SensorFusion(const rclcpp::NodeOptions & options)
   declare_parameter("inflation_radius", 0.3);     // 膨胀 0.3m
   declare_parameter("lidar_timeout", 0.3);
   declare_parameter("vision_timeout", 0.5);
+  // V0.0.86：时间对齐与置信度门控
+  declare_parameter("max_sync_diff", 0.10);    // 激光-视觉时间戳最大允许差（s）
+  declare_parameter("vision_conf_min", 0.45);  // 视觉置信度门控阈值
+  declare_parameter("conf_full_scale", 0.9);   // 视觉达到满权重的置信度
 
   lidar_topic_ = get_parameter("lidar_topic").as_string();
   vision_topic_ = get_parameter("vision_topic").as_string();
@@ -67,6 +71,9 @@ SensorFusion::SensorFusion(const rclcpp::NodeOptions & options)
   inflation_radius_ = get_parameter("inflation_radius").as_double();
   lidar_timeout_ = get_parameter("lidar_timeout").as_double();
   vision_timeout_ = get_parameter("vision_timeout").as_double();
+  max_sync_diff_ = get_parameter("max_sync_diff").as_double();
+  vision_conf_min_ = get_parameter("vision_conf_min").as_double();
+  conf_full_scale_ = get_parameter("conf_full_scale").as_double();
 
   lidar_sub_ = create_subscription<hunter_msgs::msg::DetectedObjectArray>(
     lidar_topic_, rclcpp::SensorDataQoS(),
@@ -83,9 +90,12 @@ SensorFusion::SensorFusion(const rclcpp::NodeOptions & options)
     std::chrono::milliseconds(1000),
     std::bind(&SensorFusion::checkTimeout, this));
 
-  RCLCPP_INFO(get_logger(), "sensor_fusion 启动：匹配阈值=%.1fm, 权重=%.1f/%.1f/%.1f/%.1f",
+  RCLCPP_INFO(get_logger(),
+    "sensor_fusion 启动：匹配阈值=%.1fm, 权重=%.1f/%.1f/%.1f/%.1f, "
+    "时间对齐窗≤%.2fs, 视觉置信门控≥%.2f（满权重@%.2f）",
     match_distance_, pos_lidar_weight_, pos_vision_weight_,
-    size_lidar_weight_, size_vision_weight_);
+    size_lidar_weight_, size_vision_weight_,
+    max_sync_diff_, vision_conf_min_, conf_full_scale_);
 }
 
 void SensorFusion::lidarCallback(
@@ -117,6 +127,24 @@ void SensorFusion::visionCallback(
     }
     // 统一替换 frame_id 为 base_link
     vision_cache_.header.frame_id = "base_link";
+
+    // V0.0.86 置信度门控：丢弃低于阈值的视觉检测（YOLO 误检/边缘抖动），
+    // 避免假目标以 vision_only 身份进入决策层。门控后整帧可为空——
+    // "此刻视觉确认无高置信目标"同样是有效观测（时间戳照常更新，
+    // 供 fuseAndPublish 做时间对齐判断）。
+    const size_t raw_cnt = vision_cache_.objects.size();
+    vision_cache_.objects.erase(
+      std::remove_if(
+        vision_cache_.objects.begin(), vision_cache_.objects.end(),
+        [this](const hunter_msgs::msg::DetectedObject & o) {
+          return o.confidence < vision_conf_min_;
+        }),
+      vision_cache_.objects.end());
+    if (vision_cache_.objects.size() < raw_cnt) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+        "置信度门控：丢弃 %zu/%zu 个低置信(<%.2f)视觉目标",
+        raw_cnt - vision_cache_.objects.size(), raw_cnt, vision_conf_min_);
+    }
   } catch (const tf2::TransformException & ex) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
       "视觉目标 TF 转换失败: %s", ex.what());
@@ -253,9 +281,24 @@ void SensorFusion::fuseAndPublish()
     return;  // 双输入丢失
   }
 
+  // V0.0.86 时间对齐：双传感器有效时还要求两帧时间戳足够接近。视觉帧
+  // 滞后（推理/传输延迟）会使目标位置错位——车以 0.5rad/s 转向时 0.3s
+  // 滞后在 5m 处横向偏差可达 ~1.5m，强行融合会拉偏位置甚至错误关联。
+  // 超窗时降级 laser-only：宁缺一个旧目标，不采用错误位置。
+  bool time_aligned = false;
+  if (lidar_valid && vision_valid) {
+    const double dt = std::fabs((lidar_stamp_ - vision_stamp_).seconds());
+    time_aligned = dt <= max_sync_diff_;
+    if (!time_aligned) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "时间对齐失败：激光-视觉时间戳差 %.3fs > %.2fs，本帧降级 laser_only",
+        dt, max_sync_diff_);
+    }
+  }
+
   std::vector<FusionObject> fused;
 
-  if (lidar_valid && vision_valid) {
+  if (lidar_valid && vision_valid && time_aligned) {
     // 完整融合：匈牙利关联 + 加权融合（文档 6.2/6.3）
     const auto assignment = associate(lidar_cache_.objects, vision_cache_.objects);
     std::vector<bool> vision_matched(vision_cache_.objects.size(), false);
@@ -311,21 +354,26 @@ hunter_msgs::msg::DetectedObject SensorFusion::fusePair(
 {
   hunter_msgs::msg::DetectedObject out = lidar;  // 基础用激光（含速度）
 
-  // 位置加权融合（文档 6.3：激光 0.7，视觉 0.3）
-  out.pose.position.x =
-    pos_lidar_weight_ * lidar.pose.position.x + pos_vision_weight_ * vision.pose.position.x;
-  out.pose.position.y =
-    pos_lidar_weight_ * lidar.pose.position.y + pos_vision_weight_ * vision.pose.position.y;
-  out.pose.position.z =
-    pos_lidar_weight_ * lidar.pose.position.z + pos_vision_weight_ * vision.pose.position.z;
+  // V0.0.86 置信度加权：视觉权重按其置信度线性缩放（conf ≥ conf_full_scale_
+  // 时满权重；低于门控阈值的目标已在 visionCallback 处丢弃），再与激光权重
+  // 归一化。低置信视觉只轻微修正位置，高置信视觉才显著拉动——避免边缘
+  // 检测抖动直接扰动融合位置。
+  const double conf_scale =
+    std::min(1.0, static_cast<double>(std::max(0.0f, vision.confidence)) / conf_full_scale_);
+  const double w_v = pos_vision_weight_ * conf_scale;
+  const double w_l = 1.0 - w_v;
 
-  // 尺寸加权融合（文档 6.3：激光 0.8，视觉 0.2）
-  out.dimensions.x =
-    size_lidar_weight_ * lidar.dimensions.x + size_vision_weight_ * vision.dimensions.x;
-  out.dimensions.y =
-    size_lidar_weight_ * lidar.dimensions.y + size_vision_weight_ * vision.dimensions.y;
-  out.dimensions.z =
-    size_lidar_weight_ * lidar.dimensions.z + size_vision_weight_ * vision.dimensions.z;
+  // 位置加权融合（文档 6.3：激光 0.7，视觉 0.3×置信度缩放）
+  out.pose.position.x = w_l * lidar.pose.position.x + w_v * vision.pose.position.x;
+  out.pose.position.y = w_l * lidar.pose.position.y + w_v * vision.pose.position.y;
+  out.pose.position.z = w_l * lidar.pose.position.z + w_v * vision.pose.position.z;
+
+  // 尺寸加权融合（文档 6.3：激光 0.8，视觉 0.2×置信度缩放）
+  const double s_v = size_vision_weight_ * conf_scale;
+  const double s_l = 1.0 - s_v;
+  out.dimensions.x = s_l * lidar.dimensions.x + s_v * vision.dimensions.x;
+  out.dimensions.y = s_l * lidar.dimensions.y + s_v * vision.dimensions.y;
+  out.dimensions.z = s_l * lidar.dimensions.z + s_v * vision.dimensions.z;
 
   // 类别：取置信度更高的类别（文档 6.3）
   if (vision.confidence > lidar.confidence) {

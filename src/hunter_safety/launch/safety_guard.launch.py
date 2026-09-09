@@ -26,6 +26,7 @@ def generate_launch_description():
                 'sector_half_deg': 60.0,    # 检测扇区半角（°）
                 'scan_timeout': 0.5,        # /scan 断流 fail-safe（s）
                 'cmd_timeout': 0.5,         # 上游指令断流看门狗（s）
+                'enable_test_mode': False,  # V0.0.86 测试模式启动默认关（运行时经 /safety/test_mode 开关）
                 'use_sim_time': False,
             }],
         ),

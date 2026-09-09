@@ -74,6 +74,9 @@ private:
   double inflation_radius_;         // 膨胀 0.3m
   double lidar_timeout_;            // 激光超时
   double vision_timeout_;           // 视觉超时
+  double max_sync_diff_;            // 激光-视觉时间戳最大允许差（s，V0.0.86）
+  double vision_conf_min_;          // 视觉置信度门控阈值（V0.0.86）
+  double conf_full_scale_;          // 视觉达到满权重的置信度（V0.0.86）
 
   // 订阅/发布
   rclcpp::Subscription<hunter_msgs::msg::DetectedObjectArray>::SharedPtr lidar_sub_;

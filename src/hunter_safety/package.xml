@@ -7,7 +7,9 @@
     HUNTER 碰撞防护与运动学安全约束节点（safety_guard）。
     串联在 velocity_smoother 与底盘之间：扫描碰撞闸（stop/slowdown）、
     阿克曼曲率钳制（δ=atan(L·w/v) ≤ atan(L/R_min)）、速度硬限、
-    感知超时 fail-safe、急停透传与 /safety/state 分级预警。
+    感知超时 fail-safe、急停透传与 /safety/state 分级预警；
+    V0.0.86 新增自动驾驶测试模式（/safety/test_mode）：0.1m/s 限速、
+    更严碰撞阈值、异常（碰撞卡死/控制器断流/goal ABORTED）自动中止。
     数据源为 /scan（pointcloud_to_laserscan 直出），不依赖感知融合链，
     与决策层（auto_mission/decision_making）互为冗余。
   </description>
@@ -17,10 +19,13 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>action_msgs</depend>
 
   <exec_depend>ros2launch</exec_depend>
 

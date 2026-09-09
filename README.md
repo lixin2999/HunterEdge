@@ -140,11 +140,11 @@
 | `hunter_agents/remote_agent` | 远程操控（WebRTC，systemd 服务） | §13 |
 | `hunter_common/hunter_msgs` | 自定义消息（DetectedObject/ChassisState/Trajectory/HunterStatus 等，含 AgileX 底盘消息） | §4.3 |
 | `hunter_common/hunter_utils` | 公共工具函数库 | §4.2 |
-| `hunter_perception/sensor_fusion` | 多传感器目标级数据融合（匈牙利关联 + 加权融合 + 可行驶区域） | §6 |
+| `hunter_perception/sensor_fusion` | 多传感器目标级数据融合（时间对齐 + 置信度门控 + 匈牙利关联 + 加权融合 + 可行驶区域） | §6 |
 | `hunter_monitor/health_monitor` | 系统监控与健康管理 | §15 |
 | `decision_making` | 模式仲裁决策（AUTO/REMOTE/ESTOP 状态机） | §13.5 |
 | `auto_mission` | AUTO 模式自主任务调度（航点巡航/安全守护/建图控制） | 自主导航扩展 |
-  | `hunter_safety/safety_guard` | 碰撞防护与运动学安全约束（scan 碰撞闸/阿克曼曲率钳制/分级预警，速度链末级） | §10.8 |
+  | `hunter_safety/safety_guard` | 碰撞防护与运动学安全约束（scan 碰撞闸/阿克曼曲率钳制/分级预警/测试模式，速度链末级） | §10.8 |
 
 ### 4.2 第三方依赖包（外部依赖，需按 §5 安装）
 
@@ -372,6 +372,9 @@ ros2 launch hunter_bringup hunter_full.launch.py \
 | `/auto_mission/current_waypoint` | `std_msgs/Int32` | 事件 | 当前执行的航点索引 |
 | `/pcd_to_map/status` | `std_msgs/String` | 事件 | PCD→地图转换状态（IDLE/CONVERTING/DONE/ERROR） |
 | `/navigate_to_pose` (action) | `nav2_msgs/NavigateToPose` | — | Nav2 单点导航 action 接口（方式B 外部下发） |
+| `/safety/state` | `std_msgs/String` | 2Hz | safety_guard 分级预警心跳（状态|原因；OK/SLOWDOWN/COLLISION_STOP/SCAN_TIMEOUT/CMD_TIMEOUT/ESTOP_PASS/TEST_ABORTED） |
+| `/safety/test_mode` | `std_msgs/Bool` | 事件 | 自动驾驶测试模式开关（true 开启 0.1m/s 限速+严阈值+异常自动中止） |
+| `/cmd_vel_nav` | `geometry_msgs/Twist` | 20Hz | controller_server 原始速度指令（safety_guard 测试模式监控其断流） |
 
 > 自定义消息定义见设计文档 §4.3（`hunter_msgs`）。
 >
@@ -416,8 +419,9 @@ hunter_full.launch.py (use_autonomous_nav:=true)
         ├── map_server                ← 加载静态 PGM 地图
         ├── Nav2 全栈                 ← 使用 autonomous_navigate.xml 扩展行为树
         ├── auto_mission_node         ← 状态机（航点巡航/安全守护）
-        └── safety_guard              ← 碰撞闸（V0.0.85：scan 急停/限速 + 阿克曼
-                                          曲率钳制 + 速度硬限，速度链末级，发布 /cmd_vel 至底盘）
+        └── safety_guard              ← 碰撞闸（V0.0.85/86：scan 急停/限速 + 阿克曼
+                                          曲率钳制 + 速度硬限 + 测试模式，速度链末级，
+                                          发布 /cmd_vel 至底盘）
 
 ```
 
@@ -491,9 +495,25 @@ NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
 | 急停透传 | /estop=true | 零速（弥补 Nav2 goal 取消延迟窗口）ESTOP_PASS |
 | 阿克曼曲率钳制 | 恒生效 | \|w\| ≤ \|v\|/1.9（δ≤0.33rad，杜绝打满转向） |
 | 速度硬限 | 恒生效 | \|v\| ≤ 0.8m/s（第二重限速） |
+| 测试模式碰撞急停 | 测试模式开启时同扇区 < test_stop_dist(1.0m) | 立即零速 COLLISION_STOP【测试模式】 |
+| 测试模式减速 | 测试模式开启时同扇区 < test_slow_dist(2.0m) | 限速 ≤0.1m/s（test_max_linear_vel） |
+| 测试模式异常中止 | 疑似碰撞卡死（指令>0.05m/s 而反馈≈0 持续 1s）/ goal ABORTED / goal 活跃但 /cmd_vel_nav 断流 >2s | 零速锁存 TEST_ABORTED + /estop=true + 取消全部导航目标 |
 
 分级预警：/safety/state（std_msgs/String）2Hz 心跳，格式 状态|原因；
 仅导航模式启动（mapping 模式 auto_mission cruise 直发 /cmd_vel，避免双发布者）。
+
+**自动驾驶测试模式（V0.0.86）**：低速实车联调专用。运行时开关：
+
+```bash
+ros2 topic pub --once /safety/test_mode std_msgs/msg/Bool "{data: true}"   # 开启
+ros2 topic pub --once /safety/test_mode std_msgs/msg/Bool "{data: false}"  # 关闭（恢复常规阈值）
+```
+
+开启后 0.1m/s 限速巡航、±60° 扇区 <1.0m 急停/<2.0m 减速（较常规 0.6/1.2m 更早介入），
+并自动监控三类异常——疑似碰撞卡死、控制器断流、Nav2 goal ABORTED——任一发生立即
+零速锁存（TEST_ABORTED）并发布 /estop=true（auto_mission 取消全部导航任务）；
+锁存后即使外部把 /estop 清回 false 也保持零速，必须重新发布 true 才能解除
+（视为人工确认现场安全）。
 
 ### 10.9 新增/修改文件清单
 
