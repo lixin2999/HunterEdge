@@ -368,6 +368,12 @@ void AutoMissionNode::estopCallback(const std_msgs::msg::Bool::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lk(data_mutex_);
   estop_signal_ = msg->data;
+  if (!msg->data) {
+    // 急停解除（如 health_monitor CAN 恢复后发布 /estop=false）
+    estop_self_triggered_.store(false);
+  }
+  // data==true 时不清 estop_self_triggered_：本节点自触发急停时也会收到
+  // 自己发布的 /estop=true，误清理会丢失"自触发"标记导致无法自动解除
 }
 
 // ==========================================================================
@@ -649,6 +655,11 @@ void AutoMissionNode::mainLoop()
   // 避免 pcd_to_map 把"遥控接管/临时异常"误判为 MAPPING→非MAPPING 的建图结束
   // 信号而提前触发地图转换。急停仍会切 ESTOP（急停 = 终止建图，语义一致）。
   if (mission_mode_ == "mapping") {
+    // 自触发急停（障碍物类）解除：障碍物远离后自动发布 /estop=false，
+    // 释放 decision_making 与 start_mapping_cruise 门控（巡航仍需手动重启）
+    if (estop_snap && tryReleaseSelfEstop()) {
+      estop_snap = false;
+    }
     const bool pause = (behavior.mode != "AUTO") || (health.overall_status == "CRITICAL");
     mapping_paused_.store(pause);
     if (pause) {
@@ -903,7 +914,12 @@ void AutoMissionNode::mainLoop()
     case MissionState::ESTOP:
     // ------------------------------------------------------------------
     {
-      // 急停状态下等待外部清除：/estop 变 false 且 AUTO 条件恢复后方可退出
+      // 自触发急停（障碍物类）：危险解除后自动发布 /estop=false 释放下游；
+      // 外部急停（health_monitor CAN 等）等待发布方恢复边沿的 /estop=false
+      if (estop_snap && tryReleaseSelfEstop()) {
+        estop_snap = false;
+      }
+      // 急停状态下等待 /estop 变 false 且 AUTO 条件恢复后方可退出
       if (!estop_snap && isAutoConditionMet()) {
         RCLCPP_INFO(get_logger(), "[ESTOP→IDLE] 急停信号解除且 AUTO 条件满足，恢复 IDLE");
         state_ = MissionState::IDLE;
@@ -1129,11 +1145,42 @@ void AutoMissionNode::triggerEstop(const std::string & reason)
   cancelCurrentGoal();
   state_ = MissionState::ESTOP;
 
+  // 标记自触发（障碍物类）：危险解除后由 tryReleaseSelfEstop 发布 /estop=false。
+  // 置位需先于 publish——单线程顺序回调下，订阅回调会在本函数返回后收到该消息
+  estop_self_triggered_.store(true);
+
   std_msgs::msg::Bool estop_msg;
   estop_msg.data = true;
   estop_pub_->publish(estop_msg);
 
   RCLCPP_ERROR(get_logger(), "[ESTOP] 触发急停：%s", reason.c_str());
+}
+
+// ==========================================================================
+// 自触发急停解除检查（仅障碍物类自触发急停；外部急停由发布方负责解除）
+// 危险解除判据：前向扇区最近障碍物退至减速阈值（warn_obstacle_dist_）之外。
+// 返回 true 表示本次调用完成了解除动作（已发布 /estop=false 并清理标志）。
+// ==========================================================================
+bool AutoMissionNode::tryReleaseSelfEstop()
+{
+  if (!estop_self_triggered_.load()) {
+    return false;
+  }
+  if (nearestObstacleDist() <= warn_obstacle_dist_) {
+    return false;   // 障碍物仍在警戒范围内，保持急停
+  }
+
+  std_msgs::msg::Bool estop;
+  estop.data = false;
+  estop_pub_->publish(estop);
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    estop_signal_ = false;
+  }
+  estop_self_triggered_.store(false);
+  RCLCPP_INFO(get_logger(),
+    "[急停解除] 自触发急停的障碍物已远离（> %.1fm），发布 /estop=false", warn_obstacle_dist_);
+  return true;
 }
 
 // ==========================================================================

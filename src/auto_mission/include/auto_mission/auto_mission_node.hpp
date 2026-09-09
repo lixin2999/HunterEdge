@@ -89,6 +89,7 @@ private:
   void sendNextWaypoint();
   void cancelCurrentGoal();
   void triggerEstop(const std::string & reason);
+  bool tryReleaseSelfEstop();  // 自触发急停（障碍物类）解除：危险消除后发布 /estop=false
 
   // ---- Nav2 就绪门控（bt_navigator lifecycle 状态） ----
   void queryNavigatorState();    // 异步查询 bt_navigator 状态（1Hz 节流，不阻塞主循环）
@@ -158,6 +159,7 @@ private:
   hunter_msgs::msg::DetectedObjectArray latest_fused_objects_;
   hunter_msgs::msg::SystemHealth latest_health_;
   bool estop_signal_{false};
+  std::atomic<bool> estop_self_triggered_{false};  // 急停由本节点触发（障碍物类）；外部急停由发布方解除
 
   // ---- 建图模式自动巡航缓存 ----
   nav_msgs::msg::Odometry latest_lio_odom_;   // FAST-LIO2 /Odometry（camera_init 系）

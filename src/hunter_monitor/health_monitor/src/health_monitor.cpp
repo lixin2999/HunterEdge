@@ -27,12 +27,19 @@ double checkTopicFrequency(
     return -1.0;
   }
   const double freq = mon.msg_count / dt;
+  // 用本窗口开始前的"是否曾在线"状态判定宽限资格，窗口内有数据则置位
+  const bool was_ever_received = mon.ever_received;
+  if (mon.msg_count > 0) {
+    mon.ever_received = true;
+  }
   mon.msg_count = 0;
   mon.window_start = now;
 
   if (freq < mon.min_rate) {
-    // 启动宽限期内话题未上线属正常（各节点启动有先后），不计异常
-    if (in_grace) {
+    // 启动宽限仅豁免"从未上线"的话题（各节点启动有先后）；
+    // 一旦真实在线过，低频立即判异常——CAN 等安全链路在线后掉线不被宽限掩护。
+    // （旧版 CAN 完全无宽限：启动后首个统计窗口必为 0Hz → 启动竞态误发 /estop=true）
+    if (in_grace && !was_ever_received) {
       return freq;
     }
     if (!mon.anomaly) {
@@ -95,16 +102,16 @@ HealthMonitor::HealthMonitor(const rclcpp::NodeOptions & options)
   // 传感器频率监控（文档 15.3 阈值：LiDAR<8Hz/2s、Camera<10Hz/2s、IMU<50Hz/1s、CAN<5Hz/1s）
   lidar_mon_ = {"lidar",
     get_parameter("lidar_min_rate").as_double(),
-    get_parameter("lidar_duration").as_double(), 0, now, false, -1.0};
+    get_parameter("lidar_duration").as_double(), 0, now, false, -1.0, false};
   camera_mon_ = {"camera",
     get_parameter("camera_min_rate").as_double(),
-    get_parameter("camera_duration").as_double(), 0, now, false, -1.0};
+    get_parameter("camera_duration").as_double(), 0, now, false, -1.0, false};
   imu_mon_ = {"imu",
     get_parameter("imu_min_rate").as_double(),
-    get_parameter("imu_duration").as_double(), 0, now, false, -1.0};
+    get_parameter("imu_duration").as_double(), 0, now, false, -1.0, false};
   can_mon_ = {"can",
     get_parameter("can_min_rate").as_double(),
-    get_parameter("can_duration").as_double(), 0, now, false, -1.0};
+    get_parameter("can_duration").as_double(), 0, now, false, -1.0, false};
 
   // 订阅传感器话题（频率监控）
   lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -192,13 +199,31 @@ void HealthMonitor::checkHealth()
 
   // 3. 降级策略（文档 15.4）
   std::string overall = "OK";
-  // CAN 通信中断 → 严重告警 + 安全停车
+  // CAN 通信中断 → 严重告警 + 1Hz 持续发布 /estop=true；
+  // 恢复边沿 → 发布 /estop=false 解除（旧版只发 true 从不发 false，
+  // decision_making / auto_mission 收不到解除信号会永久锁死在急停）
   if (can_mon_.anomaly) {
     overall = "CRITICAL";
+    if (!estop_active_) {
+      estop_active_ = true;
+      estop_release_repeat_ = 0;
+      RCLCPP_ERROR(get_logger(), "CAN 通信中断，触发安全停车（持续发布 /estop=true）");
+    }
     std_msgs::msg::Bool estop;
     estop.data = true;
     estop_pub_->publish(estop);
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000, "CAN 通信中断，触发安全停车");
+  } else if (estop_active_) {
+    // 恢复边沿：解除安全停车，false 补发数秒（覆盖 best-effort 订阅丢包）
+    estop_active_ = false;
+    estop_release_repeat_ = 5;
+    RCLCPP_INFO(get_logger(), "CAN 通信已恢复，解除安全停车（/estop=false）");
+  }
+  if (estop_release_repeat_ > 0) {
+    std_msgs::msg::Bool estop;
+    estop.data = false;
+    estop_pub_->publish(estop);
+    estop_release_repeat_--;
   }
   // 传感器异常 → 告警降级
   if (lidar_mon_.anomaly || camera_mon_.anomaly || imu_mon_.anomaly) {
@@ -294,12 +319,9 @@ void HealthMonitor::checkNodes()
     node_was_alive_[name] = alive;
   }
 
-  // 关键节点故障触发安全停车（文档 15.2：hunter_ros2/navigation 故障）
-  if (can_mon_.anomaly) {
-    std_msgs::msg::Bool estop;
-    estop.data = true;
-    estop_pub_->publish(estop);
-  }
+  // （/estop 统一由 checkHealth 管理：CAN 异常时 1Hz 持续发 true、恢复边沿发
+  //   false 补发数秒。此处不再重复发布 true——checkNodes 周期 2s，恢复竞态下
+  //   可能晚于 checkHealth 的 false 到达，把下游重新锁死在急停）
 }
 
 double HealthMonitor::readCpuUsage()

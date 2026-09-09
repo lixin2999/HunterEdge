@@ -29,6 +29,7 @@ struct TopicMonitor
   rclcpp::Time window_start;
   bool anomaly;
   double anomaly_since;   // 异常起始（秒，-1 表示正常）
+  bool ever_received;     // 曾收到过消息（区分"启动期未上线"与"在线后掉线"）
 };
 
 class HealthMonitor : public rclcpp::Node
@@ -80,6 +81,11 @@ private:
   TopicMonitor camera_mon_;
   TopicMonitor imu_mon_;
   TopicMonitor can_mon_;
+
+  // /estop 发布状态（CAN 中断 → 1Hz 持续发 true；恢复边沿 → false 补发数次，
+  // 覆盖 decision_making 侧 best-effort 订阅的丢包窗口）
+  bool estop_active_{false};
+  int estop_release_repeat_{0};
 
   // 节点重启计数（文档 15.2）
   std::map<std::string, int> restart_count_;
