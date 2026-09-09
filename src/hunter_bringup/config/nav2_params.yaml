@@ -70,13 +70,16 @@ planner_server:
       tolerance: 0.25                          # 文档 9.2：目标点容差
       max_iterations: 1000000                  # 文档 9.2：最大搜索迭代次数
       max_planning_time: 2.0
-      motion_model_for_search: "REEDS_SHEPP"   # 文档 9.2：支持前进+倒车
+      motion_model_for_search: "DUBIN"         # V0.0.82：改纯前进。REEDS_SHEPP 允许路径含倒车段，
+                                               # 但本 fork RPP 不支持倒车跟随（无 allow_reversing 参数），
+                                               # 倒车段会令控制器死磕 → Failed to make progress；
+                                               # 倒车需求由 BackUp 恢复行为承担
       angle_quantization_bins: 72              # 文档 9.2：航向角量化(5°/bin)
       minimum_turning_radius: 1.9              # 文档 9.2：最小转弯半径(m)
-      reverse_penalty: 2.0                     # 文档 9.2：倒车惩罚
-      change_penalty: 0.5                      # 文档 9.2：前进/倒车切换惩罚
+      reverse_penalty: 2.0                     # 文档 9.2：倒车惩罚（DUBIN 下不生效，保留供回切 REEDS_SHEPP）
+      change_penalty: 0.5                      # 文档 9.2：前进/倒车切换惩罚（同上）
       downsample_obstacle_heuristic: true      # 文档 9.2：障碍物启发式降采样
-      allow_reversing: true
+      allow_reversing: false                   # V0.0.82：与 DUBIN 匹配，规划路径不含倒车段
       use_final_approach_orientation: false
       max_robot_pose_search_dist: 5.0
 
@@ -98,8 +101,11 @@ controller_server:
       min_lookahead_dist: 0.3
       max_lookahead_dist: 1.5
       use_velocity_scaled_lookahead_dist: true
-      use_rotate_to_heading: true
-      rotate_to_heading_min_angle: 0.785
+      use_rotate_to_heading: false             # V0.0.82：阿克曼无法原地旋转。开启时 RPP 在朝向差大
+                                               # 时命令 v=0+w，经底盘自行车模型(δ=atan(L·w/v))换算
+                                               # 为打满转向(0.58rad)原地不动——"转向迟缓"来源之一；
+                                               # 大朝向差由 Smac Hybrid 的前进弧线自然衔接
+      rotate_to_heading_min_angle: 0.785       # （use_rotate_to_heading=false 后不生效，保留占位）
       use_regulated_linear_velocity_scaling: true
       regulated_linear_scaling_min_radius: 1.9
       regulated_linear_scaling_min_speed: 0.2
@@ -185,7 +191,8 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /localization/odom
-    bt_loop_duration: 10
+    bt_loop_duration: 20                       # V0.0.82：10ms 在 Jetson 上偏紧（"Behavior Tree tick
+                                               # rate was exceeded" 刷屏），放宽到 20ms
     default_server_timeout: 20
     # ⚠️ 勿在此设置 plugin_lib_names：该参数一旦设置将【整体覆盖】bt_navigator 代码
     # 内置的全量 BT 插件列表（nav2_bt_navigator/src/bt_navigator.cpp，49 项）。

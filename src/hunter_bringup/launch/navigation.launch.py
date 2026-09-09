@@ -1,6 +1,8 @@
 """HUNTER Nav2 导航栈启动：SmacPlannerHybrid 全局规划 + RPP 局部控制（文档第 8/9/10 章）。
 
-适配 HUNTER-SE 阿克曼车辆：REEDS_SHEPP 运动模型、最小转弯半径 1.9m、footprint。
+适配 HUNTER-SE 阿克曼车辆：DUBIN 纯前进运动模型、最小转弯半径 1.9m、footprint。
+注意：正式运行走 hunter_autonomous_nav.launch.py（use_autonomous_nav:=true）；
+本文件仅 use_autonomous_nav:=false 的旧路径使用，cmd_vel 重映射链与之一致。
 """
 import os
 
@@ -45,15 +47,18 @@ def generate_launch_description():
     )
 
     # 恢复行为服务（Nav2 Humble 中 nav2_recoveries 已改名为 nav2_behaviors）
+    # cmd_vel 重映射到 cmd_vel_nav：与 controller 统一经 velocity_smoother 下发底盘
     recoveries_server = Node(
         package='nav2_behaviors',
         executable='behavior_server',
         name='behavior_server',
         output='screen',
         parameters=[LaunchConfiguration('params_file')],
+        remappings=[('cmd_vel', 'cmd_vel_nav')],
     )
 
     # 行为树导航器（文档 2.3 nav2_bt_navigator）
+    # ⚠ 参数名必须是 default_nav_to_pose_bt_xml（本 fork 实际读取，旧名被静默忽略）
     bt_navigator = Node(
         package='nav2_bt_navigator',
         executable='bt_navigator',
@@ -61,7 +66,7 @@ def generate_launch_description():
         output='screen',
         parameters=[
             LaunchConfiguration('params_file'),
-            {'default_bt_xml_filename': bt_file},
+            {'default_nav_to_pose_bt_xml': bt_file},
         ],
     )
 
@@ -72,6 +77,10 @@ def generate_launch_description():
         name='velocity_smoother',
         output='screen',
         parameters=[LaunchConfiguration('params_file')],
+        remappings=[
+            ('cmd_vel', 'cmd_vel_nav'),
+            ('cmd_vel_smoothed', 'cmd_vel'),
+        ],
     )
 
     # 生命周期管理器

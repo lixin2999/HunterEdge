@@ -53,6 +53,13 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
     "/estop", rclcpp::QoS(10).reliable(),
     std::bind(&AutoMissionNode::estopCallback, this, std::placeholders::_1));
 
+  // 静态地图（map_server 激活时以 transient_local 发布一次，V0.0.82）：
+  // 必须 transient_local + reliable 订阅，volatile 订阅会因晚于发布而漏收地图。
+  // 缓存地图边界用于航点越界校验，防止 "Goal pose is out of costmap!" 死局。
+  map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+    "/map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
+    std::bind(&AutoMissionNode::mapCallback, this, std::placeholders::_1));
+
   // ---- 发布 ----
   status_pub_ = create_publisher<std_msgs::msg::String>("/auto_mission/status", 10);
   waypoint_idx_pub_ = create_publisher<std_msgs::msg::Int32>("/auto_mission/current_waypoint", 10);
@@ -1055,6 +1062,40 @@ void AutoMissionNode::navigatorStateResponse(
 }
 
 // ==========================================================================
+// /map 回调：缓存静态地图边界（航点越界校验用，V0.0.82）
+// ==========================================================================
+void AutoMissionNode::mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg)
+{
+  std::lock_guard<std::mutex> lk(data_mutex_);
+  const bool first_map = (latest_map_ == nullptr);
+  latest_map_ = msg;
+  map_min_x_ = msg->info.origin.position.x;
+  map_min_y_ = msg->info.origin.position.y;
+  map_max_x_ = map_min_x_ + static_cast<double>(msg->info.width) * msg->info.resolution;
+  map_max_y_ = map_min_y_ + static_cast<double>(msg->info.height) * msg->info.resolution;
+  if (first_map) {
+    RCLCPP_INFO(get_logger(),
+      "auto_mission 已缓存静态地图边界：x[%.2f, %.2f] y[%.2f, %.2f]（航点安全边距 %.2fm）",
+      map_min_x_, map_max_x_, map_min_y_, map_max_y_, waypoint_map_margin_);
+  }
+}
+
+// ==========================================================================
+// 航点是否落在静态地图边界内（含安全边距）；地图未就绪时放行（退回旧行为）
+// ==========================================================================
+bool AutoMissionNode::waypointInsideMap(const Waypoint & wp)
+{
+  std::lock_guard<std::mutex> lk(data_mutex_);
+  if (!latest_map_) {
+    return true;
+  }
+  return wp.x >= map_min_x_ + waypoint_map_margin_ &&
+         wp.x <= map_max_x_ - waypoint_map_margin_ &&
+         wp.y >= map_min_y_ + waypoint_map_margin_ &&
+         wp.y <= map_max_y_ - waypoint_map_margin_;
+}
+
+// ==========================================================================
 // 向 Nav2 发送下一个航点
 // ==========================================================================
 void AutoMissionNode::sendNextWaypoint()
@@ -1084,6 +1125,38 @@ void AutoMissionNode::sendNextWaypoint()
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
       "[sendNextWaypoint] Nav2 /navigate_to_pose action server 尚未发现，等待");
     return;
+  }
+
+  // ---- 航点越界校验（V0.0.82） ----
+  // 目标超出静态地图边界时，SmacPlannerHybrid 必报 "Goal pose is out of costmap!"
+  // → BT 恢复行为循环倒车/等待 → fail_count 耗尽（实车：航点 (5,5)/(0,5) 的 y=5
+  // 超出地图 y≤3.85）。发送前校验，越界航点自动轮转到下一个边界内的航点；
+  // 全部越界则回 IDLE 防止跳过风暴。
+  if (!waypointInsideMap(waypoints_[current_wp_idx_])) {
+    RCLCPP_ERROR(get_logger(),
+      "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 在静态地图边界外"
+      "（x[%.2f, %.2f] y[%.2f, %.2f]，安全边距 %.2fm），跳过该航点",
+      current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
+      waypoints_[current_wp_idx_].x, waypoints_[current_wp_idx_].y,
+      map_min_x_, map_max_x_, map_min_y_, map_max_y_, waypoint_map_margin_);
+    bool found_valid = false;
+    for (size_t step = 1; step <= waypoints_.size(); ++step) {
+      const size_t idx = (current_wp_idx_ + step) % waypoints_.size();
+      if (waypointInsideMap(waypoints_[idx])) {
+        current_wp_idx_ = idx;
+        found_valid = true;
+        break;
+      }
+    }
+    if (!found_valid) {
+      RCLCPP_ERROR(get_logger(),
+        "[sendNextWaypoint] 全部航点均在静态地图边界外，停止巡航回 IDLE；"
+        "请重新记录航点（建图模式 rviz Publish Point）或修正 waypoints 配置");
+      state_ = MissionState::IDLE;
+      return;
+    }
+    RCLCPP_WARN(get_logger(), "[sendNextWaypoint] 改发边界内的航点[%zu] %s",
+      current_wp_idx_, waypoints_[current_wp_idx_].label.c_str());
   }
 
   const Waypoint & wp = waypoints_[current_wp_idx_];

@@ -58,8 +58,11 @@ from launch_ros.actions import Node
 def _nav2_params_with_bt(context, *args, **kwargs):
     """运行时拼接 nav2_params 覆盖项：将 bt_navigator 默认行为树指向 autonomous_navigate.xml。
 
-    因为 bt_navigator default_bt_xml_filename 在 nav2_params.yaml 里是字符串，
-    需要在 launch 运行时才能解析包路径，所以用 OpaqueFunction 动态生成 Node。
+    行为树 XML 需要运行时解析包内绝对路径，所以用 OpaqueFunction 动态生成 Node。
+    ⚠ 参数名必须是 default_nav_to_pose_bt_xml——本 fork（Humble）bt_navigator 只读
+    该名（nav2_bt_navigator/src/navigators/navigate_to_pose.cpp:73）；旧名
+    default_bt_xml_filename 会被静默忽略 → 自定义树不生效，回退内置默认树
+    （默认树恢复池含 Spin，阿克曼车被命令原地旋转、转向角打满画圈，V0.0.81 实车事故）。
     """
     pkg_bringup = get_package_share_directory('hunter_bringup')
     pkg_auto    = get_package_share_directory('auto_mission')
@@ -130,12 +133,16 @@ def _nav2_params_with_bt(context, *args, **kwargs):
     )
 
     # ---- behavior_server ----
+    # 恢复行为（BackUp/Wait）的 cmd_vel 必须与 controller 一样重映射到 cmd_vel_nav，
+    # 统一经 velocity_smoother 后以 /cmd_vel 下发底盘。旧版未重映射时恢复行为
+    # 直发 /cmd_vel 绕过平滑器，而正常跟随指令断链——形成"只有恢复行为能动"。
     behavior_server = Node(
         package='nav2_behaviors',
         executable='behavior_server',
         name='behavior_server',
         output='screen',
         parameters=[nav2_params_file],
+        remappings=[('cmd_vel', 'cmd_vel_nav')],
     )
 
     # ---- bt_navigator：使用扩展行为树 autonomous_navigate.xml ----
@@ -146,18 +153,27 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         output='screen',
         parameters=[
             nav2_params_file,
-            {'default_bt_xml_filename': auto_bt_file},
+            # ⚠ 必须用 default_nav_to_pose_bt_xml（本 fork 实际读取的参数名）；
+            #   旧名 default_bt_xml_filename 被静默忽略 → 自定义树不生效。
+            {'default_nav_to_pose_bt_xml': auto_bt_file},
             {'use_sim_time': use_sim_time == 'true'},
         ],
     )
 
     # ---- velocity_smoother ----
+    # 输入 cmd_vel→cmd_vel_nav（接 controller_server / behavior_server），
+    # 输出 cmd_vel_smoothed→cmd_vel（hunter_base 订阅 /cmd_vel）。
+    # 旧版缺这对重映射：controller 指令到不了底盘 → 车辆不动 → Failed to make progress。
     velocity_smoother = Node(
         package='nav2_velocity_smoother',
         executable='velocity_smoother',
         name='velocity_smoother',
         output='screen',
         parameters=[nav2_params_file],
+        remappings=[
+            ('cmd_vel', 'cmd_vel_nav'),
+            ('cmd_vel_smoothed', 'cmd_vel'),
+        ],
     )
 
     # ---- 全局定位（map→odom）：AMCL + 3D→2D 激光投影 ----

@@ -15,6 +15,7 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/int32.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -75,6 +76,7 @@ private:
   void fusedObjectsCallback(const hunter_msgs::msg::DetectedObjectArray::SharedPtr msg);
   void systemHealthCallback(const hunter_msgs::msg::SystemHealth::SharedPtr msg);
   void estopCallback(const std_msgs::msg::Bool::SharedPtr msg);
+  void mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg);  // /map 边界缓存（航点越界校验，V0.0.82）
 
   // ---- 主循环（10Hz 定时器） ----
   void mainLoop();
@@ -90,6 +92,7 @@ private:
   void cancelCurrentGoal();
   void triggerEstop(const std::string & reason);
   bool tryReleaseSelfEstop();  // 自触发急停（障碍物类）解除：危险消除后发布 /estop=false
+  bool waypointInsideMap(const Waypoint & wp);  // 航点是否在静态地图边界内（含安全边距）
 
   // ---- Nav2 就绪门控（bt_navigator lifecycle 状态） ----
   void queryNavigatorState();    // 异步查询 bt_navigator 状态（1Hz 节流，不阻塞主循环）
@@ -128,6 +131,7 @@ private:
   rclcpp::Subscription<hunter_msgs::msg::DetectedObjectArray>::SharedPtr fused_objects_sub_;
   rclcpp::Subscription<hunter_msgs::msg::SystemHealth>::SharedPtr health_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
 
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr waypoint_idx_pub_;
@@ -177,6 +181,14 @@ private:
   size_t current_wp_idx_{0};
   int wp_fail_count_{0};           // 连续失败计数
   bool goal_in_flight_{false};     // 是否有 goal 在飞
+
+  // ---- 静态地图边界缓存（/map transient_local，V0.0.82 航点越界校验） ----
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr latest_map_;
+  double map_min_x_{0.0};
+  double map_max_x_{0.0};
+  double map_min_y_{0.0};
+  double map_max_y_{0.0};
+  double waypoint_map_margin_{0.5};  // 航点距地图边界的最小安全边距（m）
 
   // ---- 定位等待计时 ----
   rclcpp::Time localize_wait_start_;
