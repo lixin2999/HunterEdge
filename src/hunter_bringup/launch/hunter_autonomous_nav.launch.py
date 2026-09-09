@@ -20,6 +20,9 @@
             + Nav2 全栈（使用 autonomous_navigate.xml 扩展行为树）
             + auto_mission_node（按 autonomous_nav_params.yaml 执行航点巡航）
       加载：nav2_map_server 加载已保存的静态地图（map_yaml_path 参数）
+      自愈：pcd_to_map 常驻——地图 YAML 缺失而 PCD 存在时（建图结束转换
+            竞态失败遗留），启动后自动补转换；本次 map_server 若已因缺图
+            启动失败，转换完成后重启本 launch 即可
 
 集成方式：
   由 hunter_full.launch.py 通过 use_autonomous_nav:=true 可选加载，
@@ -179,7 +182,41 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         ],
     )
 
-    return [
+    # ---- pcd_to_map（nav 模式自愈守护） ----
+    # maps/ 下只有 .pcd 而 .yaml 缺失（建图结束自动转换竞态失败遗留）时，
+    # 启动后自动补转换并尝试热重载 map_server；本次 map_server 若已因缺图
+    # 启动失败，转换完成后重启本 launch 即可。
+    map_pcd_path = os.path.splitext(map_yaml_path)[0] + '.pcd'
+    yaml_exists  = os.path.isfile(map_yaml_path)
+    pcd_exists   = os.path.isfile(map_pcd_path)
+
+    pcd_to_map_nav = Node(
+        package='auto_mission',
+        executable='pcd_to_map',
+        name='pcd_to_map',
+        output='screen',
+        parameters=[{
+            'pcd_file':       map_pcd_path,
+            'map_output_dir': os.path.dirname(map_yaml_path),
+            'map_name':       os.path.splitext(os.path.basename(map_yaml_path))[0],
+            'auto_reload_map':        True,   # map_server 正常运行时转换后热重载
+            'trigger_on_mapping_end': False,  # nav 模式无建图结束信号
+            'use_sim_time':           use_sim_time == 'true',
+        }],
+    )
+
+    precheck_logs = []
+    if not yaml_exists and pcd_exists:
+        precheck_logs.append(LogInfo(
+            msg='[hunter_autonomous_nav] 警告：地图 YAML 缺失而 PCD 存在，'
+                'pcd_to_map 将自动补转换；本次 map_server 可能启动失败，'
+                '转换完成后重启本 launch 即可'))
+    elif not yaml_exists:
+        precheck_logs.append(LogInfo(
+            msg='[hunter_autonomous_nav] 错误：地图 YAML 与 PCD 均不存在，'
+                '请先完成建图（use_autonomous_nav:=true autonomous_nav_mode:=mapping）'))
+
+    return precheck_logs + [
         fast_lio2_nav_param_node,
         map_server,
         controller_server,
@@ -189,6 +226,7 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         velocity_smoother,
         lifecycle_manager,
         auto_mission,
+        pcd_to_map_nav,
     ]
 
 
@@ -268,6 +306,7 @@ def _mapping_nodes(context, *args, **kwargs):
             'padding_m':              0.5,
             'auto_reload_map':        False,   # 建图模式下 map_server 未启动，禁用重载
             'trigger_on_mapping_end': True,
+            'convert_on_start_if_missing': False,  # 建图开始时无图可转，禁用启动自愈
             'use_sim_time':           use_sim_time == 'true',
         }],
     )

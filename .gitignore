@@ -46,3 +46,6 @@ YOLOv8-ROS-TensorRT/
 yolo_trt_ros/
 ugv_sdk/
 livox_ros_driver2/
+
+#采集构建的地图
+maps/

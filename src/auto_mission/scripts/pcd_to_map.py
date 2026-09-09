@@ -23,6 +23,7 @@
 #   padding_m       : 地图四周填充边距，m（默认 0.5）
 #   auto_reload_map : 转换完成后是否自动调用 map_server 重载（默认 true）
 #   trigger_on_mapping_end : 检测到建图结束后自动触发转换（默认 true）
+#   convert_on_start_if_missing : 启动自愈——YAML 缺失而 PCD 存在时自动补转换（默认 true）
 
 import math
 import os
@@ -52,13 +53,17 @@ class PcdParser:
             raw = f.read()
 
         # ---- 解析 header ----
+        # 注意：marker 含前导 '\n'，因此 raw[:idx] 不包含 DATA 行本身。
+        # 旧版实现由此永远读不到 DATA 行，data_type 恒为默认 'ascii'，
+        # 导致 FAST-LIO2 writeBinary 输出的 binary PCD 被按 ASCII 解析出
+        # 0 个点，建图结束的自动转换必然失败（maps/ 下只有 .pcd）。
         header_end_marker = b'\nDATA '
         idx = raw.find(header_end_marker)
         if idx == -1:
             raise ValueError('无效 PCD 文件：找不到 DATA 字段')
 
         header_str = raw[:idx].decode('ascii', errors='replace')
-        data_type  = 'ascii'
+        data_type  = ''
         fields: list = []
         sizes:  list = []
         types:  list = []
@@ -84,6 +89,18 @@ class PcdParser:
                 n_points = int(tok[1])
             elif key == 'DATA':
                 data_type = tok[1].lower()
+
+        # DATA 行位于 marker 之后，从原始字节补解析（strip 兼容 '\r'）
+        if not data_type:
+            data_line = raw[idx + 1:idx + 40].split(b'\n')[0].decode(
+                'ascii', errors='replace').strip()
+            if data_line.startswith('DATA'):
+                parts = data_line.split()
+                if len(parts) >= 2:
+                    data_type = parts[1].lower()
+        if data_type not in ('ascii', 'binary'):
+            raise ValueError(
+                f'不支持的 PCD 数据格式：{data_type or "未知"}（需要 ascii 或 binary）')
 
         if not counts:
             counts = [1] * len(fields)
@@ -293,6 +310,7 @@ class PcdToMap(Node):
         self.declare_parameter('padding_m',       0.5)
         self.declare_parameter('auto_reload_map', True)
         self.declare_parameter('trigger_on_mapping_end', True)
+        self.declare_parameter('convert_on_start_if_missing', True)
 
         self._pcd_file        = self.get_parameter('pcd_file').get_parameter_value().string_value
         self._map_output_dir  = self.get_parameter('map_output_dir').get_parameter_value().string_value
@@ -305,6 +323,8 @@ class PcdToMap(Node):
         self._padding_m       = self.get_parameter('padding_m').get_parameter_value().double_value
         self._auto_reload     = self.get_parameter('auto_reload_map').get_parameter_value().bool_value
         self._trigger_on_end  = self.get_parameter('trigger_on_mapping_end').get_parameter_value().bool_value
+        self._convert_on_start = self.get_parameter(
+            'convert_on_start_if_missing').get_parameter_value().bool_value
 
         # launch 命令行传参形如 map_file_path:=~/HunterEdge/... 时 '~' 不会被 shell 展开，
         # 这里统一 expanduser，保证与 FAST-LIO2 落盘路径一致
@@ -344,6 +364,23 @@ class PcdToMap(Node):
             except ImportError:
                 self.get_logger().warn('nav2_msgs 不可用，auto_reload_map 功能禁用')
                 self._auto_reload = False
+
+        # ---- 启动自愈：YAML 缺失而 PCD 存在时自动补转换 ----
+        # 场景：建图结束时自动转换因竞态/异常未完成，maps/ 下只有 .pcd。
+        # nav 模式启动本节点后自动补齐 .pgm/.yaml；若本次 map_server 已因
+        # 缺图启动失败，转换完成后重启 launch 即可（map_server 正常运行时
+        # auto_reload_map=true 会直接热重载，无需重启）。
+        if self._convert_on_start:
+            yaml_path = os.path.join(self._map_output_dir, f'{self._map_name}.yaml')
+            if not os.path.isfile(yaml_path) and os.path.isfile(self._pcd_file):
+                self.get_logger().warn(
+                    '[pcd_to_map] 地图 YAML 缺失而 PCD 存在，2s 后自动补转换\n'
+                    f'  YAML: {yaml_path}\n  PCD : {self._pcd_file}')
+                threading.Timer(2.0, self._do_convert).start()
+            elif not os.path.isfile(yaml_path):
+                self.get_logger().info(
+                    '[pcd_to_map] 地图 YAML 缺失且 PCD 不存在，跳过启动自愈\n'
+                    f'  PCD : {self._pcd_file}')
 
         self.get_logger().info(
             f'pcd_to_map 节点启动\n'
@@ -557,7 +594,12 @@ class PcdToMap(Node):
         if not self._load_map_cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().warn(
                 '[pcd_to_map] /map_server/load_map 服务不可用，跳过自动重载\n'
-                f'  请手动执行：ros2 service call /map_server/load_map '
+                '  常见原因：本次 bringup 中 map_server 因缺图 configure 失败\n'
+                '  （lifecycle_manager 已 Aborting，服务从未创建）。地图文件\n'
+                '  此刻已补齐，重启本 launch 即可正常加载，无需手动干预。\n'
+                '  若 map_server 处于 active 状态（ros2 lifecycle get '
+                '/map_server），可手动重载：\n'
+                f'  ros2 service call /map_server/load_map '
                 f'nav2_msgs/srv/LoadMap "{{map_url: \'{yaml_path}\'}}"')
             return
 
