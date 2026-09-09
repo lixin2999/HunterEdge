@@ -76,9 +76,9 @@ auto_mission_node:
     # -------------------------------------------------------------------------
     # params_file 由 launch 传入（与 waypoint_recorder 写入的是同一文件），无需在此配置
     params_file: ""                  # 占位；实际值来自 launch 的 auto_params_file
-    cruise_max_speed: 1.0            # 巡航直行最大速度（m/s），建图质量建议 ≤ 1.0
+    cruise_max_speed: 0.1            # 巡航直行最大速度（m/s）；首跑安全临时值（≈慢步速），确认平稳后逐步回调 0.5 → 1.0
     cruise_turn_speed: 0.4           # 航向偏差 > cruise_yaw_slow_deg 时的限速（m/s）
-    cruise_min_speed: 0.2            # 接近航点减速下限（m/s），避免临门蠕动
+    cruise_min_speed: 0.05           # 接近航点减速下限（m/s），避免临门蠕动；保持 ≤ cruise_max_speed（恢复巡航速度时同步回调，如 0.2）
     cruise_reach_dist: 0.6           # 到达判定距离（m），需 ≥ 阿克曼停车精度
     cruise_brake_dist: 2.0           # 接近目标开始线性减速的距离（m）
     cruise_kp_yaw: 1.2               # 航向 P 增益
