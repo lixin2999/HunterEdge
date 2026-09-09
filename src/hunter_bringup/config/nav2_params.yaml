@@ -73,16 +73,22 @@ global_costmap:
       height: 100
       footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
-      inflation_layer:
-        inflation_radius: 0.3                  # 文档 8.3：膨胀半径 0.3m
-        cost_scaling_factor: 3.0
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true    # Humble：map_server 以 transient_local 发 /map，默认 volatile 订阅将收不到地图
       obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"   # 必填：loadPlugins() 缺失即 FATAL "Can not get 'plugin' param"
+        enabled: true
         observation_sources: lidar
         lidar:
           topic: /perception/lidar/obstacle_cloud
           data_type: "PointCloud2"
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        inflation_radius: 0.3                  # 文档 8.3：膨胀半径 0.3m
+        cost_scaling_factor: 3.0
 
 # ---- 局部代价地图（文档 8.3） ----
 local_costmap:
@@ -98,16 +104,19 @@ local_costmap:
       height: 10
       footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
       plugins: ["obstacle_layer", "inflation_layer"]
-      inflation_layer:
-        inflation_radius: 0.2                  # 文档 8.3：膨胀半径 0.2m
-        cost_scaling_factor: 3.0
       obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"   # 必填：loadPlugins() 缺失即 FATAL "Can not get 'plugin' param"
+        enabled: true
         observation_sources: lidar
         lidar:
           topic: /perception/lidar/obstacle_cloud
           data_type: "PointCloud2"
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        inflation_radius: 0.2                  # 文档 8.3：膨胀半径 0.2m
+        cost_scaling_factor: 3.0
 
 # ---- 行为树导航器（文档 2.3 nav2_bt_navigator） ----
 bt_navigator:
