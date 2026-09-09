@@ -31,6 +31,8 @@
 
   <!-- Nav2 action/service 接口 -->
   <depend>nav2_msgs</depend>
+  <!-- bt_navigator lifecycle 状态查询（goal 发送前门控） -->
+  <depend>lifecycle_msgs</depend>
 
   <!-- HUNTER 自定义消息 -->
   <depend>hunter_msgs</depend>

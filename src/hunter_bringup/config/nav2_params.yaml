@@ -1,6 +1,66 @@
 # nav2_params.yaml — Nav2 导航栈参数
 # 出处：附录 C（控制器）、文档 8.3（代价地图）、9.2（SmacPlannerHybrid）、9.3（footprint）、10.2（RPP）
 
+# ---- 全局定位（map→odom）：AMCL 粒子滤波 ----
+# TF 分工：EKF 发布 odom→base_link（ekf_params.yaml publish_tf: true）；
+#          AMCL 发布 map→odom（global_costmap / bt_navigator 依赖的缺失环节）。
+# scan 输入由 pointcloud_to_laserscan 从 /lidar_points（RS-Helios-16P，frame rslidar）投影生成。
+# 初始位姿默认地图原点（假设上电位姿≈建图起点 camera_init）；偏差大时用 rviz2
+# "2D Pose Estimate" 向 /initialpose 发布真实位姿重定位。
+amcl:
+  ros__parameters:
+    use_sim_time: False
+    # 运动噪声（差速模型近似：HUNTER-SE 阿克曼低速行驶转弯半径大，误差可接受）
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+    # TF 帧链（odom→base_link 源为 EKF，map→odom 由本节点广播）
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    global_frame_id: "map"
+    scan_topic: "/scan"                # pointcloud_to_laserscan 输出
+    map_topic: "/map"                  # map_server 发布（transient local）
+    set_initial_pose: true             # 上电自动设初始位姿（地图原点）
+    initial_pose:                      # 与建图起点对齐（建图起点 = camera_init 原点 = 地图原点）
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+    always_reset_initial_pose: false   # 保留运行中 /initialpose 重定位结果
+    # 激光观测模型（likelihood_field，匹配 0.05 m/cell 的 PGM 地图）
+    laser_model_type: "likelihood_field"
+    laser_min_range: 0.5               # 与传感器 ROI min_range 一致
+    laser_max_range: 50.0              # 与传感器 ROI max_range 一致
+    laser_likelihood_max_dist: 2.0
+    max_beams: 120
+    sigma_hit: 0.2
+    z_hit: 0.5
+    z_rand: 0.5
+    z_max: 0.05
+    z_short: 0.05
+    lambda_short: 0.1
+    do_beamskip: false
+    beam_skip_distance: 0.5
+    beam_skip_error_threshold: 0.9
+    beam_skip_threshold: 0.3
+    # 粒子滤波
+    min_particles: 300
+    max_particles: 2000
+    pf_err: 0.05
+    pf_z: 0.99
+    recovery_alpha_slow: 0.0
+    recovery_alpha_fast: 0.0
+    resample_interval: 1
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    save_pose_rate: 0.5
+    tf_broadcast: true                 # 广播 map→odom
+    transform_tolerance: 1.0
+    # 滤波更新阈值（调低：低速导航下位姿及时刷新）
+    update_min_a: 0.1
+    update_min_d: 0.15
+
 # ---- 全局规划器（文档 9.2 SmacPlannerHybrid，Hybrid-A*） ----
 planner_server:
   ros__parameters:

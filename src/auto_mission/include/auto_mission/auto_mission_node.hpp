@@ -22,6 +22,7 @@
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/action/follow_waypoints.hpp"
+#include "lifecycle_msgs/srv/get_state.hpp"
 
 #include "hunter_msgs/msg/behavior_state.hpp"
 #include "hunter_msgs/msg/detected_object_array.hpp"
@@ -89,6 +90,11 @@ private:
   void cancelCurrentGoal();
   void triggerEstop(const std::string & reason);
 
+  // ---- Nav2 就绪门控（bt_navigator lifecycle 状态） ----
+  void queryNavigatorState();    // 异步查询 bt_navigator 状态（1Hz 节流，不阻塞主循环）
+  void navigatorStateResponse(
+    rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedFuture future);
+
   // ---- 建图模式自动巡航（mapping auto cruise）----
   void startCruiseCallback(
     const std_srvs::srv::Trigger::Request::SharedPtr req,
@@ -134,6 +140,14 @@ private:
   rclcpp::TimerBase::SharedPtr cruise_timer_;
 
   rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr nav_action_client_;
+
+  // ---- Nav2 就绪门控状态 ----
+  rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr nav_state_client_;
+  std::atomic<bool> nav_active_{false};        // bt_navigator 是否 ACTIVE
+  rclcpp::Time nav_state_query_time_{0, 0, RCL_ROS_TIME};  // 上次状态查询时刻（1Hz 节流）
+  rclcpp::Time nav_wait_start_{0, 0, RCL_ROS_TIME};        // 开始等待 bt_navigator 激活的时刻
+  bool nav_wait_started_{false};
+  rclcpp::Time nav_retry_not_before_{0, 0, RCL_ROS_TIME};  // goal 被拒/失败后的退避截止时刻
 
   rclcpp::TimerBase::SharedPtr main_timer_;
 
@@ -190,6 +204,8 @@ private:
   bool loop_waypoints_{true};          // 循环/停车
   int max_wp_failures_{3};             // 最大连续失败次数
   double goal_timeout_{60.0};          // 单点导航超时（s）
+  double nav_active_wait_timeout_{60.0}; // NAVIGATING 中等待 bt_navigator 激活的超时（s）
+  double nav_retry_backoff_{2.0};      // goal 被拒/失败后的重试退避（s）
   // 障碍物等待
   double obstacle_wait_timeout_{30.0}; // 障碍物等待超时（s）
   // 最大速度（仅日志/合规性检查；实际限速由 Nav2 params 控制）

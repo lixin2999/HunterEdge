@@ -59,6 +59,15 @@ auto_mission_node:
     obstacle_wait_timeout: 30.0      # 障碍物等待超时（s）
 
     # -------------------------------------------------------------------------
+    # Nav2 就绪门控
+    #   nav_active_wait_timeout : NAVIGATING 中等待 bt_navigator 激活的超时（s），
+    #                             超时回 IDLE（Nav2 bringup 常规 <30s）
+    #   nav_retry_backoff       : goal 被拒/失败后的重试退避（s），防止高频重发
+    # -------------------------------------------------------------------------
+    nav_active_wait_timeout: 60.0
+    nav_retry_backoff: 2.0
+
+    # -------------------------------------------------------------------------
     # 速度约束（仅合规性检查，实际限速由 nav2_params.yaml controller/velocity_smoother 控制）
     # 文档规定：HUNTER-SE 最大速度 ≤ 2.0 m/s
     # -------------------------------------------------------------------------
@@ -128,8 +137,10 @@ auto_mission_node:
     # 注意：map_yaml_path 指向 .yaml 元数据文件，同目录下需有同名 .pgm 栅格文件
     map_yaml_path: "/home/agilex/HunterEdge/maps/hunter_map.yaml"
 
-    # 本系统已有 FAST-LIO2+EKF 作为定位源，默认不启动 AMCL
-    use_amcl: false
+    # 全局定位（map→odom）由 AMCL 提供：hunter_autonomous_nav.launch.py 启动
+    # AMCL + pointcloud_to_laserscan（/lidar_points→/scan），匹配静态地图发布
+    # map→odom。关闭用 launch 参数 use_amcl:=false（此时 Nav2 无法工作，仅调试用）。
+    use_amcl: true
 
     # 代价地图障碍物来源（与 nav2_params.yaml 一致）
     costmap_obstacle_topic: "/perception/lidar/obstacle_cloud"

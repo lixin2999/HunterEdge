@@ -70,6 +70,7 @@ def _nav2_params_with_bt(context, *args, **kwargs):
     map_yaml_path    = LaunchConfiguration('map_yaml_path').perform(context)
     use_sim_time     = LaunchConfiguration('use_sim_time').perform(context)
     autostart        = LaunchConfiguration('autostart').perform(context)
+    use_amcl         = LaunchConfiguration('use_amcl').perform(context)
 
     # 导航模式：确保 fast_lio2 不写 PCD（pcd_save_en=false），避免磁盘无限增长
     fast_lio2_nav_param_node = Node(
@@ -93,6 +94,9 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         'bt_navigator',
         'velocity_smoother',
     ]
+    # AMCL 在 map_server 之后激活（依赖其发布的 /map），负责发布 map→odom
+    if use_amcl == 'true':
+        lifecycle_nodes.insert(1, 'amcl')
 
     # ---- map_server：加载已保存的静态 PGM 地图 ----
     map_server = Node(
@@ -154,6 +158,49 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         name='velocity_smoother',
         output='screen',
         parameters=[nav2_params_file],
+    )
+
+    # ---- 全局定位（map→odom）：AMCL + 3D→2D 激光投影 ----
+    # TF 链：map --AMCL--> odom --EKF--> base_link。
+    # AMCL 以 /scan（由 /lidar_points 经 pointcloud_to_laserscan 投影）匹配静态地图，
+    # 自动输出并持续修正 map→odom；初始位姿默认地图原点（假设上电位姿≈建图起点），
+    # 偏差大时用 rviz2 "2D Pose Estimate" 向 /initialpose 发布真实位姿重定位。
+    use_amcl_cond = IfCondition(PythonExpression(
+        ["'", LaunchConfiguration('use_amcl'), "' == 'true'"]))
+
+    cloud_to_scan = Node(
+        package='pointcloud_to_laserscan',
+        executable='pointcloud_to_laserscan_node',
+        name='pointcloud_to_laserscan',
+        output='screen',
+        remappings=[('cloud_in', '/lidar_points'), ('scan', '/scan')],
+        parameters=[{
+            'target_frame': 'base_link',        # 点云 rslidar → base_link（URDF TF）
+            'transform_tolerance': 0.1,
+            'min_height': -0.2,                 # base_link 系高度切片：滤除地面反射
+            'max_height': 0.8,                  # 拦腰高度（车顶雷达俯视场景）
+            'angle_min': -3.14159,
+            'angle_max': 3.14159,
+            'angle_increment': 0.008726646,     # 0.5°/束 → 720 束
+            'scan_time': 0.1,                   # /lidar_points 10Hz
+            'range_min': 0.5,
+            'range_max': 50.0,
+            'use_inf': True,
+            'use_sim_time': use_sim_time == 'true',
+        }],
+        condition=use_amcl_cond,
+    )
+
+    amcl = Node(
+        package='nav2_amcl',
+        executable='amcl',
+        name='amcl',
+        output='screen',
+        parameters=[
+            nav2_params_file,
+            {'use_sim_time': use_sim_time == 'true'},
+        ],
+        condition=use_amcl_cond,
     )
 
     # ---- lifecycle_manager（含 map_server） ----
@@ -219,6 +266,8 @@ def _nav2_params_with_bt(context, *args, **kwargs):
     return precheck_logs + [
         fast_lio2_nav_param_node,
         map_server,
+        amcl,
+        cloud_to_scan,
         controller_server,
         planner_server,
         behavior_server,
@@ -388,6 +437,14 @@ def generate_launch_description():
         description='Nav2 lifecycle_manager 是否自动激活节点',
     )
 
+    # 全局定位开关（默认 true）：关闭时不启动 AMCL/激光投影——将没有 map→odom，
+    # global_costmap 与 bt_navigator 无法工作，仅用于调试其余组件
+    declare_use_amcl = DeclareLaunchArgument(
+        'use_amcl',
+        default_value='true',
+        description='[nav 模式] 启动 AMCL + pointcloud_to_laserscan 全局定位（发布 map→odom）',
+    )
+
     # ---- 模式判断条件 ----
     is_nav_mode     = PythonExpression(["'", LaunchConfiguration('mode'), "' == 'nav'"])
     is_mapping_mode = PythonExpression(["'", LaunchConfiguration('mode'), "' == 'mapping'"])
@@ -422,6 +479,7 @@ def generate_launch_description():
         declare_params_file_path,
         declare_use_sim_time,
         declare_autostart,
+        declare_use_amcl,
         # 日志
         log_nav,
         log_mapping,

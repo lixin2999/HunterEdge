@@ -62,6 +62,12 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
   nav_action_client_ = rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(
     this, "/navigate_to_pose");
 
+  // ---- bt_navigator lifecycle 状态查询 ----
+  // bt_navigator 的 action server 在 configure 阶段即被发现，但 inactive 状态会拒绝
+  // goal（日志"goal 被服务端拒绝"），发送前必须经 GetState 确认节点已 ACTIVE。
+  nav_state_client_ = create_client<lifecycle_msgs::srv::GetState>(
+    "/bt_navigator/get_state");
+
   // ---- 建图模式自动巡航设施 ----
   // /cmd_vel：mapping 模式下 Nav2 全栈未启动，无竞争发布者；
   // hunter_base 订阅 /cmd_vel 并按 bicycle model 换算阿克曼转向角。
@@ -129,6 +135,10 @@ void AutoMissionNode::declareParameters()
   declare_parameter("goal_timeout", 60.0);
   declare_parameter("obstacle_wait_timeout", 30.0);
 
+  // Nav2 就绪门控
+  declare_parameter("nav_active_wait_timeout", 60.0);
+  declare_parameter("nav_retry_backoff", 2.0);
+
   // 速度（合规性）
   declare_parameter("max_velocity", 2.0);
 
@@ -176,6 +186,8 @@ void AutoMissionNode::declareParameters()
   cruise_min_turn_radius_ = get_parameter("cruise_min_turn_radius").as_double();
   cruise_cmd_rate_        = get_parameter("cruise_cmd_rate").as_double();
   cruise_odom_timeout_    = get_parameter("cruise_odom_timeout").as_double();
+  nav_active_wait_timeout_ = get_parameter("nav_active_wait_timeout").as_double();
+  nav_retry_backoff_       = get_parameter("nav_retry_backoff").as_double();
 
   // 最大速度合规检查（文档规定 ≤ 2.0 m/s）
   if (max_velocity_ > 2.0) {
@@ -700,7 +712,14 @@ void AutoMissionNode::mainLoop()
           "[IDLE] 无可用航点，请在 autonomous_nav_params.yaml 中配置 waypoints");
         break;
       }
-      // 条件满足，先检查定位收敛
+      // 条件满足，先确认 Nav2 就绪（bt_navigator ACTIVE，inactive 会拒收 goal）
+      if (!nav_active_.load()) {
+        queryNavigatorState();
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 3000,
+          "[IDLE] AUTO 条件满足，但 bt_navigator 未激活（Nav2 bringup 进行中），等待");
+        break;
+      }
+      // 再检查定位收敛
       if (!isLocalizationValid()) {
         RCLCPP_INFO(get_logger(), "[IDLE→WAITING_LOCALIZE] AUTO 条件满足，等待定位收敛");
         localize_wait_started_ = true;
@@ -760,6 +779,27 @@ void AutoMissionNode::mainLoop()
         break;
       }
 
+      // Nav2 就绪门控：bt_navigator 非 ACTIVE（bringup 进行中/中途重启）时暂停发送
+      if (!nav_active_.load()) {
+        queryNavigatorState();
+        if (!nav_wait_started_) {
+          nav_wait_started_ = true;
+          nav_wait_start_ = this->now();
+        }
+        if ((this->now() - nav_wait_start_).seconds() > nav_active_wait_timeout_) {
+          RCLCPP_ERROR(get_logger(),
+            "[NAVIGATING] 等待 bt_navigator 激活超时（%.0fs），回到 IDLE",
+            nav_active_wait_timeout_);
+          nav_wait_started_ = false;
+          state_ = MissionState::IDLE;
+          break;
+        }
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+          "[NAVIGATING] bt_navigator 未激活（Nav2 bringup 进行中），暂不发送 goal");
+        break;
+      }
+      nav_wait_started_ = false;
+
       // goal 超时检查
       if (goal_in_flight_) {
         const double elapsed = (this->now() - goal_send_time_).seconds();
@@ -802,10 +842,11 @@ void AutoMissionNode::mainLoop()
         break;
       }
 
-      // 正常导航中，只在没有 goal 在飞时重新发送（防止重复发送）
+      // 正常导航中，只在没有 goal 在飞时重新发送（防止重复发送）；
+      // goal 被拒/失败后的退避窗口由 sendNextWaypoint 开头统一检查
       if (!goal_in_flight_) {
-        RCLCPP_INFO(get_logger(), "[NAVIGATING] 无在途 goal，重新发送航点[%zu]",
-          current_wp_idx_);
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 3000,
+          "[NAVIGATING] 无在途 goal，重新发送航点[%zu]", current_wp_idx_);
         sendNextWaypoint();
       }
       break;
@@ -970,6 +1011,34 @@ double AutoMissionNode::nearestObstacleDist()
 }
 
 // ==========================================================================
+// bt_navigator lifecycle 状态查询（异步，1Hz 节流，不阻塞主循环）
+// ==========================================================================
+void AutoMissionNode::queryNavigatorState()
+{
+  const rclcpp::Time now = this->now();
+  if ((now - nav_state_query_time_).seconds() < 1.0) {
+    return;   // 查询节流
+  }
+  nav_state_query_time_ = now;
+
+  if (!nav_state_client_->service_is_ready()) {
+    // 服务未上线 ⇒ bt_navigator 尚未 configure 完成
+    nav_active_.store(false);
+    return;
+  }
+  auto req = std::make_shared<lifecycle_msgs::srv::GetState::Request>();
+  nav_state_client_->async_send_request(req,
+    std::bind(&AutoMissionNode::navigatorStateResponse, this, std::placeholders::_1));
+}
+
+void AutoMissionNode::navigatorStateResponse(
+  rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedFuture future)
+{
+  const auto & state = future.get()->current_state;
+  nav_active_.store(state.id == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+}
+
+// ==========================================================================
 // 向 Nav2 发送下一个航点
 // ==========================================================================
 void AutoMissionNode::sendNextWaypoint()
@@ -980,10 +1049,24 @@ void AutoMissionNode::sendNextWaypoint()
     return;
   }
 
-  if (!nav_action_client_->wait_for_action_server(std::chrono::seconds(3))) {
-    RCLCPP_ERROR(get_logger(),
-      "[sendNextWaypoint] Nav2 /navigate_to_pose action server 不可用，回到 IDLE");
-    state_ = MissionState::IDLE;
+  // goal 被拒/失败后的退避窗口：窗口内静默放弃，由调用方下个周期再尝试
+  if ((this->now() - nav_retry_not_before_).seconds() < 0.0) {
+    return;
+  }
+
+  // bt_navigator 未激活（inactive 会拒绝 goal），不发送，等待其激活
+  if (!nav_active_.load()) {
+    queryNavigatorState();
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+      "[sendNextWaypoint] bt_navigator 未激活，暂不发送 goal");
+    return;
+  }
+
+  // action server 未发现：Nav2 可能尚未启动完成。保持当前状态等待而非回 IDLE，
+  // 避免 Nav2 bringup 期间 IDLE⇄NAVIGATING 反复跳变
+  if (!nav_action_client_->wait_for_action_server(std::chrono::seconds(0))) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+      "[sendNextWaypoint] Nav2 /navigate_to_pose action server 尚未发现，等待");
     return;
   }
 
@@ -1061,9 +1144,18 @@ void AutoMissionNode::goalResponseCallback(
 {
   std::lock_guard<std::mutex> lk(goal_handle_mutex_);
   if (!handle) {
-    RCLCPP_ERROR(get_logger(), "[Nav2] goal 被服务端拒绝");
     goal_in_flight_ = false;
     wp_fail_count_++;
+    // 退避 + 失败上限：杜绝 10Hz 高频重发；拒收达上限回 IDLE 等待条件重置
+    nav_retry_not_before_ = this->now() + rclcpp::Duration::from_seconds(nav_retry_backoff_);
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      "[Nav2] goal 被服务端拒绝（fail_count=%d/%d），%.0fs 后重试",
+      wp_fail_count_, max_wp_failures_, nav_retry_backoff_);
+    if (wp_fail_count_ >= max_wp_failures_) {
+      RCLCPP_ERROR(get_logger(),
+        "[Nav2] goal 连续被拒 %d 次达上限，回到 IDLE", max_wp_failures_);
+      state_ = MissionState::IDLE;
+    }
   } else {
     goal_handle_ = handle;
     RCLCPP_INFO(get_logger(), "[Nav2] goal 已被接受，开始导航至航点[%zu]",
@@ -1132,6 +1224,8 @@ void AutoMissionNode::resultCallback(
       current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
       reason, wp_fail_count_ + 1, max_wp_failures_);
     wp_fail_count_++;
+    // 重试退避：给 Nav2 恢复/系统稳定留窗口，防止立刻重发
+    nav_retry_not_before_ = this->now() + rclcpp::Duration::from_seconds(nav_retry_backoff_);
 
     if (wp_fail_count_ >= max_wp_failures_) {
       RCLCPP_ERROR(get_logger(),
