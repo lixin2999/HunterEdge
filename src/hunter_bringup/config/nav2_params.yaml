@@ -176,7 +176,11 @@ global_costmap:
           min_obstacle_height: 0.3                 # V0.0.89 抬高至底盘/地面之上（原 0.0），避免近地杂波把车脚底标致命
           max_obstacle_height: 1.5
           marking: true
-          clearing: false
+          clearing: true                      # V0.0.91 必须开清障！原 false 使假障碍只增不减：
+                                              # 遥控接管后车身下方变成“永久致命栅格”，
+                                              # clear_entirely 清完又被下一帧重标，
+                                              # 所有航点持续报 Starting point in lethal space，
+                                              # 车辆原地锁死不能自主（现场问题②直接成因）
           obstacle_range: 3.0
           raytrace_range: 4.0
           expected_update_rate: 0.5             # 10Hz 数据，0.5s 无更新仅告警不断链
@@ -220,7 +224,11 @@ local_costmap:
           min_obstacle_height: 0.3                 # V0.0.89 抬高至底盘/地面之上（原 0.0），避免近地杂波把车脚底标致命
           max_obstacle_height: 1.5
           marking: true
-          clearing: false
+          clearing: true                      # V0.0.91 必须开清障！原 false 使假障碍只增不减：
+                                              # 遥控接管后车身下方变成“永久致命栅格”，
+                                              # clear_entirely 清完又被下一帧重标，
+                                              # 所有航点持续报 Starting point in lethal space，
+                                              # 车辆原地锁死不能自主（现场问题②直接成因）
           obstacle_range: 3.0
           raytrace_range: 4.0
           expected_update_rate: 0.5

@@ -21,6 +21,7 @@
 #include "std_msgs/msg/int32.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "std_srvs/srv/trigger.hpp"
+#include "std_srvs/srv/empty.hpp"
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/action/follow_waypoints.hpp"
@@ -44,6 +45,8 @@ enum class MissionState : uint8_t
   NAVIGATING,        // 正在执行导航目标
   OBSTACLE_AVOID,    // 障碍物减速等待
   ESTOP,             // 急停状态
+  FAULT,             // 任务故障锁存（V0.0.91）：连续规划失败达上限后停驻，
+                     // 不再静默重发；需模式开关离开 AUTO 再回来才能解除
 };
 
 // ---------------------------------------------------------------------------
@@ -92,6 +95,8 @@ private:
   void sendNextWaypoint();
   void cancelCurrentGoal();
   void triggerEstop(const std::string & reason);
+  void enterFault(const std::string & reason);  // 任务故障锁存（V0.0.91）：停止巡航并等待人工处置
+  void clearCostmapsOnStart();                  // 任务（重）启动时异步清一次全局/局部代价地图（V0.0.91）
   bool tryReleaseSelfEstop();  // 自触发急停（障碍物类）解除：危险消除后发布 /estop=false
   bool waypointInsideMap(const Waypoint & wp);  // 航点在已采集地图区域内（边界+边距+非未建图栅格，V0.0.82/0.0.87）
   std::string waypointMapCheckDetail(const Waypoint & wp);  // 越界原因（空=通过）：矩形边界外 / 未建图(unknown)栅格
@@ -150,6 +155,10 @@ private:
 
   // ---- Nav2 就绪门控状态 ----
   rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr nav_state_client_;
+
+  // ---- 代价地图清除客户端（V0.0.91：任务（重）启动时主动清障） ----
+  rclcpp::Client<std_srvs::srv::Empty>::SharedPtr clear_global_costmap_srv_;
+  rclcpp::Client<std_srvs::srv::Empty>::SharedPtr clear_local_costmap_srv_;
   std::atomic<bool> nav_active_{false};        // bt_navigator 是否 ACTIVE
   rclcpp::Time nav_state_query_time_{0, 0, RCL_ROS_TIME};  // 上次状态查询时刻（1Hz 节流）
   rclcpp::Time nav_wait_start_{0, 0, RCL_ROS_TIME};        // 开始等待 bt_navigator 激活的时刻
@@ -183,6 +192,7 @@ private:
   size_t current_wp_idx_{0};
   int wp_fail_count_{0};           // 连续失败计数
   bool goal_in_flight_{false};     // 是否有 goal 在飞
+  std::string fault_reason_;       // FAULT 锁存原因（V0.0.91，仅日志用）
 
   // ---- 静态地图边界缓存（/map transient_local；V0.0.82 矩形边界校验，
   //      V0.0.87 增加未建图(unknown)栅格校验） ----

@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V1.3（开发指南，对应软件基线 V0.0.90：窄小测试场地低速巡航档——限速≤0.5m/s、只前进不倒车、observation_sources 类型修复；建图 PCD 保存体素去重与退出兜底截断容错）
+> **文档版本**：V1.3（开发指南，对应软件基线 V0.0.91：碰撞防护改用矩形安全走廊纵向净空判据、stop/slow 抬到 1.0/1.8m 并与 `range_min` 盲区一致性强制校验；点云观测源必开清障 + 观测时基按消息时间戳查 TF；auto_mission 新增 `FAULT` 锁存态与起步前清图）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -445,6 +445,8 @@ IDLE ──[AUTO条件满足]──→ WAITING_LOCALIZE ──[收敛]──→ 
 IDLE ──[mapping模式]──→ MAPPING
 NAVIGATING ──[障碍物 < warn_dist]──→ OBSTACLE_AVOID ──[路清]──→ NAVIGATING
 NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
+NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁存：不发 goal、不重发，
+                                                  需模式开关离开 AUTO 再切回）
 任意状态 ──[非AUTO/急停]──→ IDLE / ESTOP
 ```
 
@@ -491,15 +493,16 @@ NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
 
 | 能力 | 触发条件 | 动作 |
 |------|----------|------|
-| 碰撞急停 | 行进方向 ±60° 扇区最近障碍 < stop_dist(0.5m) | 立即零速 COLLISION_STOP |
-| 碰撞限速 | 最近障碍 < slow_dist(1.0m) | 线性限速至 max×(d−stop)/(slow−stop)，SLOWDOWN |
+| 碰撞急停 | 前方安全走廊（\|y\| ≤ corridor_half_width 0.45m）内**纵向净空** < stop_dist(1.0m，V0.0.91) | 立即零速 COLLISION_STOP |
+| 碰撞限速 | 走廊纵向净空 < slow_dist(1.8m，V0.0.91) | 线性限速至 max×(d−stop)/(slow−stop)，SLOWDOWN |
+| 盲区一致性强制（V0.0.91） | 配置的 stop_dist ≤ /scan `range_min`+0.15（急停区落在感知盲区内） | 运行时强制抬升到 range_min+0.15 并一次性 ERROR 告警修参数（撞墙事故根因：range_min 0.8 > stop_dist 0.5） |
 | 感知 fail-safe | /scan 超时 0.5s 或未到达 | 零速（宁可停车不盲走）SCAN_TIMEOUT |
 | 指令看门狗 | 上游速度指令断流 >0.5s | 零速心跳 CMD_TIMEOUT |
 | 急停透传 | /estop=true | 零速（弥补 Nav2 goal 取消延迟窗口）ESTOP_PASS |
 | 阿克曼曲率钳制 | 恒生效 | \|w\| ≤ \|v\|/1.9（δ≤0.33rad，杜绝打满转向） |
 | 速度硬限 | 恒生效 | \|v\| ≤ 0.5m/s（第二重限速，V0.0.89） |
-| 测试模式碰撞急停 | 测试模式开启时同扇区 < test_stop_dist(0.5m) | 立即零速 COLLISION_STOP【测试模式】 |
-| 测试模式减速 | 测试模式开启时同扇区 < test_slow_dist(1.0m) | 限速 ≤0.3m/s（test_max_linear_vel，V0.0.89） |
+| 测试模式碰撞急停 | 测试模式开启时同走廊净空 < test_stop_dist(1.0m，V0.0.91 原 0.5) | 立即零速 COLLISION_STOP【测试模式】 |
+| 测试模式减速 | 同走廊净空 < test_slow_dist(1.8m，V0.0.91 原 1.0) | 限速 ≤0.3m/s（test_max_linear_vel，V0.0.89） |
 | 测试模式异常中止 | 疑似碰撞卡死（指令>0.05m/s 而反馈≈0 持续 1s）/ **连续** `test_max_goal_aborts`(3) 次 goal ABORTED（EXECUTING 会清零，V0.0.89）/ goal 活跃但 /cmd_vel_nav 断流 >`plan_fail_timeout`(10s) | 零速锁存 TEST_ABORTED + /estop=true + 取消全部导航目标 |
 | 地图边界减速（V0.0.87） | 车辆距未建图(unknown)/界外栅格 < map_edge_slow_dist(1.0m，V0.0.89 原 1.5) | 线性限速至 max×(d−stop)/(slow−stop)，MAP_EDGE_SLOWDOWN |
 | 地图边界停车（V0.0.87） | 车辆距未建图(unknown)/界外栅格 < map_edge_stop_dist(0.4m，V0.0.89 原 0.5) | 立即零速 MAP_EDGE_STOP（回到已建图区域自动恢复）；测试模式下升级为中止锁存 TEST_ABORTED |
@@ -522,7 +525,7 @@ ros2 topic pub --once /safety/test_mode std_msgs/msg/Bool "{data: true}"   # 开
 ros2 topic pub --once /safety/test_mode std_msgs/msg/Bool "{data: false}"  # 关闭（恢复常规阈值）
 ```
 
-开启后 0.3m/s 限速巡航（V0.0.89，原 0.1 易导致“基本不动”）、±60° 扇区 <0.5m 急停/<1.0m 减速（与常规同值，阈值已适配窄小测试场地尺度）；
+开启后 0.3m/s 限速巡航（V0.0.89，原 0.1 易导致“基本不动”）、前方安全走廊净空 <1.0m 急停 / <1.8m 减速（V0.0.91，原 0.5/1.0）；
 并自动监控四类异常——疑似碰撞卡死、控制器断流（>`plan_fail_timeout` 10s，V0.0.89 原 2s）、Nav2 goal ABORTED（V0.0.89 起**连续**达 `test_max_goal_aborts`(3) 次才触发，EXECUTING 清零，避免起步期瞬时 ABORT 一票否决）、
 **地图越界（V0.0.87，距未建图/界外栅格 <0.4m）**——任一发生立即
 零速锁存（TEST_ABORTED）并发布 /estop=true（auto_mission 取消全部导航任务）；

@@ -198,17 +198,31 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'wheelbase': 0.65,          # HunterV2Params::wheelbase（AGX_V2 实车）
             'min_turn_radius': 1.9,     # 与 Smac minimum_turning_radius 一致
             'max_linear_vel': 0.5,      # V0.0.89 测试场地：与 desired_linear_vel/velocity_smoother 一致 0.5
-            'stop_dist': 0.5,           # V0.0.89 窄场地适度收紧（scan 前进方向扇区急停，原 0.6）
-            'slow_dist': 1.0,           # V0.0.89 减速预警距离（原 1.2，窄场地墙边不至于常年限速）
+            # V0.0.91 撞墙事故修正：急停距离必须严格大于 /scan 的 range_min（0.8m），
+            # 否则"障碍越近越看不见→越近越安全"，碰撞闸形同虚设（旧值 stop 0.5 <
+            # range_min 0.8：急停在数学上不可达，日志里最近障碍恒为 0.800m 地板值）。
+            # 旧值之所以被压到 0.5，是因为径向+扇区判据把平行侧墙误报成急停；
+            # 现改由走廊矩形（corridor_half_width）判据消除侧墙误报，阈值可回到安全值。
+            'stop_dist': 1.0,           # 行进走廊净空 < 1.0m 零速（> range_min 0.8 + 余量）
+            'slow_dist': 1.8,           # 净空 < 1.8m 线性限速
             'sector_half_deg': 60.0,    # 检测扇区半角（°）
+            # V0.0.91 走廊几何：只判车前方 [车体前缘, stop/slow] × |y| ≤ 0.45 的矩形区，
+            # 平行侧墙（|y|≈0.5）不再误急停；自车包络内回波按 footprint 丢弃，
+            # 不再依赖上游 range_min 粗截断（文档 9.3 footprint 0.45/-0.37/±0.32）
+            'corridor_half_width': 0.45,
+            'footprint_front': 0.45,
+            'footprint_rear': 0.37,
+            'footprint_half_width': 0.32,
+            'self_margin': 0.12,
             'scan_timeout': 0.5,        # /scan 断流 fail-safe（s）
             'cmd_timeout': 0.5,         # 上游指令断流看门狗（s）
             'enable_test_mode': False,  # 测试模式运行时经 /safety/test_mode 开关
             # V0.0.89 窄小测试场地低速档：测试模式限速抬到 0.3m/s（原 0.1 “基本不动”），
-            # 碰撞阈值适配场地尺度（急停 0.5/减速 1.0），并容忍起步期瞬时 ABORT/断流：
+            # 碰撞阈值适配场地尺度（急停 1.0/减速 1.8，V0.0.91 与 range_min 对齐），
+            # 并容忍起步期瞬时 ABORT/断流：
             'test_max_linear_vel': 0.3,
-            'test_stop_dist': 0.5,
-            'test_slow_dist': 1.0,
+            'test_stop_dist': 1.0,
+            'test_slow_dist': 1.8,
             'plan_fail_timeout': 10.0,        # > 非运动恢复 Wait 总时长，避免清图/等待期误判断流
             'test_max_goal_aborts': 3,        # 连续 ABORTED 达 3 次才锁存中止（EXECUTING 会清零）
             # V0.0.87 地图边界监护（/map + /amcl_pose；建图模式无源自动不介入）
@@ -242,10 +256,14 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'angle_max': 3.14159,
             'angle_increment': 0.008726646,     # 0.5°/束 → 720 束
             'scan_time': 0.1,                   # /lidar_points 10Hz
-            'range_min': 0.8,                   # V0.0.89 测试场地：抬到车身最大外接半径
-                                            # （footprint 0.45/-0.37/±0.32 → ≈0.55m）之上，
-                                            # 滤除车顶雷达看到自身/支架的近距反射——旧值 0.5
-                                            # 会让 safety_guard 常年看到 ~0.6m 假障碍而急停
+            'range_min': 0.8,                   # ⚠ V0.0.91 与 safety_guard stop_dist 强耦合：
+                                            # 小于本值的回波在投影阶段就被丢弃，车前形成
+                                            # 0.8m 盲区，故 stop_dist 必须 > 本值（safety_guard
+                                            # 运行时会校验并强制抬升，但正解是保持两者一致）。
+                                            # 车身自反射不再靠抬大本值解决，改由 safety_guard
+                                            # 的 footprint 包络盒过滤（costmap 侧由
+                                            # amcl.laser_min_range 与本值对齐保持不受污染）。
+                                            # 旧值 0.5 会让 safety_guard 常年看到 ~0.6m 假障碍而急停
             'range_max': 50.0,
             'use_inf': True,
             'use_sim_time': use_sim_time == 'true',

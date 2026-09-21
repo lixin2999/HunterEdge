@@ -78,6 +78,13 @@ public:
     declare_parameter<double>("stop_dist", 0.6);           // 碰撞急停距离（m）
     declare_parameter<double>("slow_dist", 1.2);           // 减速预警距离（m）
     declare_parameter<double>("sector_half_deg", 60.0);    // 行进方向检测扇区半角（°）
+    // V0.0.91 走廊几何判定：碰撞闸由"扇区内最小径向距离"改为"前方矩形走廊内
+    // 最小纵向净空"，并用自车包络盒过滤自身反射（替代上游 range_min 粗截断）
+    declare_parameter<double>("corridor_half_width", 0.45);  // 安全走廊半宽（m）
+    declare_parameter<double>("footprint_front", 0.45);      // 车体前缘 x（文档 9.3）
+    declare_parameter<double>("footprint_rear", 0.37);       // 车体后缘 x
+    declare_parameter<double>("footprint_half_width", 0.32); // 车体半宽
+    declare_parameter<double>("self_margin", 0.12);          // 自车包络外扩余量（m）
     declare_parameter<double>("scan_timeout", 0.5);        // /scan 超时（s）
     declare_parameter<double>("cmd_timeout", 0.5);         // 上游指令超时（s）
     declare_parameter<double>("control_rate", 20.0);       // 主循环频率（Hz）
@@ -107,6 +114,11 @@ public:
     stop_dist_ = get_parameter("stop_dist").as_double();
     slow_dist_ = get_parameter("slow_dist").as_double();
     sector_half_rad_ = get_parameter("sector_half_deg").as_double() * M_PI / 180.0;
+    corridor_half_width_ = get_parameter("corridor_half_width").as_double();
+    footprint_front_ = get_parameter("footprint_front").as_double();
+    footprint_rear_ = get_parameter("footprint_rear").as_double();
+    footprint_half_width_ = get_parameter("footprint_half_width").as_double();
+    self_margin_ = get_parameter("self_margin").as_double();
     scan_timeout_ = get_parameter("scan_timeout").as_double();
     cmd_timeout_ = get_parameter("cmd_timeout").as_double();
     control_rate_ = get_parameter("control_rate").as_double();
@@ -141,6 +153,15 @@ public:
       RCLCPP_WARN(get_logger(),
         "test_stop_dist ≥ test_slow_dist，修正 test_slow_dist=test_stop+0.5");
       test_slow_dist_ = test_stop_dist_ + 0.5;
+    }
+    // V0.0.91 走廊必须严于自车包络，否则自身反射会被当成"前方障碍"常年急停；
+    // 二者矛盾时以包络为准放宽走廊（宁可漏报由 costmap 层兜底，不可误报到不能走）
+    if (corridor_half_width_ <= footprint_half_width_ + self_margin_) {
+      RCLCPP_WARN(get_logger(),
+        "corridor_half_width=%.2f ≤ 车体半宽+余量 %.2f，走廊会看到自身反射，已放宽到 %.2f",
+        corridor_half_width_, footprint_half_width_ + self_margin_,
+        footprint_half_width_ + self_margin_ + 0.05);
+      corridor_half_width_ = footprint_half_width_ + self_margin_ + 0.05;
     }
     if (!enable_map_fence_) {
       RCLCPP_WARN(get_logger(),
@@ -254,11 +275,13 @@ public:
 
     RCLCPP_INFO(get_logger(),
       "safety_guard 启动：v_max=%.2fm/s, R_min=%.2fm（|w|≤|v|/R_min）, "
-      "stop=%.2fm, slow=%.2fm, 扇区±%.0f°, scan超时%.2fs；"
+      "stop=%.2fm, slow=%.2fm, 走廊±%.2fm（车体包络 %.2f/%.2f/%.2f+m%.2f）, "
+      "扇区±%.0f°, scan超时%.2fs；"
       "测试模式=%s（限速%.2fm/s, 急停%.1fm, 减速%.1fm, 卡死判定%.1fs, 断流判定%.1fs）；"
       "地图边界监护=%s（停车%.2fm, 减速%.2fm，/map+/amcl_pose 就绪后生效）",
       max_linear_vel_, min_turn_radius_, stop_dist_, slow_dist_,
-      sector_half_rad_ * 180.0 / M_PI, scan_timeout_,
+      corridor_half_width_, footprint_front_, footprint_rear_, footprint_half_width_,
+      self_margin_, sector_half_rad_ * 180.0 / M_PI, scan_timeout_,
       test_mode_ ? "ON" : "OFF",
       test_max_linear_vel_, test_stop_dist_, test_slow_dist_,
       stall_timeout_, plan_fail_timeout_,
@@ -288,40 +311,64 @@ private:
     return "UNKNOWN";
   }
 
-  // 行进方向扇区内的最近有效距离（m）；无有效回波返回 +inf，超时返回 -1.0
-  double nearestObstacle(bool forward, bool & scan_ok)
+  // 行进方向“安全走廊”净空（m）：把极坐标回波投影到车体系，
+  //   x = 沿行进方向的纵向净空（正=前方），y = 横向偏移
+  // 判定域为矩形走廊 [车体边缘, +∞) × |y| ≤ corridor_half_width，而非原来的
+  // “扇区内最小径向距离 r”。两个关键差异（V0.0.91 撞墙事故直接相关）：
+  //   ① 用纵向净空 x 而非斜距 r：斜 45° 的墙角 r=0.70 → x=0.50，旧逻辑按 0.70
+  //     处理会漏判（实际纵向只剩 0.5m 已不够制动）；
+  //   ② 用横向走廊限制而非扇区半角：平行侧墙（|y|≈0.5）不再常年触发急停，
+  //     窄场地里“因为怕误停而把阈值调得过小”的恶性循环得以解除。
+  // 自车包络（footprint + self_margin 外扩）内的回波直接丢弃，取代上游
+  //   pointcloud_to_laserscan 用大 range_min 粗截断的做法——后者会在车前
+  //   造出“越近越安全”的盲区（本次撞墙根因：range_min 0.8 > stop_dist 0.5）。
+  // 返回 false 表示 /scan 缺失或超时；无有效障碍时 d_clear = +inf。
+  bool corridorClearance(bool forward, double & d_clear, double & y_at)
   {
     std::lock_guard<std::mutex> lk(data_mutex_);
-    scan_ok = false;
-    if (!scan_received_) {
-      return -1.0;
+    d_clear = std::numeric_limits<double>::infinity();
+    y_at = 0.0;
+    if (!scan_received_ || (now() - last_scan_time_).seconds() > scan_timeout_) {
+      return false;
     }
-    if ((now() - last_scan_time_).seconds() > scan_timeout_) {
-      return -1.0;
-    }
-    scan_ok = true;
 
     const auto & scan = last_scan_;
     // 行进方向中心角：前进 0（x 前），倒车 π
     const double center = forward ? 0.0 : M_PI;
-    double nearest = std::numeric_limits<double>::infinity();
+    // 自车包络过滤线：沿行进方向的车体边缘 + 余量，及横向半宽 + 余量
+    const double self_x = (forward ? footprint_front_ : footprint_rear_) + self_margin_;
+    const double self_y = footprint_half_width_ + self_margin_;
 
     double angle = static_cast<double>(scan.angle_min);
     for (const float r : scan.ranges) {
       // 归一化角度差到 [-π, π]
-      const double diff =
-        std::fabs(std::remainder(angle - center, 2.0 * M_PI));
-      if (diff <= sector_half_rad_ && std::isfinite(r) &&
-        r >= static_cast<double>(scan.range_min) &&
-        r <= static_cast<double>(scan.range_max))
-      {
-        nearest = std::min(nearest, static_cast<double>(r));
-      }
+      const double rel = std::remainder(angle - center, 2.0 * M_PI);
       angle += static_cast<double>(scan.angle_increment);
+      if (std::fabs(rel) > sector_half_rad_) {
+        continue;                        // 扇区外（含侧后方）不参与行进方向判定
+      }
+      if (!std::isfinite(r) ||
+        r < static_cast<double>(scan.range_min) ||
+        r > static_cast<double>(scan.range_max))
+      {
+        continue;                        // inf/无效回波（use_inf=true 下无障碍）
+      }
+      const double x = static_cast<double>(r) * std::cos(rel);
+      const double y = static_cast<double>(r) * std::sin(rel);
+      if (x <= 0.0 || std::fabs(y) > corridor_half_width_) {
+        continue;                        // 走廊外：不构成行进方向威胁
+      }
+      if (x <= self_x && std::fabs(y) <= self_y) {
+        continue;                        // 自车包络内：车身/支架自身反射
+      }
+      if (x < d_clear) {
+        d_clear = x;
+        y_at = y;
+      }
     }
-    return nearest;
-    // 扇区内全为 inf/无效回波 → infinity：视为无障碍。车前 60° 全无回波
-    // 属异常场景，由 costmap 的 scan 清障层与 health_monitor 兜底。
+    return true;
+    // 走廊内全为 inf/无效回波 → +inf：视为无障碍。车前扇区全无回波属异常场景，
+    // 由 SCAN_TIMEOUT 看门狗、costmap 的 scan 清障层与 health_monitor 兜底。
   }
 
   void publishCmd(double v, double w)
@@ -390,8 +437,14 @@ private:
     }
 
     // 2. 感知 fail-safe：/scan 缺失或超时 → 零速（宁可停车不盲走）
+    //    V0.0.91：此处只查新鲜度，净空测量在第 4 步按实际行进方向算一次
+    //    （旧实现先按“前进”扫一遍取 scan_ok，倒车时白算且方向可能与指令相反）
     bool scan_ok = false;
-    const double d = nearestObstacle(true, scan_ok);
+    {
+      std::lock_guard<std::mutex> lk(data_mutex_);
+      scan_ok = scan_received_ &&
+        (now_t - last_scan_time_).seconds() <= scan_timeout_;
+    }
     if (!scan_ok) {
       publishCmd(0.0, 0.0);
       transition(State::SCAN_TIMEOUT,
@@ -418,31 +471,65 @@ private:
       w_in = last_cmd_.angular.z;
     }
     const bool forward = v_in >= 0.0;
-    const double dist = forward ? d : nearestObstacle(false, scan_ok);
+    double dist = 0.0;
+    double y_lat = 0.0;
+    if (!corridorClearance(forward, dist, y_lat)) {
+      // 指令快照与取数之间存在并发窗口，期间 /scan 刚好断流 → 同样 fail-safe
+      publishCmd(0.0, 0.0);
+      transition(State::SCAN_TIMEOUT, "/scan 在指令快照期间超时，fail-safe 停车");
+      return;
+    }
 
     // 4.5 V0.0.86 测试模式生效参数：0.1m/s 限速 + 更严碰撞阈值
     const double v_lim = test_active ? test_max_linear_vel_ : max_linear_vel_;
-    const double stop_d = test_active ? test_stop_dist_ : stop_dist_;
-    const double slow_d = test_active ? test_slow_dist_ : slow_dist_;
+    double stop_d = test_active ? test_stop_dist_ : stop_dist_;
+    double slow_d = test_active ? test_slow_dist_ : slow_dist_;
     const char * test_tag = test_active ? "【测试模式】" : "";
 
+    // 4.6 V0.0.91 盲区一致性强制：/scan 小于 range_min 的回波在上游投影阶段
+    //   已被丢弃，若急停阈值 ≤ range_min，“急停”在数学上不可达——本次撞墙
+    //   事故的确切机制（range_min=0.8 而 stop_dist=0.5）：碰撞闸全程未触发，
+    //   日志最近障碍恒为 0.800m 地板值，障碍再靠近就从 /scan 消失→回到 OK
+    //   全速放行，直到撞上。这里按 range_min 强制抬升有效急停距离并一次性告警，
+    //   使参数矛盾不可能再“静默失效”。
+    {
+      std::lock_guard<std::mutex> lk(data_mutex_);
+      const double blind_floor = static_cast<double>(last_scan_.range_min) + 0.15;
+      if (stop_d <= blind_floor) {
+        if (!blind_zone_warned_) {
+          blind_zone_warned_ = true;
+          RCLCPP_ERROR(get_logger(),
+            "急停距离 %.2fm ≤ /scan range_min %.2fm + 0.15m 余量：碰撞闸存在盲区，"
+            "已按 %.2fm 强制抬升。请修正 launch 参数（stop_dist 必须大于 range_min）",
+            stop_d, static_cast<double>(last_scan_.range_min), blind_floor);
+        }
+        stop_d = blind_floor;
+        if (slow_d <= stop_d) {
+          slow_d = stop_d + 0.5;
+        }
+      }
+    }
+
     // 5. 碰撞闸分级：急停 → 线性限速 → 放行
+    //    dist 为走廊内最小纵向净空（x），非斜距，与制动距离同一量纲
     double v_allow = v_lim;
     std::string detail = std::string("正常放行") + test_tag;
     State next = State::OK;
     if (dist < stop_d) {
       publishCmd(0.0, 0.0);
       transition(State::COLLISION_STOP,
-        "行进方向最近障碍 " + std::to_string(dist).substr(0, 5) +
-        "m < 急停距离 " + std::to_string(stop_d).substr(0, 4) + "m" + test_tag);
+        "行进方向走廊净空 " + std::to_string(dist).substr(0, 5) +
+        "m（侧偏 " + std::to_string(y_lat).substr(0, 5) + "m）< 急停距离 " +
+        std::to_string(stop_d).substr(0, 4) + "m" + test_tag);
       return;
     }
     if (dist < slow_d) {
       v_allow = v_lim * (dist - stop_d) / (slow_d - stop_d);
       v_allow = std::max(v_allow, 0.0);
       next = State::SLOWDOWN;
-      detail = "行进方向最近障碍 " + std::to_string(dist).substr(0, 5) +
-        "m，限速 " + std::to_string(v_allow).substr(0, 5) + "m/s" + test_tag;
+      detail = "行进方向走廊净空 " + std::to_string(dist).substr(0, 5) +
+        "m（侧偏 " + std::to_string(y_lat).substr(0, 5) + "m），限速 " +
+        std::to_string(v_allow).substr(0, 5) + "m/s" + test_tag;
     }
 
     // 5.5 V0.0.87 地图边界监护：行驶范围不得超出已采集（已建图）地图区域。
@@ -717,6 +804,13 @@ private:
   double stop_dist_{0.6};
   double slow_dist_{1.2};
   double sector_half_rad_{M_PI / 3.0};
+  // V0.0.91 走廊几何与自车包络过滤
+  double corridor_half_width_{0.45};
+  double footprint_front_{0.45};
+  double footprint_rear_{0.37};
+  double footprint_half_width_{0.32};
+  double self_margin_{0.12};
+  bool blind_zone_warned_{false};   // 盲区参数矛盾仅告警一次
   double scan_timeout_{0.5};
   double cmd_timeout_{0.5};
   double control_rate_{20.0};

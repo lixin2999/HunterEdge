@@ -11,6 +11,8 @@
 //   NAVIGATING ──[goal失败]────────▶ NAVIGATING（重试/跳过）或 IDLE
 //   OBSTACLE_AVOID ──[路清]────────▶ NAVIGATING（恢复）
 //   OBSTACLE_AVOID ──[超时/极近]───▶ ESTOP
+//   NAVIGATING ──[连续失败达上限]──▶ FAULT（V0.0.91：锁存停驻，不再静默重发）
+//   FAULT ──[模式离开 AUTO]────────▶ IDLE（人工确认后重新进入）
 //   任意状态 ──[非AUTO/急停]────────▶ IDLE 或 ESTOP
 
 #include "auto_mission/auto_mission_node.hpp"
@@ -74,6 +76,14 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
   // goal（日志"goal 被服务端拒绝"），发送前必须经 GetState 确认节点已 ACTIVE。
   nav_state_client_ = create_client<lifecycle_msgs::srv::GetState>(
     "/bt_navigator/get_state");
+
+  // ---- 代价地图清除服务（V0.0.91）----
+  // 遥控接管后重新自主的标配动作：接管期车辆会压过此前被标记的栅格，
+  // 叠加定位跳变在地图上留下的假障碍，不清一次就大概率“起点在致命栅格”。
+  clear_global_costmap_srv_ = create_client<std_srvs::srv::Empty>(
+    "/global_costmap/clear_entirely_global_costmap");
+  clear_local_costmap_srv_ = create_client<std_srvs::srv::Empty>(
+    "/local_costmap/clear_entirely_local_costmap");
 
   // ---- 建图模式自动巡航设施 ----
   // /cmd_vel：mapping 模式下 Nav2 全栈未启动，无竞争发布者；
@@ -698,7 +708,11 @@ void AutoMissionNode::mainLoop()
 
   // ---------- health 检查 ----------
   if (health.overall_status == "CRITICAL") {
-    if (state_ != MissionState::IDLE && state_ != MissionState::ESTOP) {
+    // FAULT 不因 health 恢复而被默默清除（V0.0.91）：故障锁存只能由
+    // “模式开关离开 AUTO 再回来”人工确认解除
+    if (state_ != MissionState::IDLE && state_ != MissionState::ESTOP &&
+      state_ != MissionState::FAULT)
+    {
       RCLCPP_ERROR(get_logger(),
         "[降级] SystemHealth=CRITICAL，停止导航，安全停车");
       cancelCurrentGoal();
@@ -747,6 +761,7 @@ void AutoMissionNode::mainLoop()
         RCLCPP_INFO(get_logger(), "[IDLE→NAVIGATING] AUTO 条件满足，定位已收敛，开始导航");
         current_wp_idx_ = 0;
         wp_fail_count_ = 0;
+        clearCostmapsOnStart();
         state_ = MissionState::NAVIGATING;
         sendNextWaypoint();
       }
@@ -769,6 +784,7 @@ void AutoMissionNode::mainLoop()
         current_wp_idx_ = 0;
         wp_fail_count_ = 0;
         localize_wait_started_ = false;
+        clearCostmapsOnStart();
         sendNextWaypoint();
         break;
       }
@@ -828,9 +844,7 @@ void AutoMissionNode::mainLoop()
           cancelCurrentGoal();
           wp_fail_count_++;
           if (wp_fail_count_ >= max_wp_failures_) {
-            RCLCPP_ERROR(get_logger(),
-              "[NAVIGATING] 连续失败 %d 次，停止巡航，进入 IDLE", max_wp_failures_);
-            state_ = MissionState::IDLE;
+            enterFault("单航点导航超时连续达上限");
           } else {
             current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
             sendNextWaypoint();
@@ -936,6 +950,20 @@ void AutoMissionNode::mainLoop()
           estop_snap ? "true" : "false",
           isAutoConditionMet() ? "满足" : "未满足");
       }
+      break;
+    }
+
+    // ------------------------------------------------------------------
+    case MissionState::FAULT:
+    // ------------------------------------------------------------------
+    {
+      // 故障锁存：停车、不重发 goal（非 AUTO 降级分支已在主循环上方将其重置为
+      // IDLE，能走到这里说明 AUTO 仍持有，即等待人工处置）
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "[FAULT] 任务已锁存（%s）：请检查 ①车身四周/脚底是否被假障碍占位（遥控移开后用 "
+        "rviz2 2D Pose Estimate 重定位）②定位是否跳变（map→odom）③航点是否可达；"
+        "处置后将模式开关离开 AUTO 再切回以重启任务",
+        fault_reason_.empty() ? "未记录原因" : fault_reason_.c_str());
       break;
     }
 
@@ -1261,6 +1289,58 @@ void AutoMissionNode::triggerEstop(const std::string & reason)
 }
 
 // ==========================================================================
+// 任务故障锁存（V0.0.91）
+//
+// 现场教训（问题②“遥控接管后重新自主，车停在原地不动”）：旧实现达失败上限时
+// 回到 IDLE，而 IDLE 分支下一拍就发现“AUTO 条件仍满足”→ 重置计数并重新
+// 从航点[0] 发送同一批不可规划的目标，形成 IDLE⇄NAVIGATING 静默抖动：
+//   • 车辆永不移动，也无任何对外故障上报，旁人无法从日志判断“已放弃”；
+//   • 行为树（V0.0.89 起）恢复池仅剩“清图 + Wait”非运动手段，帮不了
+//     “起点在致命栅格”——这种需要重定位/人工移车的死局。
+// 因此改为锁存到 FAULT：不再发 goal、不再重置计数，持续输出带处置指引的告警，
+// 需模式开关离开 AUTO（本节点主循环上方的降级分支会清回 IDLE）才能重启任务。
+// 注：不发 /estop——车已停且非危险场景，保持急停通道语义纯净。
+// ==========================================================================
+void AutoMissionNode::enterFault(const std::string & reason)
+{
+  fault_reason_ = reason;
+  RCLCPP_ERROR(get_logger(),
+    "[FAULT] 连续失败 %d/%d 次达上限（%s），停止巡航并锁存。"
+    "高频成因：起点位于致命栅格/定位跳变/假障碍累积——清图+等待无法自救，"
+    "需人工移车并用 rviz2 2D Pose Estimate 重定位，然后将模式开关离开 AUTO 再切回",
+    wp_fail_count_, max_wp_failures_, reason.c_str());
+  cancelCurrentGoal();
+  wp_fail_count_ = 0;   // 计数归零，但锁存不因此解除（靠状态而非计数拦截重发）
+  state_ = MissionState::FAULT;
+}
+
+// ==========================================================================
+// 任务（重）启动时主动清除两张代价地图（V0.0.91）
+//
+// 背景：接管后重新自主时，global/local costmap 里往往残留接管期间累积的
+//   假障碍（旧配置下 lidar_cloud 源 clearing:false 只增不减；观测时基错位
+//   使 raytrace 被跳过），起点直接落在致命栅格 → Smac 返
+//   "Starting point in lethal space"，1Hz 重规划全失败。行为树的清图只在
+//   规划失败后触发，本函数将其前置到“起步前”，两者配合才能避免死循环。
+// 异步 fire-and-forget：不阻塞 10Hz 主循环；服务未就绪（Nav2 未激活）仅告警。
+// ==========================================================================
+void AutoMissionNode::clearCostmapsOnStart()
+{
+  const auto try_clear =
+    [this](const rclcpp::Client<std_srvs::srv::Empty>::SharedPtr & cli, const char * name) {
+      if (!cli->service_is_ready()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+          "[清图] %s 未就绪，跳过（Nav2 未激活？）", name);
+        return;
+      }
+      cli->async_send_request(std::make_shared<std_srvs::srv::Empty::Request>());
+      RCLCPP_INFO(get_logger(), "[清图] 已请求清除 %s", name);
+    };
+  try_clear(clear_global_costmap_srv_, "global_costmap/clear_entirely_global_costmap");
+  try_clear(clear_local_costmap_srv_, "local_costmap/clear_entirely_local_costmap");
+}
+
+// ==========================================================================
 // 自触发急停解除检查（仅障碍物类自触发急停；外部急停由发布方负责解除）
 // 危险解除判据：前向扇区最近障碍物退至减速阈值（warn_obstacle_dist_）之外。
 // 返回 true 表示本次调用完成了解除动作（已发布 /estop=false 并清理标志）。
@@ -1303,9 +1383,7 @@ void AutoMissionNode::goalResponseCallback(
       "[Nav2] goal 被服务端拒绝（fail_count=%d/%d），%.0fs 后重试",
       wp_fail_count_, max_wp_failures_, nav_retry_backoff_);
     if (wp_fail_count_ >= max_wp_failures_) {
-      RCLCPP_ERROR(get_logger(),
-        "[Nav2] goal 连续被拒 %d 次达上限，回到 IDLE", max_wp_failures_);
-      state_ = MissionState::IDLE;
+      enterFault("goal 连续被 bt_navigator 拒收");
     }
   } else {
     goal_handle_ = handle;
@@ -1379,9 +1457,7 @@ void AutoMissionNode::resultCallback(
     nav_retry_not_before_ = this->now() + rclcpp::Duration::from_seconds(nav_retry_backoff_);
 
     if (wp_fail_count_ >= max_wp_failures_) {
-      RCLCPP_ERROR(get_logger(),
-        "[Nav2] 连续失败 %d 次达到上限，停止巡航，进入 IDLE", max_wp_failures_);
-      state_ = MissionState::IDLE;
+      enterFault("航点导航连续 ABORTED/CANCELED 达上限");
       return;
     }
     // 跳过当前航点，继续下一个
@@ -1420,6 +1496,7 @@ std::string AutoMissionNode::stateToString(MissionState s)
     case MissionState::NAVIGATING:      return "NAVIGATING";
     case MissionState::OBSTACLE_AVOID:  return "OBSTACLE_AVOID";
     case MissionState::ESTOP:           return "ESTOP";
+    case MissionState::FAULT:           return "FAULT";
     default:                            return "UNKNOWN";
   }
 }

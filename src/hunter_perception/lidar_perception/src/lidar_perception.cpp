@@ -234,14 +234,37 @@ void LidarPerception::transformToBaseLink(
     return;
   }
   try {
+    // V0.0.91 时基一致性修复（现场问题②“接管后原地不动”的直接成因）：
+    //   本函数把点云变换到 target_frame_，而输出 header 仍沿用输入消息的 stamp
+    //   （见 cloudCallback 第 9 步）。若这里按 TimePointZero（=最新 TF）变换，
+    //   点云几何属于“now”而时间戳属于“stamp”，Nav2 costmap 按 stamp 反查
+    //   sensor origin 时拿到的是旧位姿，原点与窗口中心恒偏 (now-stamp)×v
+    //   （实车日志 local_costmap 反复报 `Sensor origin ... is out of map bounds`，
+    //   偏移达 6m）→ raytrace 清障整体被跳过 → 假障碍只增不减，遥控接管后
+    //   起点落在致命栅格，所有航点报 `Starting point in lethal space`。
+    //   故必须按消息时间戳变换；仅在该时刻 TF 不可用时降级取最新 TF 并告警。
+    const tf2::TimePoint stamp_tp{std::chrono::nanoseconds(
+        static_cast<int64_t>(rclcpp::Time(in->header.stamp).nanoseconds()))};
     const auto tf = tf_buffer_->lookupTransform(
-      target_frame_, in->header.frame_id, tf2::TimePointZero, tf2::durationFromSec(0.1));
+      target_frame_, in->header.frame_id, stamp_tp, tf2::durationFromSec(0.05));
     pcl_ros::transformPointCloud(*in, *out, tf);
   } catch (const tf2::TransformException & e) {
-    // TF 不可用，降级：保留原坐标系
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 5000, "TF 变换失败（%s），保留原始坐标系", e.what());
-    *out = *in;
+    try {
+      const auto tf_latest = tf_buffer_->lookupTransform(
+        target_frame_, in->header.frame_id, tf2::TimePointZero,
+        tf2::durationFromSec(0.1));
+      pcl_ros::transformPointCloud(*in, *out, tf_latest);
+      // 降级会重新引入时基偏差，必须响亮告警：提示现场去查雷达/TF 时延与对时
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "按消息时间戳 TF 变换失败（%s），降级用最新 TF："
+        "代价地图 raytrace 清障可能失效（请核查 /lidar_points 时延与对时）", e.what());
+    } catch (const tf2::TransformException & e2) {
+      // TF 不可用，降级：保留原坐标系
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000, "TF 变换失败（%s），保留原始坐标系", e2.what());
+      *out = *in;
+    }
   }
 }
 
