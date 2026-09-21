@@ -413,6 +413,9 @@ hunter_full.launch.py (use_autonomous_nav:=true)
     │   ├── fast_lio2_param_injector  ← 自动注入 pcd_save_en=true + 路径
     │   ├── auto_mission_node         ← 状态机（MAPPING 状态，不下发 goal）
     │   ├── pcd_to_map                ← 建图结束自动 PCD→PGM+YAML 转换
+    │   │                               （V0.0.88：Ctrl+C 退出时派生独立会话后台
+    │   │                                进程兜底，等 FAST-LIO2 把 PCD 写完整后转换，
+    │   │                                日志 maps/pcd_to_map_final.log）
     │   └── waypoint_recorder         ← /clicked_point 自动写入航点 yaml
     └── [nav 模式]
         ├── fast_lio2_param_injector  ← 自动注入 pcd_save_en=false
@@ -465,7 +468,7 @@ NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
 | 节点 | 可执行文件 | 解决的手动操作 |
 |------|-----------|---------------|
 | `fast_lio2_param_injector` | 同名 | 自动向 `fast_lio2` 注入 `pcd_save_en` + `map_file_path` |
-| `pcd_to_map` | 同名 | 建图结束自动将 PCD 三维点云转换为 Nav2 栅格地图（.pgm + .yaml） |
+| `pcd_to_map` | 同名 | 建图结束自动将 PCD 三维点云转换为 Nav2 栅格地图（.pgm + .yaml）；V0.0.88 起 Ctrl+C 退出时另派生**独立会话**后台转换进程兜底（等 FAST-LIO2 写完 PCD 后转换，日志 `maps/pcd_to_map_final.log`），并支持 `--finalize` 离线转换（无需 ROS） |
 | `waypoint_recorder` | 同名 | 建图时 rviz2 点击即自动追加写入 `autonomous_nav_params.yaml` |
 
 ### 10.6 扩展行为树
@@ -723,6 +726,7 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | sensor_fusion 报 `TF unconnected trees` | 相机 frame 双父（驱动 TF + URDF 并存，TF 树分裂） | 确认 `hunter_full.launch.py` 相机驱动为 `publish_tf: 'false'`；`ros2 run tf2_ros tf2_echo base_link camera_color_optical_frame` 验证外参；必要时 `tf2_tools view_frames` 看全树 |
 | 启动时一次性 `彩色图像超时 x.x s` | 启动竞态（视觉节点激活早于彩色流就绪） | 仅出现一次属良性，可忽略；反复出现才按"相机无图像"排查 |
 | 一次性 `[TensorRT] Using an engine plan file across different models of devices` | `.engine` 非本机/本设备型号生成（换机或文件被旧引擎覆盖） | 不阻塞运行（话题 15Hz 正常）；目标机重生成：`trtexec --onnx=<绝对路径>/yolov8s.onnx --saveEngine=/data/models/yolov8s.engine --fp16` 后重启视觉节点 |
+| Ctrl+C 后 `maps/` 只有 `.pcd`，`.pgm/.yaml` 未生成（V0.0.88 前必现） | FAST-LIO2 在 `main()` 于 `spin` 返回**后**才写 PCD（20.7M 点 ≈ 664MB 需数秒至数十秒），而 Ctrl+C 同时终止 `pcd_to_map`，运行期 `MAPPING→非MAPPING` 跳变不会发生 → 原自动转换从不启动 | V0.0.88 起 `pcd_to_map` 退出时派生独立会话后台转换进程兜底：`tail -f maps/pcd_to_map_final.log`（应见 `PCD 已写完整 → 转换成功`），数十秒内 `ls -lh maps/` 应齐 `.pcd/.pgm/.yaml`；仍缺时手动兜底 `python3 ~/HunterEdge/install/auto_mission/lib/auto_mission/pcd_to_map --finalize --pcd-file ~/HunterEdge/maps/hunter_map.pcd --force` |
 
 ---
 

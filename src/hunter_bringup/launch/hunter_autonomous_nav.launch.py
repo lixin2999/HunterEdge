@@ -8,10 +8,13 @@
             + waypoint_recorder 节点（订阅 /clicked_point，自动写入 yaml）
       操作：人工遥控（REMOTE 模式）驾驶遍历全部目标区域；rviz2 用 Publish Point
             （快捷键 P）点击记录巡检航点（User_Manual §4.4）。
-      结束：在启动终端按 Ctrl+C → fast_lio2 退出时才把全部点云写入
-            map_file_path（PCD 仅在节点退出瞬间写盘，运行中文件不存在属正常）；
-            pcd_to_map 检测 /auto_mission/status MAPPING→非MAPPING 跳变后
-            自动触发转换，无需手动执行任何命令。
+      结束：在启动终端按 Ctrl+C → fast_lio2 在退出瞬间（rclcpp::spin 返回后）
+            才把全部点云写入 map_file_path（实测 20.7M 点 ≈ 664MB 需数秒至
+            数十秒，运行中文件不存在属正常）；
+            Ctrl+C 会同时终止 auto_mission/pcd_to_map，运行期 MAPPING→非MAPPING
+            跳变不会发生——因此 pcd_to_map 在退出时派生一个独立会话
+            （setsid）的后台转换进程，等 PCD 写完整后自动生成 .pgm + .yaml
+            （进度：tail -f maps/pcd_to_map_final.log；产物：ls -lh maps/）。
       也可不退出节点，手动保存当前快照：
             ros2 service call /fast_lio2/map_save std_srvs/srv/Trigger
 
@@ -342,6 +345,7 @@ def _mapping_nodes(context, *args, **kwargs):
     map_name         = Path(map_file_path).stem      # 去掉 .pcd 后缀作为地图名
     use_sim_time     = LaunchConfiguration('use_sim_time').perform(context)
     params_file_path = LaunchConfiguration('params_file_path').perform(context)
+    final_wait       = LaunchConfiguration('final_convert_wait_timeout').perform(context)
 
     # ------------------------------------------------------------------
     # 1. 向 fast_lio2 节点设置 pcd_save 参数
@@ -402,6 +406,14 @@ def _mapping_nodes(context, *args, **kwargs):
             'auto_reload_map':        False,   # 建图模式下 map_server 未启动，禁用重载
             'trigger_on_mapping_end': True,
             'convert_on_start_if_missing': False,  # 建图开始时无图可转，禁用启动自愈
+            # ---- 退出兜底转换（V0.0.88）----
+            # Ctrl+C 时 auto_mission/pcd_to_map 与 fast_lio2 同时被 SIGINT 终止，
+            # 运行期 MAPPING→非MAPPING 跳变不会发生 → 原自动转换从不启动；
+            # 由本节点在退出路径派生独立会话的后台转换进程，等 FAST-LIO2 把
+            # PCD 写完整后生成 .pgm/.yaml（日志 maps/pcd_to_map_final.log）
+            'final_convert_on_shutdown': True,
+            'final_wait_timeout': float(final_wait),
+            'convert_wait_timeout': 60.0,   # 运行期触发（map_save 后）等待写盘上限
             'use_sim_time':           use_sim_time == 'true',
         }],
     )
@@ -469,6 +481,14 @@ def generate_launch_description():
         description='[mapping 模式] waypoint_recorder 写入的 autonomous_nav_params.yaml 路径',
     )
 
+    # 建图模式退出兜底转换：等待 FAST-LIO2 写完 PCD 的最长时间（s）。
+    # 大图（20.7M 点 ≈ 664MB）写盘需数秒~数十秒，eMMC/机械盘可按需调大
+    declare_final_wait = DeclareLaunchArgument(
+        'final_convert_wait_timeout',
+        default_value='120.0',
+        description='[mapping 模式] 退出兜底转换等待 FAST-LIO2 写完 PCD 的最长时间（s）',
+    )
+
     # 仿真时钟
     declare_use_sim_time = DeclareLaunchArgument(
         'use_sim_time',
@@ -523,6 +543,7 @@ def generate_launch_description():
         declare_map_yaml,
         declare_map_file,
         declare_params_file_path,
+        declare_final_wait,
         declare_use_sim_time,
         declare_autostart,
         declare_use_amcl,
