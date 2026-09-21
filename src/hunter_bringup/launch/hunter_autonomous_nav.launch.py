@@ -9,12 +9,16 @@
       操作：人工遥控（REMOTE 模式）驾驶遍历全部目标区域；rviz2 用 Publish Point
             （快捷键 P）点击记录巡检航点（User_Manual §4.4）。
       结束：在启动终端按 Ctrl+C → fast_lio2 在退出瞬间（rclcpp::spin 返回后）
-            才把全部点云写入 map_file_path（实测 20.7M 点 ≈ 664MB 需数秒至
-            数十秒，运行中文件不存在属正常）；
+            才把全部点云写入 map_file_path（V0.0.90 起按 pcd_save.save_voxel_size
+            =0.1m 体素去重后累加，写盘秒级完成；localization.launch.py 已给
+            fast_lio2 配 120s 退出宽限，不会再被 SIGTERM 截断成半截 PCD；
+            运行中文件不存在属正常）；
             Ctrl+C 会同时终止 auto_mission/pcd_to_map，运行期 MAPPING→非MAPPING
             跳变不会发生——因此 pcd_to_map 在退出时派生一个独立会话
             （setsid）的后台转换进程，等 PCD 写完整后自动生成 .pgm + .yaml
-            （进度：tail -f maps/pcd_to_map_final.log；产物：ls -lh maps/）。
+            （V0.0.90：即使 PCD 截断/写盘超时，也会按已写入部分尽力转换，
+            不再直接放弃；进度：tail -f maps/pcd_to_map_final.log；
+            产物：ls -lh maps/）。
       也可不退出节点，手动保存当前快照：
             ros2 service call /fast_lio2/map_save std_srvs/srv/Trigger
 
@@ -193,17 +197,24 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         parameters=[{
             'wheelbase': 0.65,          # HunterV2Params::wheelbase（AGX_V2 实车）
             'min_turn_radius': 1.9,     # 与 Smac minimum_turning_radius 一致
-            'max_linear_vel': 0.8,      # 与 nav2_params.yaml desired_linear_vel 一致
-            'stop_dist': 0.6,           # scan 行进方向扇区急停距离（m）
-            'slow_dist': 1.2,           # scan 行进方向扇区减速距离（m）
+            'max_linear_vel': 0.5,      # V0.0.89 测试场地：与 desired_linear_vel/velocity_smoother 一致 0.5
+            'stop_dist': 0.5,           # V0.0.89 窄场地适度收紧（scan 前进方向扇区急停，原 0.6）
+            'slow_dist': 1.0,           # V0.0.89 减速预警距离（原 1.2，窄场地墙边不至于常年限速）
             'sector_half_deg': 60.0,    # 检测扇区半角（°）
             'scan_timeout': 0.5,        # /scan 断流 fail-safe（s）
             'cmd_timeout': 0.5,         # 上游指令断流看门狗（s）
-            'enable_test_mode': False,  # V0.0.86 测试模式启动默认关（运行时经 /safety/test_mode 开关）
+            'enable_test_mode': False,  # 测试模式运行时经 /safety/test_mode 开关
+            # V0.0.89 窄小测试场地低速档：测试模式限速抬到 0.3m/s（原 0.1 “基本不动”），
+            # 碰撞阈值适配场地尺度（急停 0.5/减速 1.0），并容忍起步期瞬时 ABORT/断流：
+            'test_max_linear_vel': 0.3,
+            'test_stop_dist': 0.5,
+            'test_slow_dist': 1.0,
+            'plan_fail_timeout': 10.0,        # > 非运动恢复 Wait 总时长，避免清图/等待期误判断流
+            'test_max_goal_aborts': 3,        # 连续 ABORTED 达 3 次才锁存中止（EXECUTING 会清零）
             # V0.0.87 地图边界监护（/map + /amcl_pose；建图模式无源自动不介入）
             'enable_map_fence': True,   # 行驶范围不得超出已采集地图区域（行驶中最后防线）
-            'map_edge_stop_dist': 0.5,  # 距未建图/界外栅格 <0.5m 零速（测试模式下自动中止）
-            'map_edge_slow_dist': 1.5,  # 距未建图/界外栅格 <1.5m 线性限速
+            'map_edge_stop_dist': 0.4,  # V0.0.89 窄场地略收紧（原 0.5）；距未建图/界外 <此值零速
+            'map_edge_slow_dist': 1.0,  # V0.0.89 距未建图/界外 <1.0m 线性限速（原 1.5）
             'use_sim_time': use_sim_time == 'true',
         }],
     )
@@ -231,7 +242,10 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'angle_max': 3.14159,
             'angle_increment': 0.008726646,     # 0.5°/束 → 720 束
             'scan_time': 0.1,                   # /lidar_points 10Hz
-            'range_min': 0.5,
+            'range_min': 0.8,                   # V0.0.89 测试场地：抬到车身最大外接半径
+                                            # （footprint 0.45/-0.37/±0.32 → ≈0.55m）之上，
+                                            # 滤除车顶雷达看到自身/支架的近距反射——旧值 0.5
+                                            # 会让 safety_guard 常年看到 ~0.6m 假障碍而急停
             'range_max': 50.0,
             'use_inf': True,
             'use_sim_time': use_sim_time == 'true',

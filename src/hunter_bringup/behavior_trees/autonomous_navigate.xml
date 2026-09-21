@@ -7,7 +7,10 @@
     2. 障碍物感知超时检查（TimeExpired 哨兵，感知数据停止后快速失效）
     3. （V0.0.82 移除 SpeedController：本 fork 该节点为按速度调 tick 周期的装饰器、
         无障碍物限速语义；动态减速由 RPP cost-regulation 机制承担）
-    4. 路径受阻时的后退恢复（BackUp 替代 Spin，适合阿克曼底盘前进后退）
+    4. （V0.0.89 测试场地优化）路径受阻时【取消一切倒退/原地旋转恢复】——
+       改为非运动恢复（清除代价地图 + 短暂 Wait 后重试），彻底杜绝
+       "车辆只后退不前进"。窄小场地内 BackUp 会把车倒进更差的致命栅格，
+       且倒车期间 AMCL 位姿反复跳变，实车验证弊大于利，故整体移除。
     5. GoalUpdated 响应：外部实时更新目标点时立即中断重规划
 
   BT 节点说明（全部来自 bt_navigator plugin_lib_names，无自定义插件）：
@@ -15,8 +18,7 @@
     ComputePathToPose        — SmacPlannerHybrid 全局规划
     FollowPath               — RPP 局部跟踪控制（自带近障碍降速/近终点减速）
     GoalUpdated              — 外部目标点是否已更新（条件节点）
-    BackUp                   — 直线后退恢复（阿克曼车适用，替代原 Spin）
-    Wait                     — 原地等待
+    Wait                     — 原地等待（非运动恢复，V0.0.89 起唯一恢复手段）
     ClearEntireCostmap       — 清除代价地图（全局/局部）
     RateController           — 限制子树执行频率
     RecoveryNode             — 带重试次数的恢复节点
@@ -28,8 +30,8 @@
     • 定位不可用 → 立即中止整棵树，禁止发出任何速度指令
     • 感知数据超时（TimeExpired 2s）→ 触发 ClearLocalCostmap 并 Wait，
       等待感知恢复，防止代价地图信息过期后盲目通行
-    • BackUp 距离限制为 0.3 m（阿克曼最小转弯半径 1.9 m，小幅后退足以脱困）
-    • 最大全局重试次数 6（与原始行为树保持一致）
+    • （V0.0.89）恢复行为不再包含任何倒退（BackUp）/原地旋转（Spin），
+      窄小测试场地内仅清除代价地图 + 等待后重试，避免"只退不进"与定位跳变
   =====================================================================
 -->
 <root main_tree_to_execute="MainTree">
@@ -114,12 +116,13 @@
 
             <FollowPath path="{path}" controller_id="FollowPath"/>
 
-            <!-- 跟踪失败：清除局部代价地图 + 后退恢复（阿克曼适用，距离小于 0.3m） -->
+            <!-- V0.0.89 跟踪失败恢复：仅清局部代价地图 + 短暂等待后重试，
+                 不再 BackUp（阿克曼窄场地倒车会恶化定位、且与"向前巡航"相悖） -->
             <Sequence name="TrackingRecovery">
               <ClearEntireCostmap
                 name="ClearLocalCostmap-Context"
                 service_name="local_costmap/clear_entirely_local_costmap"/>
-              <BackUp backup_dist="0.3" backup_speed="0.2"/>
+              <Wait wait_duration="2"/>
             </Sequence>
 
           </RecoveryNode>
@@ -128,7 +131,9 @@
 
         <!--
           恢复行为回退池（轮询）
-          注：Spin（原地旋转）不适合阿克曼车，已替换为 BackUp + Wait 组合
+          V0.0.89 测试场地：移除 Spin（阿克曼不能原地旋转）与 BackUp（倒车恶化
+          定位/与向前巡航相悖），恢复退化为"清图 + 等待障碍让行"的非运动组合，
+          多次清图仍规划失败则由外层 RecoveryNode 达上限后 ABORT 交 auto_mission 换点
         -->
         <ReactiveFallback name="RecoveryFallback">
           <!-- 外部目标点实时更新：立即重新规划 -->
@@ -140,10 +145,8 @@
             <ClearEntireCostmap
               name="ClearLocalCostmap-Subtree"
               service_name="local_costmap/clear_entirely_local_costmap"/>
-            <!-- 后退脱困（0.3m，0.2m/s，适合阿克曼底盘） -->
-            <BackUp backup_dist="0.3" backup_speed="0.2"/>
-            <!-- 等待：障碍物可能短暂通过 -->
-            <Wait wait_duration="5"/>
+            <!-- 等待：障碍物可能短暂通过，或等待人工把车移离致命栅格 -->
+            <Wait wait_duration="3"/>
           </RoundRobin>
         </ReactiveFallback>
 

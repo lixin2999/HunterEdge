@@ -19,6 +19,14 @@
 #      SIGINT/SIGTERM/SIGKILL 与终端 Ctrl+C 进程组信号影响，等待 PCD 写完整
 #      （依据 header 中 POINTS/WIDTH×HEIGHT 与字段行宽推算的字节数校验）后
 #      完成转换，进度写入日志文件。
+#   9. 截断容错（V0.0.90）：若写盘方中途被杀（实测 3.8 亿点 ≈ 6.1GB 的地图
+#      在 launch 默认 5s 宽限内被 SIGTERM 腰斩），文件大小永远达不到
+#      header 推算值——旧逻辑会死等到超时后直接放弃，maps/ 仍只剩 .pcd。
+#      现在：① 大小连续多次采样不再变化即视为写盘已终止（截断图）；
+#      ② 等待超时但若文件非空，仍按已写入部分尽力转换（解析器本就容忍
+#      截断：按可用字节数解析），产物为“部分地图”并在日志/返回值中注明。
+#      根因修复见 fast_lio2 pcd_save.save_voxel_size 体素去重与
+#      localization.launch.py 退出宽限（同为 V0.0.90）。
 #
 # 参数：
 #   pcd_file        : PCD 文件绝对路径（默认 /home/agilex/HunterEdge/maps/hunter_map.pcd）
@@ -490,9 +498,12 @@ def wait_for_complete_pcd(pcd_file: str, wait_timeout: float,
       1) header 推算的完整字节数（POINTS 或 WIDTH×HEIGHT 与字段行宽）已达标
          —— 可精确识别"写完整"；
       2) 无法推算时（ASCII PCD / 未知字段类型）退化为"文件大小连续
-         stable_checks 次不变且非空"。
+         stable_checks 次不变且非空"；
+      3) V0.0.90：可推算但达不到推算值时，若大小也连续多轮不变，说明
+         写盘方已终止（如 FAST-LIO2 写盘中途被 SIGTERM），按"截断图"
+         接受，由调用方按已写入部分尽力转换。
 
-    超时返回 False，由调用方决定如何提示。
+    超时返回 False，由调用方决定如何提示（V0.0.90：文件非空时尽力转换）。
     """
     wait_timeout = max(float(wait_timeout), 0.0)
     started = time.time()
@@ -505,24 +516,34 @@ def wait_for_complete_pcd(pcd_file: str, wait_timeout: float,
         if os.path.isfile(pcd_file):
             size = os.path.getsize(pcd_file)
             expected = PcdParser.expected_file_size(pcd_file)
-            if expected is not None:
-                if size >= expected:
-                    log(f'PCD 已写完整：{size / 1024 / 1024:.2f} MB'
-                        f'（header 推算 {expected / 1024 / 1024:.2f} MB）')
-                    return True
-            elif size > 0:
+            if expected is not None and size >= expected:
+                log(f'PCD 已写完整：{size / 1024 / 1024:.2f} MB'
+                    f'（header 推算 {expected / 1024 / 1024:.2f} MB）')
+                return True
+            if size > 0:
                 if size == prev_size:
                     stable += 1
-                    if stable >= stable_checks:
-                        log(f'PCD 文件大小稳定：{size / 1024 / 1024:.2f} MB')
+                    # 截断接受（第 3 条）需要比 ASCII 稳定性判定多一轮观察，
+                    # 避免大体积写盘间歇性停顿被误判为已终止
+                    need_stable = (stable_checks if expected is None
+                                   else max(stable_checks, 3))
+                    if stable >= need_stable:
+                        if expected is None:
+                            log(f'PCD 文件大小稳定：{size / 1024 / 1024:.2f} MB')
+                        else:
+                            log(f'[警告] PCD 大小连续 {stable} 次采样不变'
+                                f'（{size / 1024 / 1024:.2f} MB < 推算 '
+                                f'{expected / 1024 / 1024:.2f} MB），写盘方疑已'
+                                f'终止，按已写入点尽力转换')
                         return True
                 else:
                     stable = 0
-                # ASCII/未知行宽 PCD 需要 stable_checks 次采样才能确认"写完"，
-                # 为其保证足够的观察窗口（binary 走上面的 header 精确判定，
-                # 无需额外等待）
-                deadline = max(deadline, time.time() + stable_checks * poll_s + 0.5)
-            prev_size = size
+                prev_size = size
+                if expected is None:
+                    # ASCII/未知行宽 PCD 需要 stable_checks 次采样才能确认"写完"，
+                    # 为其保证足够的观察窗口（binary 走上面的 header 精确判定，
+                    # 无需额外等待）
+                    deadline = max(deadline, time.time() + stable_checks * poll_s + 0.5)
 
         now = time.time()
         if now >= deadline:
@@ -555,18 +576,23 @@ def convert_pcd_to_map(
 
     wait_timeout > 0 时先等待 PCD 写盘完成（依据 header 推算的完整字节数）；
     wait_timeout <= 0 表示调用方已确认 PCD 写完整，直接进入转换。
+    V0.0.90：等待超时但文件非空时不再直接放弃——解析器按可用字节数容忍
+    截断，尽力转换已写入部分并在结果中注明“部分地图”。
     返回 (是否成功, 结果说明, yaml_path)；异常统一转成失败说明，不外抛。
     """
+    partial = False
     if wait_timeout and wait_timeout > 0:
         if not wait_for_complete_pcd(pcd_file, wait_timeout, log):
-            if os.path.isfile(pcd_file):
+            if os.path.isfile(pcd_file) and os.path.getsize(pcd_file) > 0:
+                log(f'[警告] 等待 PCD 写盘完成超时（{wait_timeout:.0f}s），'
+                    f'按已写入部分尽力转换：'
+                    f'{os.path.getsize(pcd_file) / 1024 / 1024:.2f} MB')
+                partial = True
+            else:
                 return (False,
-                        f'等待 PCD 写盘完成超时（{wait_timeout:.0f}s）：{pcd_file}',
+                        f'等待 PCD 文件出现超时（{wait_timeout:.0f}s）：{pcd_file}'
+                        f'（FAST-LIO2 未写盘？）',
                         None)
-            return (False,
-                    f'等待 PCD 文件出现超时（{wait_timeout:.0f}s）：{pcd_file}'
-                    f'（FAST-LIO2 未写盘？）',
-                    None)
 
     try:
         points = PcdParser.load(pcd_file)
@@ -594,7 +620,8 @@ def convert_pcd_to_map(
             occupied_thresh=occupied_thresh,
             free_thresh=free_thresh,
         )
-        msg = (f'转换成功：{points.shape[0]} pts → {w}×{h} px 栅格\n'
+        msg = (f'转换成功：{points.shape[0]} pts → {w}×{h} px 栅格'
+               + ('（PCD 未写完，部分地图）' if partial else '') + '\n'
                f'  PGM : {pgm_path}\n  YAML: {yaml_path}')
         log(msg)
         return True, msg, yaml_path
@@ -1130,12 +1157,14 @@ def finalize_convert(argv) -> int:
         log(f'  等待上限 : {opts.wait_timeout:.0f}s')
 
         if not wait_for_complete_pcd(pcd_file, opts.wait_timeout, log):
-            if os.path.isfile(pcd_file):
-                log(f'[错误] 等待 PCD 写盘完成超时（{opts.wait_timeout:.0f}s），放弃转换')
-            else:
+            if not (os.path.isfile(pcd_file) and os.path.getsize(pcd_file) > 0):
                 log(f'[错误] 等待 PCD 出现超时（{opts.wait_timeout:.0f}s）——'
                     f'FAST-LIO2 可能未写盘（检查 pcd_save_en 注入与 map_file_path）')
-            return 2
+                return 2
+            # V0.0.90：写盘超时但文件非空（如大地图写入中被 SIGTERM），
+            # 不再放弃，按已写入部分尽力转换
+            log(f'[警告] 等待 PCD 写盘完成超时（{opts.wait_timeout:.0f}s），'
+                f'尝试按已写入部分尽力转换')
 
         yaml_path = os.path.join(out_dir, f'{opts.map_name}.yaml')
         if (not opts.force and os.path.isfile(yaml_path)

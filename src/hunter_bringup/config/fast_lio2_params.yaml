@@ -71,3 +71,9 @@ fast_lio2:
       # 仍会按模式覆盖：建图模式保持 true，导航模式置 false 防无限写盘。
       pcd_save_en: true
       interval: -1
+      # V0.0.90 保存去重：pcl_wait_save 按 0.1m 全局体素去重后再累加。
+      # 此前逐帧全量累加，实测 23 分钟建图累积 3.8 亿点 ≈ 6.1GB，退出瞬间
+      # 才写盘，launch 默认 5s 宽限内被 SIGTERM 截断，pcd_to_map 转换必然
+      # 超时放弃（maps/ 只有 .pcd 无 .pgm/.yaml）。去重后写盘秒级完成。
+      # 置 0 可关闭去重回到全量累加（不推荐）。
+      save_voxel_size: 0.1

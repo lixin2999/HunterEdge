@@ -24,8 +24,8 @@ auto_mission_node:
     #   obstacle_fov_deg   : 前向检测扇区半角（total FOV = 2×obstacle_fov_deg/2），
     #                        base_link 坐标系 x 轴前方
     # -------------------------------------------------------------------------
-    warn_obstacle_dist: 2.0          # 减速警告距离（m）
-    stop_obstacle_dist: 0.8          # 急停距离（m）
+    warn_obstacle_dist: 1.5          # V0.0.89 减速警告距离（m，原 2.0，窄场地尺度）
+    stop_obstacle_dist: 0.6          # V0.0.89 急停距离（m，原 0.8，略大于 footprint 前缘 0.45）
     obstacle_fov_deg: 120.0          # 检测扇区（°），前向 ±60°
 
     # -------------------------------------------------------------------------
@@ -55,7 +55,7 @@ auto_mission_node:
     # -------------------------------------------------------------------------
     loop_waypoints: true
     max_wp_failures: 3
-    goal_timeout: 60.0               # 单点导航超时（s）
+    goal_timeout: 90.0               # V0.0.89 单点导航超时（s，原 60）：窄场地非运动恢复（清图+等待）周期变长
     obstacle_wait_timeout: 30.0      # 障碍物等待超时（s）
 
     # -------------------------------------------------------------------------
@@ -65,13 +65,13 @@ auto_mission_node:
     #   nav_retry_backoff       : goal 被拒/失败后的重试退避（s），防止高频重发
     # -------------------------------------------------------------------------
     nav_active_wait_timeout: 60.0
-    nav_retry_backoff: 2.0
+    nav_retry_backoff: 3.0           # V0.0.89 goal 被拒/失败后重试退避（原 2.0），窄场地避免高频重发刷屏
 
     # -------------------------------------------------------------------------
     # 速度约束（仅合规性检查，实际限速由 nav2_params.yaml controller/velocity_smoother 控制）
     # 文档规定：HUNTER-SE 最大速度 ≤ 2.0 m/s
     # -------------------------------------------------------------------------
-    max_velocity: 0.8                # 巡航速度（m/s），与 controller desired_linear_vel 一致
+    max_velocity: 0.5                # 巡航速度（m/s），V0.0.89 与 controller desired_linear_vel/velocity_smoother 一致
 
     # -------------------------------------------------------------------------
     # 建图模式自动巡航（mapping auto cruise）

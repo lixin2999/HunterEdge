@@ -90,6 +90,11 @@ public:
     declare_parameter<double>("stall_cmd_vel_min", 0.05);  // 判"有指令"的最小指令速度（m/s）
     declare_parameter<double>("stall_fb_vel_max", 0.02);   // 判"没在动"的最大反馈速度（m/s）
     declare_parameter<double>("plan_fail_timeout", 2.0);   // 控制器指令断流判定（s）
+    // V0.0.89 窄小测试场地：放宽起步期误判——首个航点尚不可规划/非运动恢复
+    // 的 Wait 会造成 goal 短暂 ABORTED 与 /cmd_vel_nav 断流，不应一票否决整个测试。
+    //   test_max_goal_aborts : 连续 ABORTED 达此次数才锁存中止（默认 1=旧行为）
+    //   EXECUTING（车确实在动）会清零计数；行驶中再次 ABORT 仍会中止，安全网保留
+    declare_parameter<int>("test_max_goal_aborts", 1);
     declare_parameter<bool>("estop_hold_on_abort", true);  // 中止时是否发布 /estop=true
     // V0.0.87 地图边界监护
     declare_parameter<bool>("enable_map_fence", true);     // 边界监护开关
@@ -114,6 +119,10 @@ public:
     stall_cmd_vel_min_ = get_parameter("stall_cmd_vel_min").as_double();
     stall_fb_vel_max_ = get_parameter("stall_fb_vel_max").as_double();
     plan_fail_timeout_ = get_parameter("plan_fail_timeout").as_double();
+     test_max_goal_aborts_ = get_parameter("test_max_goal_aborts").as_int();
+     if (test_max_goal_aborts_ < 1) {
+       test_max_goal_aborts_ = 1;
+     }
     estop_hold_on_abort_ = get_parameter("estop_hold_on_abort").as_bool();
     enable_map_fence_ = get_parameter("enable_map_fence").as_bool();
     map_edge_stop_dist_ = get_parameter("map_edge_stop_dist").as_double();
@@ -525,9 +534,19 @@ private:
       stall_active_ = false;
     }
 
-    // b) goal 被 Nav2 判 ABORTED → 局部规划失效
+    // b) goal 被 Nav2 判 ABORTED → 局部规划失效。V0.0.89：上升沿计数，连续达
+    //    test_max_goal_aborts 次才锁存中止；观察到 EXECUTING（车确实在动）则清零。
+    //    避免窄场地起步期不可规划航点的瞬时 ABORT 一票否决，行驶中反复 ABORT 仍会中止。
     if (nav_status == action_msgs::msg::GoalStatus::STATUS_ABORTED) {
-      return "局部规划失效：navigate_to_pose goal ABORTED";
+      if (prev_nav_status_ != static_cast<int8_t>(action_msgs::msg::GoalStatus::STATUS_ABORTED)) {
+        ++goal_abort_count_;
+      }
+      if (goal_abort_count_ >= test_max_goal_aborts_) {
+        return "局部规划失效：navigate_to_pose goal 连续 ABORTED " +
+          std::to_string(goal_abort_count_) + " 次";
+      }
+    } else if (nav_status == static_cast<int8_t>(action_msgs::msg::GoalStatus::STATUS_EXECUTING)) {
+      goal_abort_count_ = 0;
     }
 
     // c) goal 活跃但控制器指令断流（需先收到过指令，规避启动期误判）
@@ -541,6 +560,7 @@ private:
       return "局部规划失效：goal 活跃但 /cmd_vel_nav 断流 >" +
         std::to_string(plan_fail_timeout_).substr(0, 4) + "s";
     }
+    prev_nav_status_ = nav_status;
     return "";
   }
 
@@ -584,6 +604,8 @@ private:
       test_mode_ = msg->data;
     }
     stall_active_ = false;
+    prev_nav_status_ = 0;
+    goal_abort_count_ = 0;
     if (msg->data) {
       RCLCPP_WARN(get_logger(),
         "[测试模式] 开启：限速 %.2fm/s、急停 %.1fm、减速 %.1fm（±%.0f° 扇区），异常自动中止",
@@ -709,6 +731,7 @@ private:
   double stall_cmd_vel_min_{0.05};
   double stall_fb_vel_max_{0.02};
   double plan_fail_timeout_{2.0};
+  int test_max_goal_aborts_{1};            // V0.0.89 连续 ABORTED 容忍次数
   bool estop_hold_on_abort_{true};
 
   // V0.0.87 地图边界监护参数
@@ -739,6 +762,8 @@ private:
   rclcpp::Time last_plan_cmd_time_{0, 0, RCL_ROS_TIME};
   bool plan_cmd_received_{false};
   int8_t last_nav_status_{0};
+  int8_t prev_nav_status_{0};               // V0.0.89 goal 状态上升沿检测
+  int goal_abort_count_{0};                 // V0.0.89 连续 ABORTED 计数
   bool cmd_received_{false};
   geometry_msgs::msg::Twist last_cmd_;
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};

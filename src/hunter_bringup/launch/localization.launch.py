@@ -29,6 +29,13 @@ def generate_launch_description():
         name='fast_lio2',
         output='screen',
         parameters=[fast_lio2_params],
+        # V0.0.90 退出宽限：建图模式下 FAST-LIO2 在收到 SIGINT 后才把累积
+        # 点云写盘（main 中 spin 返回之后），launch 默认仅等 5s 就 SIGTERM
+        # ——大地图必然被腰斩成截断 PCD，下游 pcd_to_map 拿不到完整文件。
+        # 给 120s 写盘窗口（配合 pcd_save.save_voxel_size 去重，实际秒级完
+        # 成，写完即退出，不会真的拖 120s）。
+        sigterm_timeout='120',
+        sigkill_timeout='10',
     )
 
     # =====================================================================
