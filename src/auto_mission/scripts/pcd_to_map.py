@@ -27,6 +27,10 @@
 #      截断：按可用字节数解析），产物为“部分地图”并在日志/返回值中注明。
 #      根因修复见 fast_lio2 pcd_save.save_voxel_size 体素去重与
 #      localization.launch.py 退出宽限（同为 V0.0.90）。
+#   10. 退出链加固（V0.0.90）：rclpy.spin 改为 0.3s 分时 spin_once + 兜底
+#      派生后 os._exit——修复实机“SIGINT 后 15s 不退被 SIGKILL”的信号唤醒
+#      挂死（cyclonedds waitset 阻塞 C 层时 Python 信号异常不被执行），
+#      确保退出兜底派生机会稳定到达。
 #
 # 参数：
 #   pcd_file        : PCD 文件绝对路径（默认 /home/agilex/HunterEdge/maps/hunter_map.pcd）
@@ -962,6 +966,10 @@ class PcdToMap(Node):
             f'  待 FAST-LIO2 写完 PCD 后自动生成 .pgm/.yaml\n'
             f'  进度日志：tail -f {self._final_log_file}\n'
             f'  结果查看：ls -lh {self._map_output_dir}')
+        # V0.0.90：logger.info 经 DDS 异步转发，本节点随后即 os._exit，该行
+        # 可能来不及上屏；同步 print 一份保证现场可在 launch 日志中看到派生证据
+        print(f'[pcd_to_map] 退出兜底转换已派生后台进程 PID {pid}'
+              f'（进度：tail -f {self._final_log_file}）', flush=True)
 
     # ------------------------------------------------------------------
     # 手动触发服务回调
@@ -1215,19 +1223,30 @@ def main(args=None) -> None:
     node = PcdToMap()
     _ShutdownSignals().install()     # SIGINT/SIGTERM 统一走"优雅退出 + 兜底转换"
     try:
-        rclpy.spin(node)
+        # V0.0.90：rclpy.spin 的单个大 C 阻塞改为 0.3s 分时 spin_once——
+        # cyclonedds waitset 阻塞在 C 层时，Python 信号处理器抛出的
+        # KeyboardInterrupt 可能长时间不被执行，实机两次复现：SIGINT 后
+        # 5s 未退 → SIGTERM → 10s → SIGKILL，退出兜底派生机会命悬一线。
+        # 每轮 spin_once 必回 Python 层，信号异常≤ 0.3s 内得到处理。
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.3)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        # 退出兜底（V0.0.88）：建图模式下 FAST-LIO2 退出时才写 PCD，而本节点
-        # 随后即被 launch 终止 —— 因此把"等写盘 + 转换"交给独立会话的后台进程
+        # 退出兜底（V0.0.88）：把"等 PCD 写盘 + 转换"交给独立会话的后台进程
         try:
             node.finalize_on_shutdown()
         except Exception as e:  # noqa: BLE001
-            node.get_logger().error(f'[pcd_to_map] 退出兜底转换异常：{e}')
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                node.get_logger().error(f'[pcd_to_map] 退出兜底转换异常：{e}')
+            except Exception:
+                print(f'[pcd_to_map] 退出兜底转换异常：{e}', flush=True)
+        # V0.0.90：兜底 worker 已在独立会话，不再执行 destroy_node/rclpy.shutdown
+        # （现场同环境下 DDS 上下文清理同样会挂死，坐等 launch 的 SIGKILL 升级），
+        # 直接以 0 退出，把退出时间控在亚秒级。
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == '__main__':
