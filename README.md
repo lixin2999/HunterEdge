@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V1.3（开发指南，对应软件基线 V0.0.91：碰撞防护改用矩形安全走廊纵向净空判据、stop/slow 抬到 1.0/1.8m 并与 `range_min` 盲区一致性强制校验；点云观测源必开清障 + 观测时基按消息时间戳查 TF；auto_mission 新增 `FAULT` 锁存态与起步前清图）
+> **文档版本**：V1.4（开发指南，对应软件基线 V0.0.92：导航启动前新增 AMCL 收敛门控（订阅 `/amcl_pose`，`isLocalizationValid`/`isAutoConditionMet` 同步校验 EKF+AMCL 协方差）；起步清图从 fire-and-forget 改为同步门控（服务未就绪时每 100ms 重试直到成功才发 goal）；行为树重规划频率从 2Hz 降回 1Hz，修复“走几步即停”故障链）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -436,6 +436,7 @@ hunter_full.launch.py (use_autonomous_nav:=true)
 | 无急停信号 | 订阅 `/estop` |
 | `SystemHealth` 非 `CRITICAL` | 订阅 `/system/health` |
 | 定位协方差迹 ≤ 0.5（可配） | 订阅 `/localization/odom` 协方差对角元素 |
+| **AMCL x+y 方差和 ≤ 0.60（可配，V0.0.92 新增）** | 订阅 `/amcl_pose`（`transient_local+reliable`，与 AMCL 发布 QoS 对齐） |
 | 感知数据新鲜度 ≤ 2s（可配） | 订阅 `/perception/fused_objects` 时间戳 |
 
 ### 10.3 任务状态机
@@ -457,8 +458,9 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 | `warn_obstacle_dist` | 1.5 m | 障碍物减速警告距离（V0.0.89 窄小测试场地档） |
 | `stop_obstacle_dist` | 0.6 m | 障碍物急停距离（V0.0.89，略大于 footprint 前缘 0.45） |
 | `obstacle_fov_deg` | 120° | 前向检测扇区 |
-| `localize_cov_threshold` | 0.5 | 定位协方差迹收敛阈值 |
-| `localize_wait_timeout` | 10 s | 等待定位收敛超时 |
+| `localize_cov_threshold` | 0.5 | EKF（odom→base_link）定位协方差迹收敛阈值 |
+| `amcl_cov_threshold` | 0.60 | AMCL（map→base_link）x+y 方差和收敛阈值（**V0.0.92 新增**；故意略高于 `set_initial_pose:true` 初始帧方差和 0.5，使“上电位姿=建图起点”可即时放行；若车辆上电不在建图起点，需调低至 0.10 并手动 rviz2 `2D Pose Estimate` 重定位） |
+| `localize_wait_timeout` | 15 s | 等待定位收敛超时（V0.0.92 由 10s 调至 15s，AMCL 需多帧扫描收敛） |
 | `perception_timeout` | 2 s | 感知数据超时阈值 |
 | `max_velocity` | 0.5 m/s | 巡航速度（V0.0.89 窄小测试场地低速档，与 RPP desired_linear_vel/velocity_smoother/safety_guard 一致） |
 | `loop_waypoints` | `true` | 完成所有航点后是否循环 |
@@ -481,8 +483,7 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 - **感知保鲜**：`TimeExpired(2s)` 哨兵，感知超时时清除局部代价地图并等待恢复；
 - ~~动态减速~~（V0.0.82 移除 `SpeedController`：本 fork 该节点为按平滑速度调子树 tick 周期的装饰器，无"障碍物距离→限速"语义）；障碍物减速由 RPP `use_cost_regulated_linear_velocity_scaling`（近障碍自动降速）+ approach 减速承担；
 - ~~阿克曼后退~~（V0.0.89 移除）：`BackUp`/`Spin` 等**运动型恢复已全部删除**——窄小测试场地内倒车会把车倒进更差的致命栅格、AMCL 位姿随之跳变，导致"只退不进"；恢复退化为"清除全局/局部代价地图 + `Wait` 后重试"的非运动组合，车辆**只前进不倒车**（velocity_smoother 同步硬禁倒车）。
-- **重规划提速**（V0.0.85）：RateController 1.0→2.0Hz——RPP 为纯路径跟随器、
-  无局部避障语义，动态障碍全靠全局重规划绕行；配合 V0.0.89 全链降速 0.5m/s。
+- ~~重规划提速~~（V0.0.85 1.0→2.0Hz，**V0.0.92 回退至 1.0Hz**）：实车复盘发现，2Hz 重规划在代价地图残留假障碍时会与脏图更新同频共振，导致 RPP 转向角全幅振荡（蛇形行驶）；1Hz + 起步清图同步门控（`clearCostmapsOnStart()`，V0.0.92）已足够覆盖动态障碍响应（safety_guard 物理碰撞闸 + RPP 近障碍降速兜底），且不再放大感知噪声。
 
 ### 10.8 碰撞防护与安全约束（V0.0.85 新增 hunter_safety/safety_guard）
 

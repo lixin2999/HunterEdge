@@ -31,11 +31,21 @@ auto_mission_node:
     # -------------------------------------------------------------------------
     # 定位收敛判断
     #   localize_cov_threshold : EKF 输出位姿协方差迹（x+y+yaw 对角元素之和）
-    #                            小于此值认为定位收敛，允许执行导航
-    #   localize_wait_timeout  : 等待定位收敛的最大时间（s），超时则告警停车回 IDLE
+    #                            小于此值认为里程计定位收敛
+    #   amcl_cov_threshold     : V0.0.92 新增。AMCL 粒子滤波 x+y 方差和（cov[0]+cov[7]）
+    #                            小于此值认为全局定位收敛，允许进入导航。
+    #                            注意：set_initial_pose:true 时初始帧 x+y 方差和
+    #                            = initial_cov_xx + initial_cov_yy = 0.25+0.25 = 0.5，
+    #                            所以 0.60 的阈值允许“车辆在上电位姿=建图起点”时
+    #                            立即导航，同时屏蔽定位跳变导致的方差脔涨。
+    #                            如果车辆上电不在建图起点，请将此值调低至 0.10，
+    #                            并手动在 rviz2 中用 2D Pose Estimate 重置初始位姿。
+    #   localize_wait_timeout  : 等待定位收敛的最大时间（s），V0.0.92 由 10s 调至 15s
+    #                            （AMCL 需多帧扫描收敛）
     # -------------------------------------------------------------------------
-    localize_cov_threshold: 0.5      # 协方差迹阈值
-    localize_wait_timeout: 10.0      # 最长等待时间（s）
+    localize_cov_threshold: 0.5      # EKF 协方差迹阈值
+    amcl_cov_threshold: 0.60         # V0.0.92 AMCL x+y 方差和收敛阈值
+    localize_wait_timeout: 15.0      # 最长等待时间（s）
 
     # -------------------------------------------------------------------------
     # 感知健康度

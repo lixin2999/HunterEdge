@@ -14,6 +14,7 @@
 #include "rclcpp_action/rclcpp_action.hpp"
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"  // V0.0.92：AMCL 收敛检查
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
@@ -81,6 +82,7 @@ private:
   void systemHealthCallback(const hunter_msgs::msg::SystemHealth::SharedPtr msg);
   void estopCallback(const std_msgs::msg::Bool::SharedPtr msg);
   void mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg);  // /map 边界缓存（航点越界校验，V0.0.82/0.0.87）
+  void amclPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);  // V0.0.92：AMCL 收敛门控
 
   // ---- 主循环（10Hz 定时器） ----
   void mainLoop();
@@ -139,6 +141,7 @@ private:
   rclcpp::Subscription<hunter_msgs::msg::SystemHealth>::SharedPtr health_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr amcl_sub_;  // V0.0.92
 
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr waypoint_idx_pub_;
@@ -155,6 +158,7 @@ private:
 
   // ---- Nav2 就绪门控状态 ----
   rclcpp::Client<lifecycle_msgs::srv::GetState>::SharedPtr nav_state_client_;
+  std::atomic<bool> costmaps_clear_pending_{false};  // V0.0.92：进入 NAVIGATING 后若服务未就绪则重试清图
 
   // ---- 代价地图清除客户端（V0.0.91：任务（重）启动时主动清障） ----
   rclcpp::Client<std_srvs::srv::Empty>::SharedPtr clear_global_costmap_srv_;
@@ -175,6 +179,9 @@ private:
   hunter_msgs::msg::SystemHealth latest_health_;
   bool estop_signal_{false};
   std::atomic<bool> estop_self_triggered_{false};  // 急停由本节点触发（障碍物类）；外部急停由发布方解除
+  // ---- V0.0.92：AMCL 定位收敛缓存（data_mutex_ 保护） ----
+  geometry_msgs::msg::PoseWithCovarianceStamped latest_amcl_pose_;
+  bool amcl_pose_received_{false};  // 收到过至少一帧 /amcl_pose（transient_local 初始帧即计入）
 
   // ---- 建图模式自动巡航缓存 ----
   nav_msgs::msg::Odometry latest_lio_odom_;   // FAST-LIO2 /Odometry（camera_init 系）
@@ -223,8 +230,9 @@ private:
   double stop_obstacle_dist_{0.8};     // 急停阈值（m）
   double obstacle_fov_deg_{120.0};     // 前向检测扇区（度）
   // 定位
-  double localize_cov_threshold_{0.5}; // 协方差迹阈值
-  double localize_wait_timeout_{10.0}; // 等待收敛超时（s）
+  double localize_cov_threshold_{0.5}; // EKF 协方差迹阈值
+  double amcl_cov_threshold_{0.60};    // V0.0.92：AMCL x+y 方差和阈值（初始帧=0.5，略宽松避免锁死）
+  double localize_wait_timeout_{15.0}; // 等待收敛超时（s）
   // 感知
   double perception_timeout_{2.0};     // 感知新鲜度阈值（s）
   // 巡航

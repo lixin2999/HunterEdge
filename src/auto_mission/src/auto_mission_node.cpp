@@ -62,6 +62,14 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
     "/map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
     std::bind(&AutoMissionNode::mapCallback, this, std::placeholders::_1));
 
+  // V0.0.92：订阅 AMCL 粒子收敛结果（/amcl_pose）。
+  // AMCL 在 set_initial_pose:true 启动后立即以 transient_local 发布初始位姿，
+  // 订阅时即可收到。用于 isLocalizationValid() 判断 map→base_link 可信度，
+  // 避免定位尚在收敛时提前导航导致偏航。
+  amcl_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "/amcl_pose", rclcpp::QoS(rclcpp::KeepLast(5)).transient_local().reliable(),
+    std::bind(&AutoMissionNode::amclPoseCallback, this, std::placeholders::_1));
+
   // ---- 发布 ----
   status_pub_ = create_publisher<std_msgs::msg::String>("/auto_mission/status", 10);
   waypoint_idx_pub_ = create_publisher<std_msgs::msg::Int32>("/auto_mission/current_waypoint", 10);
@@ -141,7 +149,8 @@ void AutoMissionNode::declareParameters()
 
   // 定位
   declare_parameter("localize_cov_threshold", 0.5);
-  declare_parameter("localize_wait_timeout", 10.0);
+  declare_parameter("amcl_cov_threshold", 0.60);   // V0.0.92：AMCL x+y 方差和收敛阈值
+  declare_parameter("localize_wait_timeout", 15.0); // V0.0.92：等待超时 10s→15s（AMCL 需要更多扫描收敛）
 
   // 感知
   declare_parameter("perception_timeout", 2.0);
@@ -184,6 +193,7 @@ void AutoMissionNode::declareParameters()
   stop_obstacle_dist_     = get_parameter("stop_obstacle_dist").as_double();
   obstacle_fov_deg_       = get_parameter("obstacle_fov_deg").as_double();
   localize_cov_threshold_ = get_parameter("localize_cov_threshold").as_double();
+  amcl_cov_threshold_     = get_parameter("amcl_cov_threshold").as_double();
   localize_wait_timeout_  = get_parameter("localize_wait_timeout").as_double();
   perception_timeout_     = get_parameter("perception_timeout").as_double();
   loop_waypoints_         = get_parameter("loop_waypoints").as_bool();
@@ -758,12 +768,14 @@ void AutoMissionNode::mainLoop()
         localize_wait_start_ = this->now();
         state_ = MissionState::WAITING_LOCALIZE;
       } else {
-        RCLCPP_INFO(get_logger(), "[IDLE→NAVIGATING] AUTO 条件满足，定位已收敛，开始导航");
+        RCLCPP_INFO(get_logger(), "[IDLE→NAVIGATING] AUTO 条件满足，定位已收敛，清图后开始导航");
         current_wp_idx_ = 0;
         wp_fail_count_ = 0;
-        clearCostmapsOnStart();
+        clearCostmapsOnStart();  // V0.0.92：清图后由 NAVIGATING 入口按序发送 goal
         state_ = MissionState::NAVIGATING;
-        sendNextWaypoint();
+        // V0.0.92：移除此处的 sendNextWaypoint() 调用。
+        // 原来立即发 goal 会在清图完成前触发规划，导致 “起点在致命栅格”。
+        // NAVIGATING 状态的“无在途 goal”检查会在清图完成后自动发送第一个目标。
       }
       break;
     }
@@ -779,13 +791,13 @@ void AutoMissionNode::mainLoop()
         break;
       }
       if (isLocalizationValid()) {
-        RCLCPP_INFO(get_logger(), "[WAITING_LOCALIZE→NAVIGATING] 定位已收敛，开始导航");
+        RCLCPP_INFO(get_logger(), "[WAITING_LOCALIZE→NAVIGATING] 定位已收敛，清图后开始导航");
         state_ = MissionState::NAVIGATING;
         current_wp_idx_ = 0;
         wp_fail_count_ = 0;
         localize_wait_started_ = false;
-        clearCostmapsOnStart();
-        sendNextWaypoint();
+        clearCostmapsOnStart();  // V0.0.92：清图后由 NAVIGATING 入口按序发送 goal
+        // V0.0.92：同 IDLE→NAVIGATING，移除立即发 goal，由状态机等待清图完成
         break;
       }
       // 超时检查
@@ -833,6 +845,33 @@ void AutoMissionNode::mainLoop()
         break;
       }
       nav_wait_started_ = false;
+
+      // V0.0.92：代价地图清除门控（清图完成前不发 goal）。
+      // 背景：clearCostmapsOnStart() 进入时若服务未就继，会留下 costmaps_clear_pending_=true。
+      // 此处每 100ms（10Hz 主循环）重试一次，服务就绪后去除标志，再在下方发送 goal。
+      if (costmaps_clear_pending_.load()) {
+        const auto try_clear_retry =
+          [this](const rclcpp::Client<std_srvs::srv::Empty>::SharedPtr & cli, const char * name) {
+            if (!cli->service_is_ready()) {
+              return false;
+            }
+            cli->async_send_request(std::make_shared<std_srvs::srv::Empty::Request>());
+            RCLCPP_INFO(get_logger(), "[清图重试] 已请求清除 %s", name);
+            return true;
+          };
+        const bool g_ok = try_clear_retry(clear_global_costmap_srv_, "global_costmap");
+        const bool l_ok = try_clear_retry(clear_local_costmap_srv_, "local_costmap");
+        if (g_ok && l_ok) {
+          costmaps_clear_pending_.store(false);
+          RCLCPP_INFO(get_logger(),
+            "[NAVIGATING] 代价地图清除完成，下一个 tick 发送 goal");
+        } else {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+            "[NAVIGATING] 等待清图服务就绪（global=%s local=%s），暂不发送 goal",
+            g_ok ? "OK" : "PEND", l_ok ? "OK" : "PEND");
+        }
+        break;  // 本 tick 不发 goal，等待清图完成
+      }
 
       // goal 超时检查
       if (goal_in_flight_) {
@@ -1001,11 +1040,20 @@ bool AutoMissionNode::isAutoConditionMet()
   // 条件5：感知数据新鲜（由 isPerceptionAlive 单独调用，此处复用）
   // 注意：isLocalizationValid / isPerceptionAlive 内部也访问数据，
   //       因为已持有 mutex，避免重复加锁，在此直接内联判断。
-  // --- 定位协方差（inline） ---
+  // --- EKF 定位协方差（inline） ---
   const auto & cov = latest_odom_.pose.covariance;
   // 协方差矩阵对角元素 [0,7,35] 对应 x,y,yaw
   const double cov_trace = cov[0] + cov[7] + cov[35];
   if (cov_trace > localize_cov_threshold_) {
+    return false;
+  }
+  // --- AMCL 粒子收敛（V0.0.92 inline） ---
+  // 注意：amcl_pose_received_ 和 latest_amcl_pose_ 均由 data_mutex_ 保护，已持锁。
+  if (!amcl_pose_received_) {
+    return false;
+  }
+  const auto & amcl_cov = latest_amcl_pose_.pose.covariance;
+  if (amcl_cov[0] + amcl_cov[7] > amcl_cov_threshold_) {
     return false;
   }
   // --- 感知新鲜度（inline） ---
@@ -1017,14 +1065,28 @@ bool AutoMissionNode::isAutoConditionMet()
 }
 
 // ==========================================================================
-// 定位有效性（协方差迹 < 阈值）
+// 定位有效性（V0.0.92：EKF 协方差 + AMCL 粒子收敛双重检查）
 // ==========================================================================
 bool AutoMissionNode::isLocalizationValid()
 {
   std::lock_guard<std::mutex> lk(data_mutex_);
-  const auto & cov = latest_odom_.pose.covariance;
-  const double cov_trace = cov[0] + cov[7] + cov[35];
-  return cov_trace <= localize_cov_threshold_;
+  // ① EKF odom 协方差（快里程计收敛，反映 odom→base_link 质量）
+  const auto & odom_cov = latest_odom_.pose.covariance;
+  const double odom_trace = odom_cov[0] + odom_cov[7] + odom_cov[35];
+  if (odom_trace > localize_cov_threshold_) {
+    return false;
+  }
+  // ② AMCL 粒子收敛（map→base_link 全局定位质量）
+  // 未收到任何 /amcl_pose → AMCL 尚未启动，不允许导航
+  if (!amcl_pose_received_) {
+    return false;
+  }
+  // x+y 方差和：初始帧约 0.5（initial_cov_xx=yy=0.25），收敛后通常 < 0.10
+  const auto & amcl_cov = latest_amcl_pose_.pose.covariance;
+  if (amcl_cov[0] + amcl_cov[7] > amcl_cov_threshold_) {
+    return false;
+  }
+  return true;
 }
 
 // ==========================================================================
@@ -1106,6 +1168,27 @@ void AutoMissionNode::mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr m
     RCLCPP_INFO(get_logger(),
       "auto_mission 已缓存静态地图边界：x[%.2f, %.2f] y[%.2f, %.2f]（航点安全边距 %.2fm）",
       map_min_x_, map_max_x_, map_min_y_, map_max_y_, waypoint_map_margin_);
+  }
+}
+
+// ==========================================================================
+// V0.0.92：/amcl_pose 回调
+// AMCL 在 set_initial_pose:true 启动时立即以 transient_local 发布初始位姿
+// （x+y 协方差和 = initial_cov_xx + initial_cov_yy = 0.5）。
+// 后续每次 resample 更新（移动 > update_min_d=0.15m 时）发布新的位姿估计。
+// ==========================================================================
+void AutoMissionNode::amclPoseCallback(
+  const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lk(data_mutex_);
+  latest_amcl_pose_ = *msg;
+  const bool first_amcl = !amcl_pose_received_;
+  amcl_pose_received_ = true;
+  if (first_amcl) {
+    const double xy_cov = msg->pose.covariance[0] + msg->pose.covariance[7];
+    RCLCPP_INFO(get_logger(),
+      "auto_mission 已缓存 AMCL 初始位姿（x+y 方差和=%.3f，收敛阈值=%.3f）",
+      xy_cov, amcl_cov_threshold_);
   }
 }
 
@@ -1322,22 +1405,35 @@ void AutoMissionNode::enterFault(const std::string & reason)
 //   使 raytrace 被跳过），起点直接落在致命栅格 → Smac 返
 //   "Starting point in lethal space"，1Hz 重规划全失败。行为树的清图只在
 //   规划失败后触发，本函数将其前置到“起步前”，两者配合才能避免死循环。
-// 异步 fire-and-forget：不阻塞 10Hz 主循环；服务未就绪（Nav2 未激活）仅告警。
+// V0.0.92 升级：进入 NAVIGATING 时如果服务未就继，将不再直接放弃。
+// 改为设置 costmaps_clear_pending_ 标志，NAVIGATING 状机入口每 100ms 重试
+// 直到服务就绪并完成清除后才允许发送第一个 goal。
 // ==========================================================================
 void AutoMissionNode::clearCostmapsOnStart()
 {
+  // 无论立即还是重试，先置挂起标志
+  costmaps_clear_pending_.store(true);
+
   const auto try_clear =
     [this](const rclcpp::Client<std_srvs::srv::Empty>::SharedPtr & cli, const char * name) {
       if (!cli->service_is_ready()) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-          "[清图] %s 未就绪，跳过（Nav2 未激活？）", name);
-        return;
+        RCLCPP_WARN(get_logger(),
+          "[清图] %s 未就绪，将在 NAVIGATING 中每 100ms 重试", name);
+        return false;
       }
       cli->async_send_request(std::make_shared<std_srvs::srv::Empty::Request>());
       RCLCPP_INFO(get_logger(), "[清图] 已请求清除 %s", name);
+      return true;
     };
-  try_clear(clear_global_costmap_srv_, "global_costmap/clear_entirely_global_costmap");
-  try_clear(clear_local_costmap_srv_, "local_costmap/clear_entirely_local_costmap");
+  const bool g_ok = try_clear(
+    clear_global_costmap_srv_, "global_costmap/clear_entirely_global_costmap");
+  const bool l_ok = try_clear(
+    clear_local_costmap_srv_, "local_costmap/clear_entirely_local_costmap");
+  if (g_ok && l_ok) {
+    // 两个服务均就绪，清图请求已发出，去除挂起标志
+    // Nav2 服务处理约 1~2 个时钟周期（<100ms），10Hz 主循环下一个 tick 可发 goal
+    costmaps_clear_pending_.store(false);
+  }
 }
 
 // ==========================================================================
