@@ -37,8 +37,9 @@
 #   map_output_dir  : PGM/YAML 输出目录（默认与 pcd_file 同目录）
 #   map_name        : 输出文件名前缀（默认 hunter_map）
 #   resolution      : 栅格分辨率，m/pixel（默认 0.05 m，与 local_costmap 一致）
-#   z_min           : 障碍物 z 轴下限，m（默认 0.1，过滤地面）
+#   z_min           : 障碍物 z 轴下限，m（默认 0.3，过滤地面反射及车体自身结构）
 #   z_max           : 障碍物 z 轴上限，m（默认 2.0，过滤天花板/树冠）
+#   clear_origin_radius : 地图原点(0,0)周围清空半径，m（默认 1.0，确保起步位置无障碍）
 #   occupied_thresh : 栅格占据概率阈值（默认 0.65）
 #   free_thresh     : 栅格空闲概率阈值（默认 0.25）
 #   padding_m       : 地图四周填充边距，m（默认 0.5）
@@ -433,6 +434,59 @@ def pcd_to_occupancy_grid(
     return grid, x_min, y_min
 
 
+def clear_origin_area(
+    grid: np.ndarray,
+    origin_x: float,
+    origin_y: float,
+    resolution: float,
+    radius: float,
+) -> int:
+    """将地图世界坐标 (0,0) 周围 radius 米内的栅格强制为 FREE。
+
+    建图时车辆停在原点，LiDAR 扫描到车体自身结构会在地图上留下障碍物，
+    导致导航启动后“起点在致命空间”。此函数确保起步位置始终可通行。
+
+    参数：
+        grid       : shape=(H,W) uint8，已经被 np.flipud 的栅格（行从上到下 y 从大到小）
+        origin_x   : 地图左下角的世界 x 坐标
+        origin_y   : 地图左下角的世界 y 坐标
+        resolution : m/pixel
+        radius     : 清空半径（m），0 表示不清空
+
+    返回：清空的栅格数。
+    """
+    if radius <= 0:
+        return 0
+
+    FREE = 254
+    height, width = grid.shape
+    cleared = 0
+
+    # 世界坐标 (0,0) 在栅格中的列/行（栅格未翻转时的坐标，但已 flipud 后）
+    # flipud 后：row 0 = 顶部 = y_max,  row H-1 = 底部 = y_min
+    # 列: col = (world_x - origin_x) / resolution
+    # 行: row = (height - 1) - (world_y - origin_y) / resolution
+    center_col = (0.0 - origin_x) / resolution
+    center_row = (height - 1) - (0.0 - origin_y) / resolution
+    radius_px = radius / resolution
+
+    # 只遍历外接矩形范围
+    col_min = max(0, int(math.floor(center_col - radius_px)))
+    col_max = min(width - 1, int(math.ceil(center_col + radius_px)))
+    row_min = max(0, int(math.floor(center_row - radius_px)))
+    row_max = min(height - 1, int(math.ceil(center_row + radius_px)))
+
+    for r in range(row_min, row_max + 1):
+        for c in range(col_min, col_max + 1):
+            dist = math.sqrt((c - center_col) ** 2 + (r - center_row) ** 2) * resolution
+            if dist <= radius:
+                if grid[r, c] != FREE:
+                    cleared += 1
+                grid[r, c] = FREE
+
+    return cleared
+
+
 # ---------------------------------------------------------------------------
 # 写出 PGM + YAML
 # ---------------------------------------------------------------------------
@@ -575,6 +629,7 @@ def convert_pcd_to_map(
     padding_m: float,
     log: Callable[[str], None],
     wait_timeout: float = 60.0,
+    clear_origin_radius: float = 1.0,
 ) -> Tuple[bool, str, Optional[str]]:
     """等待 PCD 写完整 → 解析 → 生成 2D 栅格 → 写 .pgm/.yaml。
 
@@ -616,6 +671,11 @@ def convert_pcd_to_map(
         log(f'栅格生成：{w}×{h} px，分辨率 {resolution} m/px，'
             f'占据格 {occupied_count} 个，原点 ({origin_x:.3f}, {origin_y:.3f})')
 
+        # 清空原点周围区域（避免车体自身被映射为障碍物导致“起点在致命空间”）
+        cleared = clear_origin_area(grid, origin_x, origin_y, resolution, clear_origin_radius)
+        if cleared > 0:
+            log(f'原点清空：半径 {clear_origin_radius}m 内清除 {cleared} 个占据/未知栅格')
+
         pgm_path, yaml_path = write_pgm_yaml(
             grid, origin_x, origin_y,
             resolution=resolution,
@@ -655,11 +715,12 @@ class PcdToMap(Node):
         self.declare_parameter('map_output_dir',  '')          # 空 = 与 pcd_file 同目录
         self.declare_parameter('map_name',        'hunter_map')
         self.declare_parameter('resolution',      0.05)
-        self.declare_parameter('z_min',           0.1)
+        self.declare_parameter('z_min',           0.3)
         self.declare_parameter('z_max',           2.0)
         self.declare_parameter('occupied_thresh', 0.65)
         self.declare_parameter('free_thresh',     0.25)
         self.declare_parameter('padding_m',       0.5)
+        self.declare_parameter('clear_origin_radius', 1.0)  # 原点周围清空半径，保证起步无障碍
         self.declare_parameter('auto_reload_map', True)
         self.declare_parameter('trigger_on_mapping_end', True)
         self.declare_parameter('convert_on_start_if_missing', True)
@@ -682,6 +743,8 @@ class PcdToMap(Node):
         self._occupied_thresh = self.get_parameter('occupied_thresh').get_parameter_value().double_value
         self._free_thresh     = self.get_parameter('free_thresh').get_parameter_value().double_value
         self._padding_m       = self.get_parameter('padding_m').get_parameter_value().double_value
+        self._clear_origin_radius = self.get_parameter(
+            'clear_origin_radius').get_parameter_value().double_value
         self._auto_reload     = self.get_parameter('auto_reload_map').get_parameter_value().bool_value
         self._trigger_on_end  = self.get_parameter('trigger_on_mapping_end').get_parameter_value().bool_value
         self._convert_on_start = self.get_parameter(
@@ -767,6 +830,7 @@ class PcdToMap(Node):
             f'  地图名称   : {self._map_name}\n'
             f'  分辨率     : {self._resolution} m/px\n'
             f'  z 切片     : [{self._z_min}, {self._z_max}] m\n'
+            f'  原点清空半径: {self._clear_origin_radius} m\n'
             f'  自动重载   : {self._auto_reload}\n'
             f'  建图结束触发: {self._trigger_on_end}\n'
             f'  退出兜底转换: {self._final_on_shutdown}'
@@ -1010,6 +1074,7 @@ class PcdToMap(Node):
                 padding_m=self._padding_m,
                 log=self.get_logger().info,
                 wait_timeout=self._convert_wait_timeout,
+                clear_origin_radius=self._clear_origin_radius,
             )
             if not ok:
                 self.get_logger().error(f'[pcd_to_map] {result_msg}')
@@ -1123,11 +1188,13 @@ def build_finalize_parser() -> argparse.ArgumentParser:
     parser.add_argument('--map-name', default='hunter_map',
                         help='输出文件名前缀（默认 hunter_map）')
     parser.add_argument('--resolution', type=float, default=0.05)
-    parser.add_argument('--z-min', type=float, default=0.1)
+    parser.add_argument('--z-min', type=float, default=0.3)
     parser.add_argument('--z-max', type=float, default=2.0)
     parser.add_argument('--occupied-thresh', type=float, default=0.65)
     parser.add_argument('--free-thresh', type=float, default=0.25)
     parser.add_argument('--padding-m', type=float, default=0.5)
+    parser.add_argument('--clear-origin-radius', type=float, default=1.0,
+                        help='地图原点(0,0)周围清空半径，m（默认 1.0，确保起步无障碍）')
     parser.add_argument('--wait-timeout', type=float, default=120.0,
                         help='等待 PCD 写盘完成的最长时间，s（默认 120）')
     parser.add_argument('--lock-file', default='',
@@ -1192,6 +1259,7 @@ def finalize_convert(argv) -> int:
             padding_m=opts.padding_m,
             log=log,
             wait_timeout=0.0,     # 上面已确认 PCD 写完整
+            clear_origin_radius=opts.clear_origin_radius,
         )
         if not ok:
             log(f'[错误] {msg}')

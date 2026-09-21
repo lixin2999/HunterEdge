@@ -412,11 +412,12 @@ def _mapping_nodes(context, *args, **kwargs):
             'map_output_dir':         map_output_dir,
             'map_name':               map_name,
             'resolution':             0.05,
-            'z_min':                  0.1,
+            'z_min':                  0.3,   # 过滤地面反射及车体自身结构，避免原点障碍
             'z_max':                  2.0,
             'occupied_thresh':        0.65,
             'free_thresh':            0.25,
             'padding_m':              0.5,
+            'clear_origin_radius':    1.0,   # 建图起点周围 1m 清空，确保起步位置无障碍
             'auto_reload_map':        False,   # 建图模式下 map_server 未启动，禁用重载
             'trigger_on_mapping_end': True,
             'convert_on_start_if_missing': False,  # 建图开始时无图可转，禁用启动自愈
