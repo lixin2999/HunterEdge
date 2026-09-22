@@ -62,12 +62,13 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
     "/map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
     std::bind(&AutoMissionNode::mapCallback, this, std::placeholders::_1));
 
-  // V0.0.92：订阅 AMCL 粒子收敛结果（/amcl_pose）。
-  // AMCL 在 set_initial_pose:true 启动后立即以 transient_local 发布初始位姿，
-  // 订阅时即可收到。用于 isLocalizationValid() 判断 map→base_link 可信度，
-  // 避免定位尚在收敛时提前导航导致偏航。
+  // V0.0.93 方案A：订阅全局重定位位姿 /relocalization/pose（原 /amcl_pose）。
+  // hunter_relocalization(NDT) 以 2Hz 持续发布 map 系位姿：收敛时协方差小
+  // （converged_covariance，默认 0.01），未收敛时发布大协方差（100）。
+  // 用于 isLocalizationValid() 判断 map→base_link 全局定位可信度，
+  // 避免定位尚在收敛时提前导航导致偏航。（成员名沿用 amcl_* 前缀，语义为重定位。）
   amcl_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
-    "/amcl_pose", rclcpp::QoS(rclcpp::KeepLast(5)).transient_local().reliable(),
+    "/relocalization/pose", rclcpp::QoS(rclcpp::KeepLast(5)).transient_local().reliable(),
     std::bind(&AutoMissionNode::amclPoseCallback, this, std::placeholders::_1));
 
   // ---- 发布 ----
@@ -98,7 +99,7 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
   // hunter_base 订阅 /cmd_vel 并按 bicycle model 换算阿克曼转向角。
   cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
 
-  // FAST-LIO2 里程计（camera_init 系，10Hz）——与 rviz "Publish Point"
+  // FAST-LIO2 里程计（odom 系，原 camera_init；V0.0.93 方案A 帧名已归一，10Hz）——与 rviz "Publish Point"
   // 点击航点严格同源，巡航反馈直接使用该位姿，避免 EKF 系折算偏差。
   lio_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
     "/Odometry", rclcpp::SensorDataQoS(),
@@ -406,7 +407,7 @@ void AutoMissionNode::estopCallback(const std_msgs::msg::Bool::SharedPtr msg)
 // ==========================================================================
 // 建图模式自动巡航：20Hz /cmd_vel 控制（含安全约束）
 //
-// 反馈源：FAST-LIO2 /Odometry（camera_init 系）——与 rviz "Publish Point"
+// 反馈源：FAST-LIO2 /Odometry（odom 系，原 camera_init）——与 rviz "Publish Point"
 // 点击航点严格同源；安全：复用 NAVIGATING 的障碍物 warn/stop 阈值与 /estop。
 // 阿克曼约束：|w| ≤ v / R_min（HUNTER-SE 最小转弯半径 1.9m）。
 // ==========================================================================
@@ -493,7 +494,7 @@ void AutoMissionNode::cruiseControlStep()
   }
   const Waypoint & wp = waypoints_[current_wp_idx_];
 
-  // ---- 位姿（camera_init 系，与航点同源） ----
+  // ---- 位姿（odom 系，原 camera_init，与航点同源） ----
   const double px = lio.pose.pose.position.x;
   const double py = lio.pose.pose.position.y;
   const auto & q = lio.pose.pose.orientation;
@@ -1076,12 +1077,12 @@ bool AutoMissionNode::isLocalizationValid()
   if (odom_trace > localize_cov_threshold_) {
     return false;
   }
-  // ② AMCL 粒子收敛（map→base_link 全局定位质量）
-  // 未收到任何 /amcl_pose → AMCL 尚未启动，不允许导航
+  // ② 全局重定位收敛（map→base_link 全局定位质量，V0.0.93 由 NDT 提供）
+  // 未收到任何 /relocalization/pose → 重定位尚未启动，不允许导航
   if (!amcl_pose_received_) {
     return false;
   }
-  // x+y 方差和：初始帧约 0.5（initial_cov_xx=yy=0.25），收敛后通常 < 0.10
+  // x+y 方差和：NDT 收敛时发布小协方差（默认 0.01，和=0.02），未收敛时=100（和=200）
   const auto & amcl_cov = latest_amcl_pose_.pose.covariance;
   if (amcl_cov[0] + amcl_cov[7] > amcl_cov_threshold_) {
     return false;
@@ -1172,10 +1173,10 @@ void AutoMissionNode::mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr m
 }
 
 // ==========================================================================
-// V0.0.92：/amcl_pose 回调
-// AMCL 在 set_initial_pose:true 启动时立即以 transient_local 发布初始位姿
-// （x+y 协方差和 = initial_cov_xx + initial_cov_yy = 0.5）。
-// 后续每次 resample 更新（移动 > update_min_d=0.15m 时）发布新的位姿估计。
+// V0.0.93 方案A：/relocalization/pose 回调（原 /amcl_pose，函数名/成员名保留）
+// hunter_relocalization(NDT) 以 publish_rate（默认 2Hz）持续发布 map 系位姿：
+// 收敛时 covariance[0]=[7]=converged_covariance（默认 0.01），未收敛时=100。
+// 每次刷新缓存 latest，isLocalizationValid() 据当前方差和动态判收敛。
 // ==========================================================================
 void AutoMissionNode::amclPoseCallback(
   const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
@@ -1187,7 +1188,7 @@ void AutoMissionNode::amclPoseCallback(
   if (first_amcl) {
     const double xy_cov = msg->pose.covariance[0] + msg->pose.covariance[7];
     RCLCPP_INFO(get_logger(),
-      "auto_mission 已缓存 AMCL 初始位姿（x+y 方差和=%.3f，收敛阈值=%.3f）",
+      "auto_mission 已缓存全局重定位位姿（x+y 方差和=%.3f，收敛阈值=%.3f）",
       xy_cov, amcl_cov_threshold_);
   }
 }

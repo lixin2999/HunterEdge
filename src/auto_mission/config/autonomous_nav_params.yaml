@@ -19,7 +19,7 @@ auto_mission_node:
     # -------------------------------------------------------------------------
     # 安全距离约束（单位：m）
     #   warn_obstacle_dist : 前向扇区内障碍物距离低于此值 → 进入 OBSTACLE_AVOID，
-    #                        Nav2 RPP 自然减速，等待障碍物清除
+    #                        Nav2 MPPI 自然减速，等待障碍物清除
     #   stop_obstacle_dist : 前向扇区内障碍物距离低于此值 → 立即触发 ESTOP
     #   obstacle_fov_deg   : 前向检测扇区半角（total FOV = 2×obstacle_fov_deg/2），
     #                        base_link 坐标系 x 轴前方
@@ -30,21 +30,18 @@ auto_mission_node:
 
     # -------------------------------------------------------------------------
     # 定位收敛判断
-    #   localize_cov_threshold : EKF 输出位姿协方差迹（x+y+yaw 对角元素之和）
-    #                            小于此值认为里程计定位收敛
-    #   amcl_cov_threshold     : V0.0.92 新增。AMCL 粒子滤波 x+y 方差和（cov[0]+cov[7]）
-    #                            小于此值认为全局定位收敛，允许进入导航。
-    #                            注意：set_initial_pose:true 时初始帧 x+y 方差和
-    #                            = initial_cov_xx + initial_cov_yy = 0.25+0.25 = 0.5，
-    #                            所以 0.60 的阈值允许“车辆在上电位姿=建图起点”时
-    #                            立即导航，同时屏蔽定位跳变导致的方差脔涨。
-    #                            如果车辆上电不在建图起点，请将此值调低至 0.10，
-    #                            并手动在 rviz2 中用 2D Pose Estimate 重置初始位姿。
-    #   localize_wait_timeout  : 等待定位收敛的最大时间（s），V0.0.92 由 10s 调至 15s
-    #                            （AMCL 需多帧扫描收敛）
+    #   localize_cov_threshold : 里程计（/localization/odom）位姿协方差迹
+    #                            （x+y+yaw 对角元素之和）小于此值认为里程计收敛
+    #   amcl_cov_threshold     : V0.0.93 方案A 语义改为全局重定位（NDT）。
+    #                            hunter_relocalization 发布 /relocalization/pose：
+    #                            收敛时 covariance[0]=[7]=0.01（和=0.02），
+    #                            未收敛时=100（和=200）。此阈值 0.10 清晰区分两者：
+    #                            ≤ 0.10 才允许进入导航。成员/参数名沿用 amcl_* 前缀。
+    #   localize_wait_timeout  : 等待定位收敛的最大时间（s）。NDT 首帧配准即可收敛，
+    #                            保留 15s 供大场景首帧充分扫到特征。
     # -------------------------------------------------------------------------
-    localize_cov_threshold: 0.5      # EKF 协方差迹阈值
-    amcl_cov_threshold: 0.60         # V0.0.92 AMCL x+y 方差和收敛阈值
+    localize_cov_threshold: 0.5      # 里程计协方差迹阈值
+    amcl_cov_threshold: 0.10         # V0.0.93 全局重定位(NDT) x+y 方差和收敛阈值
     localize_wait_timeout: 15.0      # 最长等待时间（s）
 
     # -------------------------------------------------------------------------
@@ -87,7 +84,7 @@ auto_mission_node:
     # 建图模式自动巡航（mapping auto cruise）
     #
     # 用途：建图模式下车辆沿 rviz 点击的航点自动巡航采集点云，无需遥控驾驶。
-    # 使用：rviz2 "Publish Point" 点击航点（Fixed Frame 必须为 camera_init，
+    # 使用：rviz2 "Publish Point" 点击航点（Fixed Frame 必须为 odom，
     #       与 FAST-LIO2 /Odometry 反馈同源）后，调用
     #       ros2 service call /auto_mission/start_mapping_cruise std_srvs/srv/Trigger
     # 停止：ros2 service call /auto_mission/stop_mapping_cruise std_srvs/srv/Trigger
@@ -151,10 +148,11 @@ auto_mission_node:
     # 注意：map_yaml_path 指向 .yaml 元数据文件，同目录下需有同名 .pgm 栅格文件
     map_yaml_path: "/home/agilex/HunterEdge/maps/hunter_map.yaml"
 
-    # 全局定位（map→odom）由 AMCL 提供：hunter_autonomous_nav.launch.py 启动
-    # AMCL + pointcloud_to_laserscan（/lidar_points→/scan），匹配静态地图发布
-    # map→odom。关闭用 launch 参数 use_amcl:=false（此时 Nav2 无法工作，仅调试用）。
-    use_amcl: true
+    # 全局定位（map→odom）由 hunter_relocalization(NDT) 提供（V0.0.93 方案A）：
+    # hunter_autonomous_nav.launch.py 启动 hunter_relocalization 将实时点云配准到
+    # 先验 .pcd（与 map_yaml 同名），发布 map→odom；同时启动 pointcloud_to_laserscan
+    # 供 costmap/safety 用。use_amcl 已废弃（AMCL 已移除），保留仅供旧配置兼容。
+    use_amcl: false
 
     # 代价地图障碍物来源（与 nav2_params.yaml 一致）
     costmap_obstacle_topic: "/perception/lidar/obstacle_cloud"

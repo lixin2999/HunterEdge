@@ -10,7 +10,7 @@
 #      Autocompute Value Bounds）：颜色逐帧稳定，地面/墙体一眼可辨；
 #      默认的 Intensity+Autocompute Intensity Bounds 每帧重标定 → 彩虹噪声
 #   3) 视角预置近俯视（Orbit Pitch≈88°）：Publish Point 点击落点即地面 XY
-#   4) Fixed Frame=camera_init（与 /Odometry、waypoint_recorder 严格同源，勿改）
+#   4) Fixed Frame=odom（与 /Odometry、waypoint_recorder 严格同源，勿改；V0.0.93 方案A 帧名由 camera_init 归一为 odom）
 #   5) PointCloud2 Selectable=true：Publish Point 必须点在已渲染点云上才生效
 Panels:
   - Class: rviz_common/Displays
@@ -148,7 +148,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 32; 32; 32
-    Fixed Frame: camera_init
+    Fixed Frame: odom
     Frame Rate: 30
   Name: root
   Tools:

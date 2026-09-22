@@ -106,7 +106,10 @@ def generate_launch_description():
     # can0 为 Jetson 板载 mttcan、未接线束。此前误写 can_car——该接口从未存在，
     # 导致 hunter_base 打不开设备退出、CAN 0Hz 急停循环）
     can_driver     = _isolated(src('hunter_base',      'launch', 'hunter_base.launch.py'),
-                               launch_arguments={'port_name': 'can2'})
+                               launch_arguments={'port_name': 'can2',
+                                                 # V0.0.93 方案A/P0：底盘让出 odom→base_link TF（归 FAST-LIO2），
+                                                 # 仅发布 /odom 话题供 EKF 融合，杜绝双发布者打架
+                                                 'publish_tf': 'false'})
 
     # ---- 3. 定位（fast_lio + EKF，文档 7） ----
     localization   = _isolated(local_src('localization.launch.py'))

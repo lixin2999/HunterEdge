@@ -80,7 +80,15 @@ def _nav2_params_with_bt(context, *args, **kwargs):
     map_yaml_path    = LaunchConfiguration('map_yaml_path').perform(context)
     use_sim_time     = LaunchConfiguration('use_sim_time').perform(context)
     autostart        = LaunchConfiguration('autostart').perform(context)
-    use_amcl         = LaunchConfiguration('use_amcl').perform(context)
+
+    # V0.0.93 方案A：全局重定位地图 = 与 .yaml 同名的先验 .pcd（map 系全局点云地图）
+    try:
+        reloc_cfg_file = os.path.join(
+            get_package_share_directory('hunter_relocalization'),
+            'config', 'relocalization_params.yaml')
+    except Exception:
+        reloc_cfg_file = ''
+    global_map_pcd = os.path.splitext(map_yaml_path)[0] + '.pcd'
 
     # 导航模式：确保 fast_lio2 不写 PCD（pcd_save_en=false），避免磁盘无限增长
     fast_lio2_nav_param_node = Node(
@@ -104,9 +112,7 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         'bt_navigator',
         'velocity_smoother',
     ]
-    # AMCL 在 map_server 之后激活（依赖其发布的 /map），负责发布 map→odom
-    if use_amcl == 'true':
-        lifecycle_nodes.insert(1, 'amcl')
+    # V0.0.93 方案A：移除 AMCL。map→odom 由 hunter_relocalization（非 lifecycle 普通节点）提供。
 
     # ---- map_server：加载已保存的静态 PGM 地图 ----
     map_server = Node(
@@ -120,7 +126,7 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         ],
     )
 
-    # ---- controller_server（RPP，与原 navigation.launch.py 一致） ----
+    # ---- controller_server（V0.0.93 方案A：MPPI 局部控制，参数见 nav2_params.yaml） ----
     controller_server = Node(
         package='nav2_controller',
         executable='controller_server',
@@ -225,7 +231,7 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'test_slow_dist': 1.8,
             'plan_fail_timeout': 10.0,        # > 非运动恢复 Wait 总时长，避免清图/等待期误判断流
             'test_max_goal_aborts': 3,        # 连续 ABORTED 达 3 次才锁存中止（EXECUTING 会清零）
-            # V0.0.87 地图边界监护（/map + /amcl_pose；建图模式无源自动不介入）
+            # V0.0.87 地图边界监护（/map + /relocalization/pose；建图模式无源自动不介入）
             'enable_map_fence': True,   # 行驶范围不得超出已采集地图区域（行驶中最后防线）
             'map_edge_stop_dist': 0.4,  # V0.0.89 窄场地略收紧（原 0.5）；距未建图/界外 <此值零速
             'map_edge_slow_dist': 1.0,  # V0.0.89 距未建图/界外 <1.0m 线性限速（原 1.5）
@@ -233,14 +239,13 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         }],
     )
 
-    # ---- 全局定位（map→odom）：AMCL + 3D→2D 激光投影 ----
-    # TF 链：map --AMCL--> odom --EKF--> base_link。
-    # AMCL 以 /scan（由 /lidar_points 经 pointcloud_to_laserscan 投影）匹配静态地图，
-    # 自动输出并持续修正 map→odom；初始位姿默认地图原点（假设上电位姿≈建图起点），
-    # 偏差大时用 rviz2 "2D Pose Estimate" 向 /initialpose 发布真实位姿重定位。
-    use_amcl_cond = IfCondition(PythonExpression(
-        ["'", LaunchConfiguration('use_amcl'), "' == 'true'"]))
-
+    # ---- 全局定位（map→odom）：V0.0.93 方案A —— NDT 点云重定位 ----
+    # TF 链：map --hunter_relocalization(NDT)--> odom --FAST-LIO2--> base_link。
+    # hunter_relocalization 将 FAST-LIO2 实时点云（/cloud_registered，odom 系）配准到
+    # 先验全局 .pcd（map 系），估计/持续修正 map→odom；初值默认≈建图起点（单位阵），
+    # 偏差大时用 rviz2 "2D Pose Estimate"（/initialpose）或直接发 /initialpose 重置。
+    # /scan（pointcloud_to_laserscan 投影）保留供 costmap 障碍层与 safety_guard 使用，
+    # 不再因定位而条件化。
     cloud_to_scan = Node(
         package='pointcloud_to_laserscan',
         executable='pointcloud_to_laserscan_node',
@@ -261,26 +266,27 @@ def _nav2_params_with_bt(context, *args, **kwargs):
                                             # 0.8m 盲区，故 stop_dist 必须 > 本值（safety_guard
                                             # 运行时会校验并强制抬升，但正解是保持两者一致）。
                                             # 车身自反射不再靠抬大本值解决，改由 safety_guard
-                                            # 的 footprint 包络盒过滤（costmap 侧由
-                                            # amcl.laser_min_range 与本值对齐保持不受污染）。
+                                            # 的 footprint 包络盒过滤（不再依赖 AMCL 滤污染）。
                                             # 旧值 0.5 会让 safety_guard 常年看到 ~0.6m 假障碍而急停
             'range_max': 50.0,
             'use_inf': True,
             'use_sim_time': use_sim_time == 'true',
         }],
-        condition=use_amcl_cond,
     )
 
-    amcl = Node(
-        package='nav2_amcl',
-        executable='amcl',
-        name='amcl',
+    # ---- hunter_relocalization（map→odom，方案A 替代 AMCL） ----
+    relocalization = Node(
+        package='hunter_relocalization',
+        executable='ndt_relocalization_node',
+        name='hunter_relocalization',
         output='screen',
         parameters=[
-            nav2_params_file,
-            {'use_sim_time': use_sim_time == 'true'},
+            ([reloc_cfg_file] if reloc_cfg_file else []),
+            {
+                'global_map_path': global_map_pcd,
+                'use_sim_time':    use_sim_time == 'true',
+            },
         ],
-        condition=use_amcl_cond,
     )
 
     # ---- lifecycle_manager（含 map_server） ----
@@ -346,7 +352,7 @@ def _nav2_params_with_bt(context, *args, **kwargs):
     return precheck_logs + [
         fast_lio2_nav_param_node,
         map_server,
-        amcl,
+        relocalization,
         cloud_to_scan,
         controller_server,
         planner_server,
@@ -536,12 +542,12 @@ def generate_launch_description():
         description='Nav2 lifecycle_manager 是否自动激活节点',
     )
 
-    # 全局定位开关（默认 true）：关闭时不启动 AMCL/激光投影——将没有 map→odom，
-    # global_costmap 与 bt_navigator 无法工作，仅用于调试其余组件
+    # 全局定位开关（V0.0.93 方案A 已废弃）：定位改为 hunter_relocalization NDT，
+    # 不再启动 AMCL。本参数保留仅为兼容旧调用，已无任何作用。
     declare_use_amcl = DeclareLaunchArgument(
         'use_amcl',
-        default_value='true',
-        description='[nav 模式] 启动 AMCL + pointcloud_to_laserscan 全局定位（发布 map→odom）',
+        default_value='false',
+        description='[已废弃 V0.0.93] AMCL 已被 hunter_relocalization(NDT) 取代，本参数无效',
     )
 
     # ---- 模式判断条件 ----

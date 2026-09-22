@@ -6,7 +6,10 @@ ekf_filter_node:
     frequency: 50.0               # 文档 7.3：EKF 输出 50Hz
     two_d_mode: false             # 文档 7.3：3D模式，保留 roll/pitch
     print_diagnostics: true       # 文档 7.3
-    publish_tf: true              # 文档 7.3：发布 odom→base_link
+    publish_tf: false             # V0.0.93 方案A：EKF 不再广播任何 TF。
+                                  #   odom→base_link 归 FAST-LIO2；map→odom 归 hunter_relocalization(NDT)。
+                                  #   此前 publish_tf:true 与底盘双发布者打架，是"无法自主巡航"根因。
+                                  #   EKF 仍输出 /odometry/filtered 话题供诊断/备用，但不进入 TF 树。
     publish_acceleration: false
     smooth_lagged_data: true      # 文档 7.3：处理延迟数据
 

@@ -179,12 +179,12 @@ private:
   hunter_msgs::msg::SystemHealth latest_health_;
   bool estop_signal_{false};
   std::atomic<bool> estop_self_triggered_{false};  // 急停由本节点触发（障碍物类）；外部急停由发布方解除
-  // ---- V0.0.92：AMCL 定位收敛缓存（data_mutex_ 保护） ----
+  // ---- V0.0.93 方案A：全局重定位(NDT)收敛缓存（原 AMCL，data_mutex_ 保护） ----
   geometry_msgs::msg::PoseWithCovarianceStamped latest_amcl_pose_;
-  bool amcl_pose_received_{false};  // 收到过至少一帧 /amcl_pose（transient_local 初始帧即计入）
+  bool amcl_pose_received_{false};  // 收到过至少一帧 /relocalization/pose
 
   // ---- 建图模式自动巡航缓存 ----
-  nav_msgs::msg::Odometry latest_lio_odom_;   // FAST-LIO2 /Odometry（camera_init 系）
+  nav_msgs::msg::Odometry latest_lio_odom_;   // FAST-LIO2 /Odometry（odom 系，原 camera_init）
   rclcpp::Time last_lio_odom_arrive_{0, 0, RCL_SYSTEM_TIME};  // 最近一次到达时刻（本节点时钟）
   std::atomic<bool> mapping_paused_{false};   // 非 AUTO / CRITICAL → 暂停巡航（保持 MAPPING）
 

@@ -25,12 +25,12 @@
 //      async_cancel_all_goals() 取消 /navigate_to_pose 活动目标；
 //      中止状态需人工重新发布 /safety/test_mode true 解除。
 //   9. 地图边界监护（V0.0.87）：车辆行驶范围不得超出已采集地图区域——
-//      订阅 /map（transient_local）+ /amcl_pose（map 系位姿），构建"到最近
+//      订阅 /map（transient_local）+ /relocalization/pose（map 系位姿），构建"到最近
 //      未建图(unknown)/界外栅格"的距离场（Chamfer 3-4 两遍扫描，一次性），
 //      运行时 O(1) 查询分级介入：距边界 < map_edge_stop_dist(0.5m) → 零速
 //      （测试模式升级为中止锁存）；< map_edge_slow_dist(1.5m) → 线性限速
 //      （/safety/state 新增 MAP_EDGE_STOP / MAP_EDGE_SLOWDOWN）。建图模式无
-//      /map 与 AMCL，监护自动静默不介入（建图巡航安全由 cruise_* 与人工保障）。
+//      /map 与重定位位姿，监护自动静默不介入（建图巡航安全由 cruise_* 与人工保障）。
 //      规划层（Nav2 track_unknown_space + allow_unknown=false）与任务层
 //      （auto_mission 航点校验）为前两道防线，本监护为行驶中最后一道。
 //
@@ -214,13 +214,14 @@ public:
     //   /map —— map_server 以 transient_local 发布一次（volatile 订阅会漏收，
     //   同 V0.0.82 auto_mission 教训）；缓存后构建"到最近未建图(unknown)/
     //   界外栅格"距离场，静态地图仅构建一次；
-    //   /amcl_pose —— AMCL map 系位姿（仅导航模式存在；update_min_d=0.15m
-    //   低速下数 Hz，监护足够）。建图模式两者皆无 → 监护自动不介入。
+    //   /relocalization/pose —— V0.0.93 方案A：hunter_relocalization(NDT) 发布的
+    //   map 系位姿（原 /amcl_pose，AMCL 已移除）。仅导航模式存在（~2Hz），
+    //   监护足够。建图模式两者皆无 → 监护自动不介入。
     map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       "/map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
       std::bind(&SafetyGuard::mapCallback, this, std::placeholders::_1));
     amcl_pose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      "/amcl_pose", rclcpp::SensorDataQoS(),
+      "/relocalization/pose", rclcpp::SensorDataQoS(),
       [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
         std::lock_guard<std::mutex> lk(data_mutex_);
         fence_pose_x_ = msg->pose.pose.position.x;
@@ -278,7 +279,7 @@ public:
       "stop=%.2fm, slow=%.2fm, 走廊±%.2fm（车体包络 %.2f/%.2f/%.2f+m%.2f）, "
       "扇区±%.0f°, scan超时%.2fs；"
       "测试模式=%s（限速%.2fm/s, 急停%.1fm, 减速%.1fm, 卡死判定%.1fs, 断流判定%.1fs）；"
-      "地图边界监护=%s（停车%.2fm, 减速%.2fm，/map+/amcl_pose 就绪后生效）",
+      "地图边界监护=%s（停车%.2fm, 减速%.2fm，/map+/relocalization/pose 就绪后生效）",
       max_linear_vel_, min_turn_radius_, stop_dist_, slow_dist_,
       corridor_half_width_, footprint_front_, footprint_rear_, footprint_half_width_,
       self_margin_, sector_half_rad_ * 180.0 / M_PI, scan_timeout_,
@@ -535,7 +536,7 @@ private:
     // 5.5 V0.0.87 地图边界监护：行驶范围不得超出已采集（已建图）地图区域。
     // 与碰撞闸同构分级——减速区线性限速、停车区零速；测试模式越界升级为
     // 中止锁存（越界即异常，人工确认后重开）。距离场/位姿未就绪（建图模式、
-    // 启动早期、AMCL 未输出）时不介入，由规划层与航点校验兜底。
+    // 启动早期、重定位未输出）时不介入，由规划层与航点校验兜底。
     if (enable_map_fence_) {
       const double edge_d = mapEdgeDistance();
       if (edge_d >= 0.0) {
@@ -774,12 +775,12 @@ private:
     }
     RCLCPP_INFO(get_logger(),
       "[边界监护] 已就绪：栅格 %dx%d @%.3fm/cell，车辆距未建图/界外区域 "
-      "<%.2fm 零速、<%.2fm 限速（数据源 /map + /amcl_pose）",
+      "<%.2fm 零速、<%.2fm 限速（数据源 /map + /relocalization/pose）",
       w, h, msg->info.resolution, map_edge_stop_dist_, map_edge_slow_dist_);
   }
 
   // 查询机器人当前位置到最近未建图(unknown)/地图界外栅格的距离（m）。
-  // 返回 -1.0 = 监护不可用（地图未就绪或 /amcl_pose 未到达，调用方不介入）；
+  // 返回 -1.0 = 监护不可用（地图未就绪或 /relocalization/pose 未到达，调用方不介入）；
   // 位姿在栅格界外 → 0（直接视为越界）。
   double mapEdgeDistance()
   {

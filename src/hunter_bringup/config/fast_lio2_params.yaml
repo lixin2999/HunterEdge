@@ -60,7 +60,7 @@ fast_lio2:
       #   本版 publish_map() 是"每 1s 追加当前帧"的无界累积（laserMapping.cpp:594，
       #   原版 featsFromMap 有界发布逻辑已被注释），叠加 dense_publish_en=true，
       #   若开 map_en 长时间运行内存/带宽持续暴涨（rviz 卡死风险）。
-      #   rviz 观察点云请直接用 /cloud_registered（10Hz，camera_init 系）+ Decay Time 累积显示。
+      #   rviz 观察点云请直接用 /cloud_registered（10Hz，odom 系，原 camera_init）+ Decay Time 累积显示。
       path_en: false
       scan_publish_en: true
       dense_publish_en: true

@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V1.4（开发指南，对应软件基线 V0.0.92：导航启动前新增 AMCL 收敛门控（订阅 `/amcl_pose`，`isLocalizationValid`/`isAutoConditionMet` 同步校验 EKF+AMCL 协方差）；起步清图从 fire-and-forget 改为同步门控（服务未就绪时每 100ms 重试直到成功才发 goal）；行为树重规划频率从 2Hz 降回 1Hz，修复“走几步即停”故障链）
+> **文档版本**：V1.5（开发指南，对应软件基线 V0.0.93：**方案A 定位架构重构**——`odom→base_link` TF 单一所有权（底盘与 EKF 均 `publish_tf=false`，FAST-LIO2 独占并帧名归一 `camera_init/body`→`odom/base_link`）；新增 `hunter_relocalization`（NDT 点云对先验 .pcd 配准）发布 `map→odom` 替代 AMCL；局部控制 RPP→MPPI（Ackermann 模型）；健康闸门改判 `/relocalization/pose`，彻底根治因 TF 双发布者打架导致的“无法自主导航巡航”）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -331,15 +331,15 @@ ros2 launch hunter_bringup hunter_full.launch.py \
 
 > 💡 **【开发者视角】** 模块化启动便于逐模块联调；`hunter_full.launch.py` 的参数开关见上表（设计文档 §4.4）。
 
-### 7.6 坐标系与 TF 树（V0.0.70 修订）
+### 7.6 坐标系与 TF 树（V0.0.93 方案A 修订）
 
-系统 TF 由两类发布者构成，**相机驱动自身 TF 已关闭**，不存在双父：
+每条 TF 边严格**单一发布者**（打架是 V0.0.93 之前“无法自主巡航”根因）：
 
 | TF 段 | 发布者 | 说明 |
 |-------|--------|------|
 | `base_link → rslidar` / `camera_color_optical_frame` / `imu` | `robot_state_publisher`（URDF 静态外参，文档 7.4/附录D） | 相机外参唯一来源（`camera_color_joint`：xyz 0.40/0/0.30，rpy 0/-π/2/π/2） |
-| `odom → base_link` | EKF（`ekf_params.yaml` 中 `publish_tf: true`） | 定位输出 |
-| `map → odom` | 后续全局定位模块（当前未接入） | — |
+| `odom → base_link` | **FAST-LIO2**（`laserMapping.cpp` 唯一广播；底盘 `hunter_base` 与 EKF 均 `publish_tf=false`） | LIO 紧耦合里程计；帧名已归一（原 camera_init/body） |
+| `map → odom` | **`hunter_relocalization`**（NDT 点云配准，V0.0.93 新增） | 将实时点云对齐先验全局 .pcd；替代 AMCL |
 
 - `realsense2_camera` 驱动在 `hunter_full.launch.py` 中固定传入 **`publish_tf: 'false'`**：驱动自建 `camera_link` 树与 URDF 对 `camera_color_optical_frame` 构成同 frame 双父，TF 树分裂为 `base_link` / `camera_link` 两棵，sensor_fusion `lookupTransform` 必败（报 `TF unconnected trees`，V0.0.70 现场问题）；驱动 TF 无任何消费者（相机外参唯一来源是 URDF；`align_depth` 在驱动内部完成不依赖 ROS TF），关闭无副作用，仅 RViz 少显示 realsense 原生 TF 视角；
 - 验证：`ros2 run tf2_ros tf2_echo base_link camera_color_optical_frame` 应输出 translation (0.40, 0.00, 0.30)、rotation 对应 rpy (0, −π/2, π/2)；调试可用 `ros2 run tf2_tools view_frames` 导出 frames.pdf 确认全树单棵连通。
@@ -436,7 +436,7 @@ hunter_full.launch.py (use_autonomous_nav:=true)
 | 无急停信号 | 订阅 `/estop` |
 | `SystemHealth` 非 `CRITICAL` | 订阅 `/system/health` |
 | 定位协方差迹 ≤ 0.5（可配） | 订阅 `/localization/odom` 协方差对角元素 |
-| **AMCL x+y 方差和 ≤ 0.60（可配，V0.0.92 新增）** | 订阅 `/amcl_pose`（`transient_local+reliable`，与 AMCL 发布 QoS 对齐） |
+| **全局重定位(NDT) x+y 方差和 ≤ 0.10（可配，V0.0.93）** | 订阅 `/relocalization/pose`（hunter_relocalization 收敛时小协方差、未收敛时大协方差） |
 | 感知数据新鲜度 ≤ 2s（可配） | 订阅 `/perception/fused_objects` 时间戳 |
 
 ### 10.3 任务状态机
@@ -458,11 +458,11 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 | `warn_obstacle_dist` | 1.5 m | 障碍物减速警告距离（V0.0.89 窄小测试场地档） |
 | `stop_obstacle_dist` | 0.6 m | 障碍物急停距离（V0.0.89，略大于 footprint 前缘 0.45） |
 | `obstacle_fov_deg` | 120° | 前向检测扇区 |
-| `localize_cov_threshold` | 0.5 | EKF（odom→base_link）定位协方差迹收敛阈值 |
-| `amcl_cov_threshold` | 0.60 | AMCL（map→base_link）x+y 方差和收敛阈值（**V0.0.92 新增**；故意略高于 `set_initial_pose:true` 初始帧方差和 0.5，使“上电位姿=建图起点”可即时放行；若车辆上电不在建图起点，需调低至 0.10 并手动 rviz2 `2D Pose Estimate` 重定位） |
-| `localize_wait_timeout` | 15 s | 等待定位收敛超时（V0.0.92 由 10s 调至 15s，AMCL 需多帧扫描收敛） |
+| `localize_cov_threshold` | 0.5 | 里程计（odom→base_link）定位协方差迹收敛阈值 |
+| `amcl_cov_threshold` | 0.10 | 全局重定位(NDT)（map→base_link）x+y 方差和收敛阈值（**V0.0.93 语义由 AMCL 改为 NDT**；成员名沿用 amcl_*。hunter_relocalization 收敛时发布 covariance[0]=[7]=0.01（和=0.02）放行，未收敛时=100（和=200）拦截） |
+| `localize_wait_timeout` | 15 s | 等待定位收敛超时（NDT 首帧即可收敛，保留 15s 供大场景首帧充分扫到特征） |
 | `perception_timeout` | 2 s | 感知数据超时阈值 |
-| `max_velocity` | 0.5 m/s | 巡航速度（V0.0.89 窄小测试场地低速档，与 RPP desired_linear_vel/velocity_smoother/safety_guard 一致） |
+| `max_velocity` | 0.5 m/s | 巡航速度（V0.0.89 窄小测试场地低速档，与 MPPI vx_max/velocity_smoother/safety_guard 一致） |
 | `loop_waypoints` | `true` | 完成所有航点后是否循环 |
 | `goal_timeout` | 90 s | 单点导航超时（V0.0.89，非运动恢复周期变长） |
 | `obstacle_wait_timeout` | 30 s | 障碍物等待超时后触发 ESTOP |
@@ -481,9 +481,9 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 
 - **定位门控**：`TransformAvailable(map→base_link)` 前置检查，定位不可用时立即阻断导航；
 - **感知保鲜**：`TimeExpired(2s)` 哨兵，感知超时时清除局部代价地图并等待恢复；
-- ~~动态减速~~（V0.0.82 移除 `SpeedController`：本 fork 该节点为按平滑速度调子树 tick 周期的装饰器，无"障碍物距离→限速"语义）；障碍物减速由 RPP `use_cost_regulated_linear_velocity_scaling`（近障碍自动降速）+ approach 减速承担；
-- ~~阿克曼后退~~（V0.0.89 移除）：`BackUp`/`Spin` 等**运动型恢复已全部删除**——窄小测试场地内倒车会把车倒进更差的致命栅格、AMCL 位姿随之跳变，导致"只退不进"；恢复退化为"清除全局/局部代价地图 + `Wait` 后重试"的非运动组合，车辆**只前进不倒车**（velocity_smoother 同步硬禁倒车）。
-- ~~重规划提速~~（V0.0.85 1.0→2.0Hz，**V0.0.92 回退至 1.0Hz**）：实车复盘发现，2Hz 重规划在代价地图残留假障碍时会与脏图更新同频共振，导致 RPP 转向角全幅振荡（蛇形行驶）；1Hz + 起步清图同步门控（`clearCostmapsOnStart()`，V0.0.92）已足够覆盖动态障碍响应（safety_guard 物理碰撞闸 + RPP 近障碍降速兜底），且不再放大感知噪声。
+- ~~动态减速~~（V0.0.82 移除 `SpeedController`：本 fork 该节点为按平滑速度调子树 tick 周期的装饰器，无"障碍物距离→限速"语义）；障碍物减速由 **MPPI** `CostCritic`/`PathAlignCritic`（近障碍自动降速，V0.0.93）+ approach 减速承担；
+- ~~阿克曼后退~~（V0.0.89 移除）：`BackUp`/`Spin` 等**运动型恢复已全部删除**——窄小测试场地内倒车会把车倒进更差的致命栅格、重定位位姿随之跳变，导致"只退不进"；恢复退化为"清除全局/局部代价地图 + `Wait` 后重试"的非运动组合，车辆**只前进不倒车**（velocity_smoother 同步硬禁倒车，与 MPPI vx_min=0 协同）。
+- ~~重规划提速~~（V0.0.85 1.0→2.0Hz，**V0.0.92 回退至 1.0Hz**）：实车复盘发现，2Hz 重规划在代价地图残留假障碍时会与脏图更新同频共振，导致控制器转向角全幅振荡（蛇形行驶）；1Hz + 起步清图同步门控（`clearCostmapsOnStart()`，V0.0.92）已足够覆盖动态障碍响应（safety_guard 物理碰撞闸 + MPPI 近障碍降速兜底），且不再放大感知噪声。
 
 ### 10.8 碰撞防护与安全约束（V0.0.85 新增 hunter_safety/safety_guard）
 
@@ -513,8 +513,8 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 > track_unknown_space: true` + Smac `allow_unknown: false`，全局规划路径不穿越
 > 未采集区域；② 任务层：auto_mission 发送航点前校验（矩形边界+0.5m 边距+
 > 非 unknown 栅格），越界航点自动跳过；③ 执行层：safety_guard 地图边界监护
-> （/map + /amcl_pose 距离场，上表最后两行），行驶中越界零速兜底。建图模式
-> 无 /map 与 AMCL，③ 自动不介入。
+> （/map + /relocalization/pose 距离场，上表最后两行），行驶中越界零速兜底。建图模式
+> 无 /map 与重定位位姿，③ 自动不介入。
 
 分级预警：/safety/state（std_msgs/String）2Hz 心跳，格式 状态|原因；
 仅导航模式启动（mapping 模式 auto_mission cruise 直发 /cmd_vel，避免双发布者）。
@@ -535,7 +535,7 @@ ros2 topic pub --once /safety/test_mode std_msgs/msg/Bool "{data: false}"  # 关
 
 地图边界监护（V0.0.87）运行时参数（launch 注入，默认全开；V0.0.89 窄场地适配）：
 `enable_map_fence`（开关）、`map_edge_stop_dist`（0.4m 零速阈值）、
-`map_edge_slow_dist`（1.0m 减速阈值）；监护在 /map 与 /amcl_pose 均就绪后生效，
+`map_edge_slow_dist`（1.0m 减速阈值）；监护在 /map 与 /relocalization/pose 均就绪后生效，
 启动日志输出 `[边界监护] 已就绪：栅格 WxH @0.050m/cell ...`。
 
 ### 10.9 新增/修改文件清单
@@ -722,7 +722,7 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | LiDAR 无点云 | 网络 / 电源 / IP 配置 | `ping` LiDAR IP、检查供电、`rosnode list` |
 | 相机无图像 | USB 连接 / 权限 | 检查 USB、`ls /dev/video*`、权限配置 |
 | 定位漂移大 | IMU 标定 / 轮速 / 外参 | 检查 IMU 数据、外参文件、EKF 参数 |
-| 控制抖动 | 控制参数 / 延迟 | 调整 RPP 参数、检查控制频率 |
+| 控制抖动 | 控制参数 / 延迟 | 调整 MPPI 参数（critics 权重/时间步）、检查控制频率 |
 | 系统卡顿 | GPU / CPU / 温度 | `tegrastats` 查看资源、降温、降频 |
 | 无法连平台 | 网络 / 证书 / Kafka | 检查 4G/WiFi、证书有效期、Kafka 配置 |
 | 视觉节点每帧崩溃（`setSize` 断言） | OpenCV 4.10 / 4.5.4 **混链**（同进程两套 OpenCV，破坏 `cv::Mat` 不变量） | `ldd vision_perception_node \| grep opencv`：只允许 `so.410`、无 `4.5d`、无 `libcv_bridge`；异常时按 §6 专项重编（禁止在视觉进程重新引入 cv_bridge） |
@@ -743,12 +743,12 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | 《自动驾驶车辆系统详细设计文档 V2.0》 | 本项目的设计基准；本文档全部参数、话题、CAN 协议、坐标系均可追溯至其对应章节 |
 | AI 编码任务清单 | 分模块开发任务（任务 00 ~ 任务 17），指导按模块开发与验收 |
 | `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程） |
-| `Deployment_Guide.md` | 部署操作文档 V1.0（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.0.72） |
+| `Deployment_Guide.md` | 部署操作文档 V1.5（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.0.93） |
 | `release.md` | 版本历史（V0.0.1 ~ 当前），记录每版主要功能与修复 |
 
 > **追溯原则**：本 README 中所有硬件参数（§2）、软件版本（§3）、话题（§8）、控制模式（§9）、限制（§13）均源自《自动驾驶车辆系统详细设计文档 V2.0》，未虚构功能。自主导航模块（§10）为在设计文档框架内的扩展实现。
 
 ---
 
-*HunterEdge 开发指南 · 文档版本 V1.2 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.70 现场实测修正*
+*HunterEdge 开发指南 · 文档版本 V1.5 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.93 现场实测修正（V0.0.89：窄小测试场地低速档；V0.0.91：走廊净空碰撞闸、`FAULT` 锁存态；V0.0.92：起步清图同步重试、行为树重规划回退 1Hz；V0.0.93：方案A 定位架构重构——TF 单一所有权、hunter_relocalization(NDT) 替代 AMCL、RPP→MPPI）*
 

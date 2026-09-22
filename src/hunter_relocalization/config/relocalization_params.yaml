@@ -1,0 +1,29 @@
+# relocalization_params.yaml — 方案A 全局 NDT 重定位（V0.0.93）
+# 节点：hunter_relocalization/ndt_relocalization_node
+# 职责：将 FAST-LIO2 实时点云（odom 系）配准到先验 .pcd（map 系），发布 map→odom TF。
+hunter_relocalization:
+  ros__parameters:
+    # 全局点云地图绝对路径（建图产物；与 nav2 map_server 的 .yaml 同名换 .pcd 后缀）
+    # 由 hunter_autonomous_nav.launch.py 依 map_yaml_path 自动派生注入；单独调试时可在此填写
+    global_map_path: ""
+
+    world_frame: map          # NDT 目标系（全局地图）
+    odom_frame:  odom         # NDT 源系（FAST-LIO2 实时云所在，帧名已归一）
+    cloud_topic: /cloud_registered
+    publish_rate: 2.0         # Hz：NDT 计算较重，低频持续修正足够
+
+    accumulate_window: 2.0    # s：滚动累积局部子图的时间窗
+    target_voxel_size: 0.5    # m：全局地图降采样体素（大图必做，控内存/耗时）
+    source_voxel_size:  0.25  # m：局部子图降采样体素
+
+    # ---- NDT 求解器 ----
+    ndt_resolution:   1.0     # m：NDT 体素分辨率
+    ndt_step_size:    0.1     # 线搜索步长
+    ndt_epsilon:      0.01    # 收敛阈值（变换增量）
+    ndt_max_iterations: 30
+
+    # ---- 收敛 / 跳变闸门 ----
+    fitness_max:          1.0   # NDT 适应度（越小越好）超过判为未收敛
+    max_step_translation: 0.5   # m/周期：单周期平移跳变上限（防瞬移）
+    max_step_rotation:    0.35  # rad/周期：单周期旋转跳变上限
+    converged_covariance: 0.01  # 收敛时 /relocalization/pose 协方差（auto_mission 门控 <0.10 判收敛）
