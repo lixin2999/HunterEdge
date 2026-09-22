@@ -43,8 +43,9 @@
 // auto_mission cruise 直接发布 /cmd_vel（自带低速与急停逻辑），本节点若
 // 在场会与之冲突。建图巡航安全由 cruise_* 参数与人工遥控接管保障。
 //
-// 参数（默认值与 HunterV2 匹配，AGX_V2 协议实车）：
-//   wheelbase=0.65m（hunter_params.hpp HunterV2Params）
+// 参数（默认值与 HUNTER-SE 实车匹配）：
+//   wheelbase=0.46m（HUNTER-SE 轴距，前/后轴中心距；仅用于 δ_max=atan(L/R_min)
+//     的转向几何叙述——曲率钳制本身以 min_turn_radius 为准，不依赖本值）
 //   min_turn_radius=1.9m（与 nav2_params.yaml Smac minimum_turning_radius 一致）
 
 #include <algorithm>
@@ -77,7 +78,7 @@ public:
   : Node("safety_guard", options)
   {
     // ---- 参数 ----
-    declare_parameter<double>("wheelbase", 0.65);          // HunterV2 轴距（m）
+    declare_parameter<double>("wheelbase", 0.46);          // HUNTER-SE 轴距（m）
     declare_parameter<double>("min_turn_radius", 1.9);     // 与 Smac 规划一致（m）
     declare_parameter<double>("max_linear_vel", 0.8);      // 纵向硬限（m/s）
     declare_parameter<double>("stop_dist", 0.90);           // 碰撞急停距离（m）
@@ -1121,7 +1122,7 @@ private:
   }
 
   // 参数
-  double wheelbase_{0.65};
+  double wheelbase_{0.46};
   double min_turn_radius_{1.9};
   double max_linear_vel_{0.8};
   double stop_dist_{0.6};

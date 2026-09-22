@@ -2,27 +2,31 @@
 <robot name="hunter_se" xmlns:xacro="http://www.ros.org/wiki/xacro">
   <!-- ==================================================================
        HUNTER SE 车辆模型（URDF/Xacro）
-       依据：
-         - 文档 7.4 坐标系定义
-         - 附录 D 传感器安装示意
-         - 文档 9.3 车辆 Footprint
+       依据：《HUNTER SE 用户手册 V2.0.2》§1.2 性能参数（权威实车规格）
+         - 长×宽×高：820 × 640 × 310 mm
+         - 轴距 460 mm / 前后轮距 550 mm / 整备重量 42 kg
+         - 最小转弯半径 1.9 m / 最高速度 4.8 m/s / 最大内轮转向角 22°
+         - 离地间隙 120 mm
+       另参照：文档 7.4 坐标系定义、附录 D 传感器安装示意、文档 9.3 车辆 Footprint
        ================================================================== -->
 
   <!-- 使用 xacro 内置的 pi 常量，不重复定义 -->
 
-  <!-- ========== 车辆本体尺寸（文档 3.1 / 9.3） ========== -->
-  <xacro:property name="length" value="0.82"/>          <!-- 车长 m -->
-  <xacro:property name="width" value="0.64"/>           <!-- 车宽 m -->
-  <xacro:property name="height" value="0.31"/>          <!-- 车高 m -->
-  <xacro:property name="wheelbase" value="0.55"/>       <!-- 轴距 m -->
-  <xacro:property name="front_overhang" value="0.45"/>  <!-- 前悬 m -->
-  <xacro:property name="rear_overhang" value="0.37"/>   <!-- 后悬 m -->
+  <!-- ========== 车辆本体尺寸（手册 §1.2 性能参数） ========== -->
+  <xacro:property name="length" value="0.82"/>          <!-- 车长 m（820mm） -->
+  <xacro:property name="width" value="0.64"/>           <!-- 车宽 m（640mm） -->
+  <xacro:property name="height" value="0.31"/>          <!-- 车高 m（310mm） -->
+  <xacro:property name="wheelbase" value="0.46"/>       <!-- 轴距 m（460mm，前/后轴中心距） -->
+  <xacro:property name="track" value="0.55"/>           <!-- 轮距 m（550mm，左右轮距） -->
+  <xacro:property name="max_steer_angle" value="0.384"/> <!-- 最大内轮转向角 22°=0.384rad（CAN 限幅 ±0.4rad） -->
+  <xacro:property name="front_overhang" value="0.45"/>  <!-- 车体前缘距 base_link m -->
+  <xacro:property name="rear_overhang" value="0.37"/>   <!-- 车体后缘距 base_link m -->
   <xacro:property name="half_width" value="0.32"/>      <!-- 半宽 m -->
-  <xacro:property name="ground_clearance" value="0.12"/> <!-- base_link 距地面 m -->
+  <xacro:property name="ground_clearance" value="0.12"/> <!-- base_link 距地面 m（120mm） -->
 
-  <!-- Footprint（文档 9.3，矩形，原点在后轴中心，含安全余量）：
+  <!-- Footprint（文档 9.3，矩形，原点相对 base_link，与 nav2 代价地图 footprint 一致）：
        [ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]
-       即 前悬 0.45 / 后悬 0.37 / 半宽 0.32，车辆尺寸 0.82m × 0.64m -->
+       即 前缘 0.45 / 后缘 0.37（总长 0.82m = 手册 820mm）、半宽 0.32（总宽 0.64m = 640mm） -->
 
   <!-- ========== 传感器安装偏移（附录 D，相对 base_link） ========== -->
   <xacro:property name="lidar_x" value="0.23"/>
@@ -56,7 +60,7 @@
     </collision>
     <inertial>
       <origin xyz="${(front_overhang - rear_overhang) / 2} 0 ${height / 2 - ground_clearance}" rpy="0 0 0"/>
-      <mass value="45.0"/>
+      <mass value="42.0"/>   <!-- 整备重量 42kg（手册 §1.2） -->
       <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/>
     </inertial>
   </link>

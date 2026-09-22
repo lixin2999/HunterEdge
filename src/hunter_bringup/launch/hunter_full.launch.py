@@ -150,6 +150,10 @@ def generate_launch_description():
     # 导致 hunter_base 打不开设备退出、CAN 0Hz 急停循环）
     can_driver     = _isolated(src('hunter_base',      'launch', 'hunter_base.launch.py'),
                                launch_arguments={'port_name': 'can2',
+                                                 # V0.0.99：实车为 HUNTER-SE，显式指定 robot_model，
+                                                 # 使底盘走 HunterSEParams（轴距 0.52/轮距 0.55/转向限幅），
+                                                 # 覆盖 hunter_base.launch.py 上游默认 hunter2（V2 参数）
+                                                 'robot_model': 'hunter_se',
                                                  # V0.0.93 方案A/P0：底盘让出 odom→base_link TF（归 FAST-LIO2），
                                                  # 仅发布 /odom 话题供 EKF 融合，杜绝双发布者打架
                                                  'publish_tf': 'false'})

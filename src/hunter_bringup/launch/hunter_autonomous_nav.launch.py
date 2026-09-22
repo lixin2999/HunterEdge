@@ -201,7 +201,7 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         output='screen',
         remappings=[('cmd_vel_in', '/cmd_vel_pre_safety')],
         parameters=[{
-            'wheelbase': 0.65,          # HunterV2Params::wheelbase（AGX_V2 实车）
+            'wheelbase': 0.46,          # HUNTER-SE 轴距（m，δ_max 几何叙述用；曲率钳制以 min_turn_radius 为准）
             'min_turn_radius': 1.9,     # 与 Smac minimum_turning_radius 一致
             'max_linear_vel': 0.5,      # V0.0.89 测试场地：与 desired_linear_vel/velocity_smoother 一致 0.5
             # V0.0.91 撞墙事故修正：急停距离必须严格大于 /scan 的 range_min，
