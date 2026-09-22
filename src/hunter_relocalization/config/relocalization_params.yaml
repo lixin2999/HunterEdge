@@ -23,7 +23,16 @@ hunter_relocalization:
     ndt_max_iterations: 30
 
     # ---- 收敛 / 跳变闸门 ----
-    fitness_max:          1.0   # NDT 适应度（越小越好）超过判为未收敛
+    # fitness_max：NDT 适应度（越小越好）超过则对外置信度判“未收敛”（仅影响协方差，不再冻结位姿）。
+    # 运动时 2s 滚动窗口拼接点云畸变会抬高 fit（实测起步~1.03、行驶中稳定~2.1），静止收敛仅 0.02~0.4。
+    # 取 2.5 容纳运动期 fit；TF 跟踪与位姿刷新由 max_step/ceiling 决定，故此值仅管“可否巡航”的置信度。
+    fitness_max:          2.5   # 由 1.0→1.5→2.5，容纳行驶期 fit 抬升（TF 仍会自适应跟踪）
     max_step_translation: 0.5   # m/周期：单周期平移跳变上限（防瞬移）
     max_step_rotation:    0.35  # rad/周期：单周期旋转跳变上限
     converged_covariance: 0.01  # 收敛时 /relocalization/pose 协方差（auto_mission 门控 <0.10 判收敛）
+    # 连续失败去抖：连续 N 个周期超闸门才对外宣告“未收敛”（大协方差），其间仍保持收敛态
+    # 仅不刷新位姿。2Hz 下 5 帧≈2.5s，抑制单帧抖动导致 auto_mission 秒退 IDLE。
+    diverge_tolerance_cycles: 5
+    # 硬失效 ceiling：fit 超过此值视为严重失准（地图/初始位姿不一致，fit≳4），立即判失效、
+    # 不去抖，绝不在错误位姿上让上层误判收敛而行驶。应 > fitness_max。
+    fitness_hard_ceiling: 3.0

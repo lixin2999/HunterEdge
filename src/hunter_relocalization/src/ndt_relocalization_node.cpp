@@ -62,10 +62,19 @@ public:
     ndt_epsilon_        = declare_parameter<double>("ndt_epsilon", 0.01);
     ndt_max_iters_      = declare_parameter<int>("ndt_max_iterations", 30);
     // 收敛/跳变闸门
-    fitness_max_        = declare_parameter<double>("fitness_max", 1.0);
+    // fitness_max 适度放宽：车辆运动时滚动时间窗拼接的点云存在畸变，NDT fitness 会抬升
+    // （实测起步时 ~1.03），静止收敛态仅 0.02~0.4。过紧（1.0）会让起步即判“未收敛”→
+    // auto_mission 秒退 IDLE，形成“进 NAVIGATING→立即取消”抖振。
+    fitness_max_        = declare_parameter<double>("fitness_max", 2.5);
     max_step_trans_     = declare_parameter<double>("max_step_translation", 0.5);  // m / 周期
     max_step_rot_       = declare_parameter<double>("max_step_rotation", 0.35);    // rad / 周期
     converged_cov_      = declare_parameter<double>("converged_covariance", 0.01); // 收敛时发布的小协方差
+    // 连续失败去抖：允许连续 N 个周期超闸门仍对外保持“收敛”小协方差（仅不更新位姿），
+    // 只有连续超限达 N 帧才真正发布大协方差告知门控未收敛，抑制单帧抖动导致的状态机反复启停。
+    diverge_tolerance_cycles_ = declare_parameter<int>("diverge_tolerance_cycles", 5);
+    // 硬失效 ceiling：fit 超过此值属“严重失准”（如地图/初始位姿不一致，fit≳4），
+    // 不走去抖，立即对外宣告未收敛，绝不在错误位姿上让上层误判收敛而行驶。
+    fitness_hard_ceiling_ = declare_parameter<double>("fitness_hard_ceiling", 3.0);
 
     // ---- 加载全局地图 ----
     if (!loadGlobalMap()) {
@@ -91,14 +100,25 @@ public:
       std::bind(&NdtRelocalization::initialPoseCallback, this, std::placeholders::_1));
 
     // ---- 发布重定位位姿（供 auto_mission / safety_guard 判定 map 系位姿与收敛性） ----
+    // 必须 transient_local + reliable：下游 auto_mission/safety_guard 以 transient_local 订阅，
+    // 若用默认 VOLATILE 会触发 DURABILITY 不兼容导致整条 /relocalization/pose 断流。
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      "/relocalization/pose", rclcpp::QoS(1));
+      "/relocalization/pose", rclcpp::QoS(rclcpp::KeepLast(5)).transient_local().reliable());
 
     // ---- 主循环定时器 ----
     const double dt = (publish_rate_ > 1e-6) ? (1.0 / publish_rate_) : 0.5;
     timer_ = create_wall_timer(
       std::chrono::milliseconds(static_cast<int>(dt * 1000)),
       std::bind(&NdtRelocalization::alignOnce, this));
+
+    // ---- 高频 TF 保活定时器（与 NDT 解耦）----
+    // NDT 重（2Hz）但下游 controller/costmap 需要“新鲜”的 map→odom：若仅靠 alignOnce
+    // 低频发 TF，odom→map 查询会落在最新 map→odom 样本之后 → tf2 报 extrapolation
+    // into the future → follow_path 无法变换位姿而反复 Abort。此处以 20Hz 广播最近
+    // 一次的 T_map_odom（未刷新则保持旧值），保证 TF 时间戳始终跟随当前时钟。
+    tf_timer_ = create_wall_timer(
+      std::chrono::milliseconds(50),   // 20Hz
+      std::bind(&NdtRelocalization::broadcastTfOnly, this));
 
     RCLCPP_INFO(get_logger(),
       "[relocalization] 启动：map=%s odom=%s cloud=%s rate=%.1fHz map='%s'",
@@ -199,11 +219,25 @@ private:
     RCLCPP_INFO(get_logger(), "[relocalization] 已用 /initialpose 重置 map→odom 初值。");
   }
 
+  // ---------- 高频仅广播 map→odom（取当前缓存值，不跑 NDT） ----------
+  void broadcastTfOnly()
+  {
+    Eigen::Matrix4f T;
+    { std::lock_guard<std::mutex> lk(t_mtx_); T = T_map_odom_; }
+    sendTf(T, rclcpp::Time(now()));
+  }
+
   // ---------- 每个周期：拼子图 → NDT → 闸门 → 广播 ----------
   void alignOnce()
   {
+    rclcpp::Time stamp(now());
     if (!ndt_ || target_ == nullptr) {
-      publishPose(1e8, 100.0, rclcpp::Time(now()));  // 无地图：大协方差=未收敛
+      // 即使无法配准，也必须广播 map→odom（用当前/单位初值），否则 map 系永不建立，
+      // Nav2 global_costmap 会因等不到 map TF 而激活超时、整栈 Aborting。
+      Eigen::Matrix4f keep;
+      { std::lock_guard<std::mutex> lk(t_mtx_); keep = T_map_odom_; }
+      sendTf(keep, stamp);
+      publishPose(1e8, 100.0, stamp);  // 无地图：大协方差=未收敛
       return;
     }
 
@@ -215,8 +249,12 @@ private:
     }
     if (src->size() < 50) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-        "[relocalization] 局部点云过少(%zu)，等待传感器...", src->size());
-      publishPose(1e8, 100.0, rclcpp::Time(now()));
+        "[relocalization] 局部点云过少(%zu)，等待传感器...（已维持 map→odom 保活）", src->size());
+      // 数据不足期间同样保活 map→odom，仅置大协方差告知门控未收敛（不发 TF 会让 map 系永缺）
+      Eigen::Matrix4f keep;
+      { std::lock_guard<std::mutex> lk(t_mtx_); keep = T_map_odom_; }
+      sendTf(keep, stamp);
+      publishPose(1e8, 100.0, stamp);
       return;
     }
     pcl::VoxelGrid<pcl::PointXYZI> vg;
@@ -241,29 +279,57 @@ private:
       Eigen::Matrix4f delta = guess.inverse() * result;
       double dtrans = delta.block<3,1>(0,3).norm();
       double drot   = std::acos(std::max(-1.0, std::min(1.0,
-                    (delta.block<3,3>(0,3).trace() - 1.0) * 0.5)));
+                    (delta.block<3,3>(0,0).trace() - 1.0) * 0.5)));
       step_ok = (dtrans <= max_step_trans_) && (drot <= max_step_rot_);
     }
 
-    rclcpp::Time stamp(now());
-    if (converged && step_ok) {
-      std::lock_guard<std::mutex> lk(t_mtx_);
-      T_map_odom_ = result;
-      has_prev_   = true;
-      sendTf(result, stamp);
-      publishPose(fitness, converged_cov_, stamp);
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 4000,
-        "[relocalization] ✓ 收敛 fit=%.3f 位置(%.2f,%.2f,%.2f)",
-        fitness, result(0,3), result(1,3), result(2,3));
+    rclcpp::Time stamp2(now());
+    // 解耦“跟踪”与“置信度”（V0.0.94）：
+    //  - 跟踪（是否刷新 map→odom 以跟随运动）：只要不是跳变(step_ok) 且非严重失准(fit<=ceiling) 就接受本帧，
+    //    避免旧版“fit 一超阈值就冻结位姿”→车动云偏→fit 更高→永不回弹的死亡螺旋。
+    //  - 置信度（对外协方差，供 auto_mission 门控）：fit<=fitness_max 视为收敛；否则去抖计数，
+    //    连续超阈值达 N 帧才对外宣告未收敛（大协方差）。
+    const bool tracking = step_ok && (fitness <= fitness_hard_ceiling_);
+    if (tracking) {
+      // 接受位姿更新以持续跟踪（含 fit 略高的运动畸变帧）
+      // 写共享状态时短暂持锁，且务必在调用 publishPose（内部会再加 t_mtx_）之前释放，避免自死锁。
+      {
+        std::lock_guard<std::mutex> lk(t_mtx_);
+        T_map_odom_ = result;
+        has_prev_   = true;
+      }
+      sendTf(result, stamp2);
+      if (converged) {
+        miss_streak_ = 0;   // 恢复收敛，清零连续失败计数
+        publishPose(fitness, converged_cov_, stamp2);
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 4000,
+          "[relocalization] ✓ 收敛 fit=%.3f 位置(%.2f,%.2f,%.2f)",
+          fitness, result(0,3), result(1,3), result(2,3));
+      } else {
+        // 在跟踪但置信度不足（多为运动畸变）：去抖，未达阈值前仍报收敛、持续刷新位姿
+        ++miss_streak_;
+        if (miss_streak_ >= diverge_tolerance_cycles_) {
+          publishPose(fitness, 100.0, stamp2);
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+            "[relocalization] ✗ 连续%d周期 fit>%.2f(fit=%.3f)（TF 仍跟踪），宣告置信度不足",
+            miss_streak_, fitness_max_, fitness);
+        } else {
+          publishPose(fitness, converged_cov_, stamp2);
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+            "[relocalization] ！运动畸变 fit=%.3f 第%d/%d，TF 跟踪中，去抖保持收敛",
+            fitness, miss_streak_, diverge_tolerance_cycles_);
+        }
+      }
     } else {
-      // 维持旧 TF，发布大协方差告知门控“未收敛”
+      // 跳变或严重失准：拒绝刷新位姿（防瞬移/防跟错），维持旧 TF，直接宣告不可信
       Eigen::Matrix4f keep;
       { std::lock_guard<std::mutex> lk(t_mtx_); keep = T_map_odom_; }
-      sendTf(keep, stamp);
-      publishPose(fitness, 100.0, stamp);
+      sendTf(keep, stamp2);
+      ++miss_streak_;
+      publishPose(fitness, 100.0, stamp2);
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-        "[relocalization] ✗ 未收敛(converged=%d fit=%.3f<=%.2f step_ok=%d)，保持上次位姿",
-        static_cast<int>(ndt_->hasConverged()), fitness, fitness_max_, static_cast<int>(step_ok));
+        "[relocalization] ✗ 位姿拒绝刷新(step_ok=%d fit=%.3f ceiling=%.2f)，维持旧位姿并宣告失效",
+        static_cast<int>(step_ok), fitness, fitness_hard_ceiling_);
     }
   }
 
@@ -277,7 +343,7 @@ private:
     ts.transform.translation.x = T(0,3);
     ts.transform.translation.y = T(1,3);
     ts.transform.translation.z = T(2,3);
-    Eigen::Quaternionf q(T.block<3,3>(0,3));
+    Eigen::Quaternionf q(T.block<3,3>(0,0));
     q.normalize();
     ts.transform.rotation.x = q.x();
     ts.transform.rotation.y = q.y();
@@ -307,7 +373,7 @@ private:
     p.pose.pose.position.x = T_map_base(0,3);
     p.pose.pose.position.y = T_map_base(1,3);
     p.pose.pose.position.z = T_map_base(2,3);
-    Eigen::Quaternionf q(T_map_base.block<3,3>(0,3)); q.normalize();
+    Eigen::Quaternionf q(T_map_base.block<3,3>(0,0)); q.normalize();
     p.pose.pose.orientation.w = q.w();
     p.pose.pose.orientation.x = q.x();
     p.pose.pose.orientation.y = q.y();
@@ -338,6 +404,8 @@ private:
   double ndt_resolution_, ndt_step_size_, ndt_epsilon_, fitness_max_;
   double max_step_trans_, max_step_rot_, converged_cov_;
   int ndt_max_iters_;
+  int diverge_tolerance_cycles_;   // 连续失败去抖阈值（周期数）
+  double fitness_hard_ceiling_;     // 硬失效 ceiling（超过立即判失效，不走_debounce）
 
   pcl::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI>::Ptr ndt_
     = std::make_shared<pcl::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI>>();
@@ -349,12 +417,14 @@ private:
 
   Eigen::Matrix4f T_map_odom_ = Eigen::Matrix4f::Identity();
   bool has_prev_ = false;
+  int miss_streak_ = 0;            // 连续未收敛周期计数（仅 alignOnce 单线程访问）
   std::mutex t_mtx_;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr tf_timer_;   // 20Hz 高频 TF 保活（与 NDT 解耦）
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;

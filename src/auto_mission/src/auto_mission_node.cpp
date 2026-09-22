@@ -89,9 +89,9 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
   // ---- 代价地图清除服务（V0.0.91）----
   // 遥控接管后重新自主的标配动作：接管期车辆会压过此前被标记的栅格，
   // 叠加定位跳变在地图上留下的假障碍，不清一次就大概率“起点在致命栅格”。
-  clear_global_costmap_srv_ = create_client<std_srvs::srv::Empty>(
+  clear_global_costmap_srv_ = create_client<nav2_msgs::srv::ClearEntireCostmap>(
     "/global_costmap/clear_entirely_global_costmap");
-  clear_local_costmap_srv_ = create_client<std_srvs::srv::Empty>(
+  clear_local_costmap_srv_ = create_client<nav2_msgs::srv::ClearEntireCostmap>(
     "/local_costmap/clear_entirely_local_costmap");
 
   // ---- 建图模式自动巡航设施 ----
@@ -852,11 +852,11 @@ void AutoMissionNode::mainLoop()
       // 此处每 100ms（10Hz 主循环）重试一次，服务就绪后去除标志，再在下方发送 goal。
       if (costmaps_clear_pending_.load()) {
         const auto try_clear_retry =
-          [this](const rclcpp::Client<std_srvs::srv::Empty>::SharedPtr & cli, const char * name) {
+          [this](const rclcpp::Client<nav2_msgs::srv::ClearEntireCostmap>::SharedPtr & cli, const char * name) {
             if (!cli->service_is_ready()) {
               return false;
             }
-            cli->async_send_request(std::make_shared<std_srvs::srv::Empty::Request>());
+            cli->async_send_request(std::make_shared<nav2_msgs::srv::ClearEntireCostmap::Request>());
             RCLCPP_INFO(get_logger(), "[清图重试] 已请求清除 %s", name);
             return true;
           };
@@ -1416,13 +1416,13 @@ void AutoMissionNode::clearCostmapsOnStart()
   costmaps_clear_pending_.store(true);
 
   const auto try_clear =
-    [this](const rclcpp::Client<std_srvs::srv::Empty>::SharedPtr & cli, const char * name) {
+    [this](const rclcpp::Client<nav2_msgs::srv::ClearEntireCostmap>::SharedPtr & cli, const char * name) {
       if (!cli->service_is_ready()) {
         RCLCPP_WARN(get_logger(),
           "[清图] %s 未就绪，将在 NAVIGATING 中每 100ms 重试", name);
         return false;
       }
-      cli->async_send_request(std::make_shared<std_srvs::srv::Empty::Request>());
+      cli->async_send_request(std::make_shared<nav2_msgs::srv::ClearEntireCostmap::Request>());
       RCLCPP_INFO(get_logger(), "[清图] 已请求清除 %s", name);
       return true;
     };

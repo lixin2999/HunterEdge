@@ -26,6 +26,7 @@
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/action/follow_waypoints.hpp"
+#include "nav2_msgs/srv/clear_entire_costmap.hpp"   // V0.0.93：清图服务真实类型（CycloneDDS 下 std_srvs/Empty 无法就绪）
 #include "lifecycle_msgs/srv/get_state.hpp"
 
 #include "hunter_msgs/msg/behavior_state.hpp"
@@ -161,8 +162,11 @@ private:
   std::atomic<bool> costmaps_clear_pending_{false};  // V0.0.92：进入 NAVIGATING 后若服务未就绪则重试清图
 
   // ---- 代价地图清除客户端（V0.0.91：任务（重）启动时主动清障） ----
-  rclcpp::Client<std_srvs::srv::Empty>::SharedPtr clear_global_costmap_srv_;
-  rclcpp::Client<std_srvs::srv::Empty>::SharedPtr clear_local_costmap_srv_;
+  // 注意：Nav2 clear_entirely_*_costmap 服务主类型为 nav2_msgs/srv/ClearEntireCostmap，
+  // 虽序列化兼容 std_srvs/Empty，但 CycloneDDS graph 匹配只认主类型，用 Empty 会导致
+  // service_is_ready() 恒 false、清图门控永久 PEND、goal 永不发送。故此处必须用原生类型。
+  rclcpp::Client<nav2_msgs::srv::ClearEntireCostmap>::SharedPtr clear_global_costmap_srv_;
+  rclcpp::Client<nav2_msgs::srv::ClearEntireCostmap>::SharedPtr clear_local_costmap_srv_;
   std::atomic<bool> nav_active_{false};        // bt_navigator 是否 ACTIVE
   rclcpp::Time nav_state_query_time_{0, 0, RCL_ROS_TIME};  // 上次状态查询时刻（1Hz 节流）
   rclcpp::Time nav_wait_start_{0, 0, RCL_ROS_TIME};        // 开始等待 bt_navigator 激活的时刻

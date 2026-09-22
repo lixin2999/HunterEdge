@@ -78,7 +78,8 @@ controller_server:
       critics: ["ConstraintCritic", "CostCritic", "GoalCritic",
                 "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
                 "PathAngleCritic", "PreferForwardCritic"]
-      ConstraintCritic: enabled: true
+      ConstraintCritic:
+        enabled: true
       CostCritic:
         enabled: true
         cost_weight: 3.0                       # 近障避让主权重
