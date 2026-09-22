@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -134,12 +135,15 @@ private:
   static double wrapAngle(double a);                 // 归一化到 [-π, π]
 
   // ---- Nav2 action 回调 ----
+  // V0.0.97：两个回调都带 goal 世代号 epoch，用于丢弃【过期 goal】的响应/结果
   void goalResponseCallback(
+    uint64_t epoch,
     const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr & handle);
   void feedbackCallback(
     rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr,
     const std::shared_ptr<const nav2_msgs::action::NavigateToPose::Feedback> feedback);
   void resultCallback(
+    uint64_t epoch,
     const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::WrappedResult & result);
 
   // ---- 状态发布 ----
@@ -221,6 +225,17 @@ private:
   //   判据由"位移标量"改为"朝目标推进量"（= 起始距离 − 当前距离）：
   //   行为树脱困倒车会增大到目标距离 → 推进量为负 → 仍判受阻，而位移标量会被"后退"骗过。
   double goal_start_dist_{-1.0};
+  // V0.0.97 绕障机动里程：自本 goal 发出起累计的行驶路程（|Δ位姿| 之和，map 系）。
+  //   作用：区分"真卡死（不动）"与"多点掉头/受限倒车绕障中（净推进为负但在动）"。
+  //   现场（V0.0.96 日志）：车被 1.0m 碰撞闸按停 → 满舵原地死磕 20s、位姿纹丝不动
+  //   （累计行程 ≈0）→ 该判受阻；而 V0.0.97 放开倒车 + REEDS_SHEPP 后，绕障会出现
+  //   "倒 0.4m→进 0.5m→再倒"的多段机动，净推进可能长期 <0.15m 却始终在机动，
+  //   用里程上限（stall_path_allow_m）把这类正常机动从"受阻"里摘出去，
+  //   真兜底交给单航点超时 goal_timeout_。
+  double goal_path_len_{0.0};
+  double last_stall_x_{0.0};
+  double last_stall_y_{0.0};
+  bool has_last_stall_pose_{false};
   // V0.0.95 主动取消标记：取消与换点已由取消方（受阻/超时/降级）完成，
   //   resultCallback 收到 CANCELED 时据此跳过重复的 fail_count++ 与换点，
   //   否则一次受阻会连跳两个航点并提前触发 FAULT。
@@ -254,6 +269,18 @@ private:
   // ---- Nav2 goal handle ----
   rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr goal_handle_;
   std::mutex goal_handle_mutex_;
+  // V0.0.97 goal 世代号（epoch）：每次 async_send_goal【之前】自增，并把当时的取值
+  //   绑定进 goal_response/result 回调。回调据此丢弃"已放弃的旧 goal"留下的结果。
+  //   现场故障链（V0.0.96 实车日志 1790055992~1790055995）：本节点因"受阻"主动
+  //   cancel 旧 goal 后立刻发新 goal，旧 goal 的结果以 **ABORTED**（而非 CANCELED，
+  //   因行为树当时已失败）返回 →
+  //     ① 旧结果被当成【新航点】的失败：一次受阻连跳 2 个航点、fail_count 迅速
+  //        3/3 → FAULT 误锁存（车其实还在正常行驶）；
+  //     ② 旧结果在回调开头清空 goal_in_flight_/goal_handle_，导致随后的
+  //        cancelCurrentGoal() 变成空操作 → FAULT 后行为树仍在驱动车辆满舵倒车
+  //        机动 10 分钟（1790056004~1790056157），现场看到"车不停乱动"。
+  //   有了世代号，过期结果一律丢弃：既不误计失败，也不破坏在途 goal 的句柄。
+  uint64_t goal_epoch_{0};
 
   // ---- 参数 ----
   // 模式
@@ -275,9 +302,12 @@ private:
   double nav_active_wait_timeout_{60.0}; // NAVIGATING 中等待 bt_navigator 激活的超时（s）
   double nav_retry_backoff_{2.0};      // goal 被拒/失败后的重试退避（s）
   // V0.0.95 航点“已到达”预检与受阻检测
-  double already_reached_dist_{0.30};  // 航点到达判定半径（m）：车与航点位置重合即跳过，不再发 goal
+  double already_reached_dist_{0.35};  // 航点到达判定半径（m）：车与航点位置重合即跳过，不再发 goal
+                                       // V0.0.97：0.30 → 0.35（修"0.30m 微调目标被阻 25s"）
   double stall_detect_time_{25.0};     // 受阻判定时长（s）：goal 在途而位移停滞超此时长判“无法绕行”
-  double stall_move_eps_{0.15};        // 受阻判定位移下限（m）：窗口内 map 系位移小于此值即停滞
+  double stall_move_eps_{0.15};        // 受阻判定净推进下限（m）：窗口内朝目标推进小于此值即停滞
+  double stall_path_allow_m_{1.0};     // V0.0.97 绕障机动里程上限（m）：累计行程达到此值即视为
+                                       //   正在多点机动，不判受阻（兜底由 goal_timeout 承担）
   // V0.0.96 航点净空校验半径（m）
   // 障碍物等待
   double obstacle_wait_timeout_{30.0}; // 障碍物等待超时（s）

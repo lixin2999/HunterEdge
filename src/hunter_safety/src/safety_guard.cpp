@@ -75,8 +75,17 @@ public:
     declare_parameter<double>("wheelbase", 0.65);          // HunterV2 轴距（m）
     declare_parameter<double>("min_turn_radius", 1.9);     // 与 Smac 规划一致（m）
     declare_parameter<double>("max_linear_vel", 0.8);      // 纵向硬限（m/s）
-    declare_parameter<double>("stop_dist", 0.6);           // 碰撞急停距离（m）
-    declare_parameter<double>("slow_dist", 1.2);           // 减速预警距离（m）
+    declare_parameter<double>("stop_dist", 0.90);           // 碰撞急停距离（m）
+    declare_parameter<double>("slow_dist", 1.40);           // 减速预警距离（m）
+    // V0.0.97 与 hunter_autonomous_nav.launch.py 同步重标定（原 0.6/1.2 为上游默认值，
+    //   与实车 0.90/1.40 不一致会让"单独起 safety_guard"时行为突变）：
+    //   · stop 0.90 = 场景可行性与制动安全的折中：> range_min(0.70)+0.15 = 0.85 盲区地板，
+    //     且前保险杠停车净空 0.90−0.45 = 0.45m ≫ 0.5m/s 制动距离 ≈0.18m；
+    //   · 不可再轻易下调：阿克曼绕障需"提前转向距离" s ≥ √(2R·(半宽+余量)) ≈ 1.33m，
+    //     碰撞闸远大于 1.33m 会在车进入可转向区之前按停（V0.0.96 现场 stop=1.0 即此死锁）；
+    //   · 也不可低于 range_min：小于 range_min 的障碍在 /scan 中根本不存在，
+    //     阈值低于它等于关闭碰撞闸（V0.0.91 撞墙事故根因）。
+    //   另注：自车反射可达 ~0.6m，故 range_min 不宜 <0.65（否则自反射变"永久障碍"）。
     declare_parameter<double>("sector_half_deg", 60.0);    // 行进方向检测扇区半角（°）
     // V0.0.91 走廊几何判定：碰撞闸由"扇区内最小径向距离"改为"前方矩形走廊内
     // 最小纵向净空"，并用自车包络盒过滤自身反射（替代上游 range_min 粗截断）
@@ -104,8 +113,9 @@ public:
     // V0.0.86 自动驾驶测试模式
     declare_parameter<bool>("enable_test_mode", false);    // 启动即进入测试模式
     declare_parameter<double>("test_max_linear_vel", 0.1); // 测试模式限速（m/s）
-    declare_parameter<double>("test_stop_dist", 1.0);      // 测试模式急停距离（m）
-    declare_parameter<double>("test_slow_dist", 2.0);      // 测试模式减速距离（m）
+    declare_parameter<double>("test_stop_dist", 0.90);      // 测试模式急停距离（m，V0.0.97 与正式模式同源）
+    declare_parameter<double>("test_slow_dist", 1.40);      // 测试模式减速距离（m）
+
     declare_parameter<double>("stall_timeout", 1.0);       // 卡死判定时长（s）
     declare_parameter<double>("stall_cmd_vel_min", 0.05);  // 判"有指令"的最小指令速度（m/s）
     declare_parameter<double>("stall_fb_vel_max", 0.02);   // 判"没在动"的最大反馈速度（m/s）

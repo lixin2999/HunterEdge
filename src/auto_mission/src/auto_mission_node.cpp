@@ -162,9 +162,19 @@ void AutoMissionNode::declareParameters()
   declare_parameter("goal_timeout", 60.0);
   declare_parameter("obstacle_wait_timeout", 30.0);
   // V0.0.95 航点“已到达”预检与受阻检测（修“原地不动/无法绕行”）
-  declare_parameter("already_reached_dist", 0.30);
+  // V0.0.97：0.30 → 0.35m。现场（V0.0.96 日志 1790055967）：车与"起点"航点相距
+  //   0.304m，刚过 0.30 阈值 ⇒ 预检不判“已到达”，下发该退化目标后又因阿克曼
+  //   无法在这个距离上做微调而被阻 25s 才放弃。0.35m 与 Nav2 的 xy_goal_tolerance
+  //   0.10m + 车辆最小转弯半径 1.9m 的"可微调圆"半径匹配，避免这类伪任务。
+  //   ⚠ 上限不宜超过 0.4m：巡逻语义下会跳过本应前往的近邻航点。
+  declare_parameter("already_reached_dist", 0.35);
   declare_parameter("stall_detect_time", 25.0);
   declare_parameter("stall_move_eps", 0.15);
+  // V0.0.97 绕障机动里程上限（m）：累计行程 ≥ 本值即认定"车辆确实在多段机动
+  //   （多点掉头/受限倒车绕障）"，不再按受阻换点，兜底交给单航点超时 goal_timeout。
+  //   取 1.0m ≈ 一次"倒 0.4m + 进 0.5m"机动的总里程；若现场绕障动辄超 1.0m
+  //   仍无净推进，说明阈值/场地几何不匹配，应先查 stop_dist/slow_dist 而非调大本值。
+  declare_parameter("stall_path_allow_m", 1.0);
   // V0.0.96 航点净空校验（修“开到静态障碍膨胀区后所有规划全失败”）
   declare_parameter("waypoint_clearance_m", 0.50);
 
@@ -211,11 +221,19 @@ void AutoMissionNode::declareParameters()
   already_reached_dist_   = get_parameter("already_reached_dist").as_double();
   stall_detect_time_      = get_parameter("stall_detect_time").as_double();
   stall_move_eps_         = get_parameter("stall_move_eps").as_double();
+  stall_path_allow_m_     = get_parameter("stall_path_allow_m").as_double();
+  if (stall_path_allow_m_ < stall_move_eps_) {
+    RCLCPP_WARN(get_logger(),
+      "stall_path_allow_m=%.2fm 小于 stall_move_eps=%.2fm，已按 %.2fm 处理"
+      "（必须大于单次机动净推进门槛，否则正常机动会被误判受阻）",
+      stall_path_allow_m_, stall_move_eps_, stall_move_eps_ * 2.0);
+    stall_path_allow_m_ = stall_move_eps_ * 2.0;
+  }
   if (already_reached_dist_ <= 0.0) {
     RCLCPP_WARN(get_logger(),
-      "already_reached_dist=%.2f ≤ 0，已按 0.30m 处理（禁用“已到达”预检会重现"
+      "already_reached_dist=%.2f ≤ 0，已按 0.35m 处理（禁用“已到达”预检会重现"
       "“目标=当前位姿”死锁）", already_reached_dist_);
-    already_reached_dist_ = 0.30;
+    already_reached_dist_ = 0.35;
   }
   if (stall_detect_time_ < 5.0) {
     RCLCPP_WARN(get_logger(),
@@ -921,24 +939,46 @@ void AutoMissionNode::mainLoop()
         // 现场依据（V0.0.95 实车日志）：车开到航点 A 附近后全局规划持续报
         //   "Starting point in lethal space!"（车停在静态障碍膨胀区内），
         //   行为树清图/等待均无效 → 需换点/锁存并给出可判读结论。
+        // V0.0.97 追加【绕障机动宽容】：V0.0.97 放开 MPPI 倒车（vx_min=-0.20）+
+        //   Smac REEDS_SHEPP 后，正常绕障是"倒 0.4m → 进 0.5m → 再倒"的多段机动，
+        //   净推进可能长期 <0.15m 却始终在动。此时若按旧逻辑判受阻换点，等于把
+        //   "正在绕障"误杀成"绕不过去"。故增加累计行程判据：
+        //     累计行程 < stall_path_allow_m(1.0m) → 真的没动，仍判受阻；
+        //     累计行程 ≥ 1.0m            → 判定为"多点机动中"，暂不换点，
+        //       由单航点超时 goal_timeout_（autonomous_nav_params.yaml 配 45s，节点默认 60s）兜底，避免无限原地磨。
         if (goal_start_dist_ >= 0.0) {
           double px = 0.0, py = 0.0;
           double progress = 0.0;
           if (currentMapPose(px, py)) {
             progress = goal_start_dist_ - std::hypot(
               waypoints_[current_wp_idx_].x - px, waypoints_[current_wp_idx_].y - py);
+            // 累计行程（map 系 |Δ位姿| 之和；位姿源 2Hz，10Hz tick 重复读数增量为 0）
+            // V0.0.97 单步死区 0.02m：滤除 NDT 位姿微抖（静止时 ±mm~cm 级），
+            //   否则 25s 内数十次抖动会被累加成一笔"假里程"，把真正卡死的情形放过。
+            //   真实行驶每 2Hz 位姿更新位移 ≥0.1m（0.2m/s×0.5s），远超死区，不会漏计。
+            if (has_last_stall_pose_) {
+              const double step = std::hypot(px - last_stall_x_, py - last_stall_y_);
+              if (step >= 0.02) {
+                goal_path_len_ += step;
+              }
+            }
+            last_stall_x_ = px;
+            last_stall_y_ = py;
+            has_last_stall_pose_ = true;
           }
-          if (elapsed > stall_detect_time_ && progress < stall_move_eps_) {
+          const bool stalled = elapsed > stall_detect_time_ && progress < stall_move_eps_;
+          const bool maneuvering = goal_path_len_ >= stall_path_allow_m_;
+          if (stalled && !maneuvering) {
             ++blocked_count_;
             RCLCPP_ERROR(get_logger(),
               "[NAVIGATING] 航点[%zu]%s 受阻：%.0fs 内向目标仅推进 %.2fm（< %.2fm，"
-              "起始距离 %.2fm / 当前 %.2fm）——前方障碍无法绕行、航点无可达路径，"
-              "或车已停在（静态地图）障碍膨胀区内致规划全失败；取消本 goal 并按失败处理"
-              "（第 %d 次受阻；请核对 /safety/state 净空、rviz2 中 global_costmap 的"
-              "膨胀区与 rviz2 报错 Starting point in lethal space）",
+              "起始距离 %.2fm / 当前 %.2fm），累计行程仅 %.2fm（< %.2fm，车基本没动）"
+              "——前方障碍无法绕行、航点无可达路径，或车已停在（静态地图）障碍膨胀区内"
+              "致规划全失败；取消本 goal 并按失败处理（第 %d 次受阻）",
               current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
               elapsed, progress, stall_move_eps_, goal_start_dist_,
-              goal_start_dist_ - progress, blocked_count_);
+              goal_start_dist_ - progress, goal_path_len_, stall_path_allow_m_,
+              blocked_count_);
             cancelCurrentGoal();
             wp_fail_count_++;
             if (wp_fail_count_ >= max_wp_failures_) {
@@ -948,6 +988,15 @@ void AutoMissionNode::mainLoop()
               sendNextWaypoint();
             }
             break;
+          }
+          if (stalled && maneuvering) {
+            // 正在多点掉头/受限倒车绕障：不换点，仅提示（可能持续到 goal_timeout 兜底）
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+              "[NAVIGATING] 航点[%zu]%s 净推进 %.2fm 但累计行程 %.2fm（多点掉头/倒车绕障中），"
+              "暂不判受阻；若长期无进展请核对 /safety/state 净空、stop_dist(0.90)/"
+              "slow_dist(1.40) 与 local_costmap 近车 0.7m 内是否有自反射假障碍",
+              current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
+              progress, goal_path_len_);
           }
         }
 
@@ -1543,13 +1592,20 @@ void AutoMissionNode::sendNextWaypoint()
   goal_msg.behavior_tree = "";   // 使用 bt_navigator 默认行为树
 
   auto send_opts = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions{};
+  // V0.0.97 goal 世代号：在发送前自增并取值，绑定进两个回调。
+  //   过期 goal（本节点已主动取消并换了新航点）的结果/响应携带的是旧世代号，
+  //   回调据此直接丢弃 —— 旧实现只挡 CANCELED 结果，而旧行为树失败回传的是
+  //   ABORTED，会被当成新航点的失败（一次受阻连跳 2 点 → FAULT 误锁存），
+  //   并把在途 goal 的 handle 清空导致 cancelCurrentGoal() 失效。
+  ++goal_epoch_;
+  const uint64_t this_epoch = goal_epoch_;
   send_opts.goal_response_callback =
-    std::bind(&AutoMissionNode::goalResponseCallback, this, std::placeholders::_1);
+    std::bind(&AutoMissionNode::goalResponseCallback, this, this_epoch, std::placeholders::_1);
   send_opts.feedback_callback =
     std::bind(&AutoMissionNode::feedbackCallback, this,
       std::placeholders::_1, std::placeholders::_2);
   send_opts.result_callback =
-    std::bind(&AutoMissionNode::resultCallback, this, std::placeholders::_1);
+    std::bind(&AutoMissionNode::resultCallback, this, this_epoch, std::placeholders::_1);
 
   nav_action_client_->async_send_goal(goal_msg, send_opts);
   goal_send_time_ = this->now();
@@ -1576,6 +1632,9 @@ void AutoMissionNode::sendNextWaypoint()
     }
     blocked_count_ = 0;
     goal_cancel_by_mission_ = false;   // 新 goal 已发出，清除上一轮的主动取消标记
+    // V0.0.97 绕障机动里程清零（受阻判据的"是否真的在动"依据）
+    goal_path_len_ = 0.0;
+    has_last_stall_pose_ = false;
   }
 
   RCLCPP_INFO(get_logger(),
@@ -1594,13 +1653,26 @@ void AutoMissionNode::sendNextWaypoint()
 void AutoMissionNode::cancelCurrentGoal()
 {
   std::lock_guard<std::mutex> lk(goal_handle_mutex_);
-  if (goal_handle_ && goal_in_flight_) {
+  // V0.0.97：判据由 "goal_handle_ && goal_in_flight_" 放宽为 "goal_handle_ 非空"。
+  //   旧写法在"句柄已拿到、但 resultCallback 已把 goal_in_flight_ 置 false"的
+  //   竞态下会静默跳过取消 → 行为树继续驱动车辆（现场 FAULT 后仍机动 10 分钟）。
+  if (goal_handle_) {
     RCLCPP_INFO(get_logger(), "[cancelCurrentGoal] 取消当前导航 goal");
     nav_action_client_->async_cancel_goal(goal_handle_);
     // V0.0.95：标记为"本节点主动取消"，使 resultCallback 不再重复计失败/换点
     goal_cancel_by_mission_ = true;
+    goal_handle_ = nullptr;
+    goal_in_flight_ = false;
+    return;
   }
-  goal_handle_ = nullptr;
+  if (goal_in_flight_) {
+    // 极窄竞态窗口：goal 已发出但服务端响应（含 handle）尚未回到本节点。
+    //   此时无法主动取消；该 goal 的结果会被世代号判为过期而丢弃（若期间已发新点），
+    //   行为树将执行到自身超时。日志留痕便于现场定位。
+    RCLCPP_WARN(get_logger(),
+      "[cancelCurrentGoal] goal 在途但服务端响应未到（无 handle），本次无法主动取消："
+      "该 goal 的结果将按过期世代丢弃，行为树可能继续执行到自身超时");
+  }
   goal_in_flight_ = false;
 }
 
@@ -1719,24 +1791,47 @@ bool AutoMissionNode::tryReleaseSelfEstop()
 // Nav2 goal response 回调
 // ==========================================================================
 void AutoMissionNode::goalResponseCallback(
+  uint64_t epoch,
   const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr & handle)
 {
-  std::lock_guard<std::mutex> lk(goal_handle_mutex_);
-  if (!handle) {
-    goal_in_flight_ = false;
-    wp_fail_count_++;
-    // 退避 + 失败上限：杜绝 10Hz 高频重发；拒收达上限回 IDLE 等待条件重置
-    nav_retry_not_before_ = this->now() + rclcpp::Duration::from_seconds(nav_retry_backoff_);
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-      "[Nav2] goal 被服务端拒绝（fail_count=%d/%d），%.0fs 后重试",
-      wp_fail_count_, max_wp_failures_, nav_retry_backoff_);
-    if (wp_fail_count_ >= max_wp_failures_) {
-      enterFault("goal 连续被 bt_navigator 拒收");
+  // V0.0.97 过期响应门控：新 goal 已发出时，迟到的旧 goal 响应（极少见）立即取消，
+  //   避免两个 goal 并存互相抢占、并把旧 handle 写进 goal_handle_ 污染取消动作。
+  if (epoch != goal_epoch_) {
+    if (handle) {
+      nav_action_client_->async_cancel_goal(handle);
     }
-  } else {
-    goal_handle_ = handle;
-    RCLCPP_INFO(get_logger(), "[Nav2] goal 已被接受，开始导航至航点[%zu]",
-      current_wp_idx_);
+    RCLCPP_WARN(get_logger(),
+      "[Nav2] 丢弃过期 goal 响应（世代 %lu ≠ 当前 %lu）%s",
+      static_cast<unsigned long>(epoch), static_cast<unsigned long>(goal_epoch_),
+      handle ? "并已请求取消该过期 goal" : "");
+    return;
+  }
+
+  // V0.0.97：【先释放锁再处理故障】。旧实现在持有 goal_handle_mutex_ 时调用
+  //   enterFault()，而 enterFault() → cancelCurrentGoal() 会再次锁同一把
+  //   std::mutex（非递归）→ 自死锁（现场未触发，但一旦"连续被拒收"就是挂死）。
+  bool need_fault = false;
+  {
+    std::lock_guard<std::mutex> lk(goal_handle_mutex_);
+    if (!handle) {
+      goal_in_flight_ = false;
+      wp_fail_count_++;
+      // 退避 + 失败上限：杜绝 10Hz 高频重发；拒收达上限回 IDLE 等待条件重置
+      nav_retry_not_before_ = this->now() + rclcpp::Duration::from_seconds(nav_retry_backoff_);
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "[Nav2] goal 被服务端拒绝（fail_count=%d/%d），%.0fs 后重试",
+        wp_fail_count_, max_wp_failures_, nav_retry_backoff_);
+      if (wp_fail_count_ >= max_wp_failures_) {
+        need_fault = true;
+      }
+    } else {
+      goal_handle_ = handle;
+      RCLCPP_INFO(get_logger(), "[Nav2] goal 已被接受，开始导航至航点[%zu]",
+        current_wp_idx_);
+    }
+  }
+  if (need_fault) {
+    enterFault("goal 连续被 bt_navigator 拒收");
   }
 }
 
@@ -1758,8 +1853,24 @@ void AutoMissionNode::feedbackCallback(
 // Nav2 result 回调
 // ==========================================================================
 void AutoMissionNode::resultCallback(
+  uint64_t epoch,
   const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::WrappedResult & result)
 {
+  // V0.0.97 过期结果门控（必须放在最前，先于任何状态清理）：
+  //   世代号不同于当前值 ⇒ 本结果属于【已被本节点放弃的旧 goal】。这种结果
+  //   ① 不能计入 wp_fail_count_（否则一次受阻连跳 2 个航点 → FAULT 误锁存）；
+  //   ② 不能触发换点（换点由取消方完成）；
+  //   ③ 更不能清空 goal_in_flight_/goal_handle_ —— 旧实现在回调开头无条件清空，
+  //      导致在途（新）goal 的句柄丢失、后续 cancelCurrentGoal() 变空操作，
+  //      行为树在 FAULT 后仍持续驱动车辆满舵/倒车机动（现场 10 分钟）。
+  if (epoch != goal_epoch_) {
+    RCLCPP_DEBUG(get_logger(),
+      "[Nav2] 丢弃过期 goal 结果（世代 %lu ≠ 当前 %lu，航点[%zu]，code=%d）",
+      static_cast<unsigned long>(epoch), static_cast<unsigned long>(goal_epoch_),
+      current_wp_idx_, static_cast<int>(result.code));
+    return;
+  }
+
   goal_in_flight_ = false;
   {
     std::lock_guard<std::mutex> lk(goal_handle_mutex_);

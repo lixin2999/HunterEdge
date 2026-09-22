@@ -204,13 +204,27 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'wheelbase': 0.65,          # HunterV2Params::wheelbase（AGX_V2 实车）
             'min_turn_radius': 1.9,     # 与 Smac minimum_turning_radius 一致
             'max_linear_vel': 0.5,      # V0.0.89 测试场地：与 desired_linear_vel/velocity_smoother 一致 0.5
-            # V0.0.91 撞墙事故修正：急停距离必须严格大于 /scan 的 range_min（0.8m），
+            # V0.0.91 撞墙事故修正：急停距离必须严格大于 /scan 的 range_min，
             # 否则"障碍越近越看不见→越近越安全"，碰撞闸形同虚设（旧值 stop 0.5 <
             # range_min 0.8：急停在数学上不可达，日志里最近障碍恒为 0.800m 地板值）。
             # 旧值之所以被压到 0.5，是因为径向+扇区判据把平行侧墙误报成急停；
             # 现改由走廊矩形（corridor_half_width）判据消除侧墙误报，阈值可回到安全值。
-            'stop_dist': 1.0,           # 行进走廊净空 < 1.0m 零速（> range_min 0.8 + 余量）
-            'slow_dist': 1.8,           # 净空 < 1.8m 线性限速
+            # ---- V0.0.97 阈值重标定（修"无法绕开障碍物"）----
+            # 旧值 stop 1.0m 在室内窄场地构成【几何死锁】：阿克曼绕开正前方障碍需
+            # "提前转向距离" s ≥ √(2R·(半宽+余量)) = √(2×1.9×0.42) ≈ 1.33m，而碰撞闸
+            # 在障碍 1.0m 处就把前进指令按停 → 车永远进不到"能转向"的位置；配合
+            # 旧版禁倒车（MPPI vx_min=0），现场表现为满舵 0.386rad 原地死磕 →
+            # "Failed to make progress" → 倒车 0.45m → 又贴回 1.0m → 循环至 FAULT。
+            # 新值 stop 0.90m：① 车体前保险杠停车净空 = 0.90 − 0.45 = 0.45m，
+            #   远大于 0.5m/s 下的制动距离 v²/(2a)+v·t_lat = 0.083+0.10 ≈ 0.18m；
+            # ② 与 range_min 0.70 的盲区地板 0.70+0.15=0.85m 保持 0.05m 余量
+            #   （safety_guard 运行时会校验并要求 stop > range_min+0.15）；
+            # ③ 配合 MPPI vx_min=-0.20 与 REEDS_SHEPP，车可"退一步再转"，把死锁
+            #   变成多点掉头。
+            # slow 1.40m 取"转向提前量 1.33m"量级：车一进入可转向区就已被限速到
+            # ~0.3m/s，保证低速精确绕障。
+            'stop_dist': 0.90,          # 行进走廊净空 < 0.90m 零速（> range_min 0.70 + 0.15）
+            'slow_dist': 1.40,          # 净空 < 1.40m 线性限速
             'sector_half_deg': 60.0,    # 检测扇区半角（°）
             # V0.0.91 走廊几何：只判车前方 [车体前缘, stop/slow] × |y| ≤ 0.45 的矩形区，
             # 平行侧墙（|y|≈0.5）不再误急停；自车包络内回波按 footprint 丢弃，
@@ -239,11 +253,11 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'obstacle_cluster_span': 0.25,
             'enable_test_mode': False,  # 测试模式运行时经 /safety/test_mode 开关
             # V0.0.89 窄小测试场地低速档：测试模式限速抬到 0.3m/s（原 0.1 “基本不动”），
-            # 碰撞阈值适配场地尺度（急停 1.0/减速 1.8，V0.0.91 与 range_min 对齐），
+            # 碰撞阈值与正式模式同源（V0.0.97：0.90/1.40，见上方 stop_dist 注释），
             # 并容忍起步期瞬时 ABORT/断流：
             'test_max_linear_vel': 0.3,
-            'test_stop_dist': 1.0,
-            'test_slow_dist': 1.8,
+            'test_stop_dist': 0.90,
+            'test_slow_dist': 1.40,
             'plan_fail_timeout': 10.0,        # > 非运动恢复 Wait 总时长，避免清图/等待期误判断流
             'test_max_goal_aborts': 3,        # 连续 ABORTED 达 3 次才锁存中止（EXECUTING 会清零）
             # V0.0.87 地图边界监护（/map + /relocalization/pose；建图模式无源自动不介入）
@@ -276,13 +290,17 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'angle_max': 3.14159,
             'angle_increment': 0.008726646,     # 0.5°/束 → 720 束
             'scan_time': 0.1,                   # /lidar_points 10Hz
-            'range_min': 0.8,                   # ⚠ V0.0.91 与 safety_guard stop_dist 强耦合：
-                                            # 小于本值的回波在投影阶段就被丢弃，车前形成
-                                            # 0.8m 盲区，故 stop_dist 必须 > 本值（safety_guard
-                                            # 运行时会校验并强制抬升，但正解是保持两者一致）。
-                                            # 车身自反射不再靠抬大本值解决，改由 safety_guard
-                                            # 的 footprint 包络盒过滤（不再依赖 AMCL 滤污染）。
-                                            # 旧值 0.5 会让 safety_guard 常年看到 ~0.6m 假障碍而急停
+            'range_min': 0.70,                  # ⚠ 与 safety_guard 的阈值强耦合（V0.0.97：0.8→0.70）：
+                                            # 小于本值的回波在投影阶段就被丢弃，车前形成盲区；
+                                            # safety_guard 运行时会校验 stop_dist > 本值+0.15，
+                                            # 不满足即 ERROR 并强制抬升（本地 0.70+0.15=0.85 < stop 0.90 ✔）。
+                                            # 取 0.70 而非更小值的硬约束——【车体自反射】：
+                                            # V0.0.88 现场实测 range_min 0.5 时 safety_guard
+                                            # 常年看到 ~0.6m 假障碍而急停，即自反射可达 ~0.6m。
+                                            # 0.70 留 0.10m 余量；再往下降必须先在 rviz2 确认
+                                            # /scan 在 0.4~0.7m 无自车回波。
+                                            # 车身自反射的第一道防线仍是 safety_guard 的 footprint
+                                            # 包络盒过滤（0.45+0.12=0.57m）。
             'range_max': 50.0,
             'use_inf': True,
             'use_sim_time': use_sim_time == 'true',

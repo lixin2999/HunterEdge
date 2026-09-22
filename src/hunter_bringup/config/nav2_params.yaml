@@ -25,16 +25,33 @@ planner_server:
                                                # global_costmap track_unknown_space: true，
                                                # 规划路径不穿越未采集(unknown)区域——
                                                # 行驶路径恒在已采集地图范围内
-      motion_model_for_search: "DUBIN"         # V0.0.82：改纯前进。REEDS_SHEPP 允许路径含倒车段，
-                                               # 但本 fork RPP 不支持倒车跟随（无 allow_reversing 参数），
-                                               # 倒车段会令控制器死磕 → Failed to make progress；
-                                               # 倒车需求由 BackUp 恢复行为承担
+      motion_model_for_search: "REEDS_SHEPP"   # V0.0.97：DUBIN → REEDS_SHEPP（放开倒车段）。
+                                               #   几何依据：R_min=1.9m 的阿克曼要绕开正前方障碍，
+                                               #   单圆弧所需"提前转向距离" s ≥ √(2R·(半宽0.32+余量0.10))
+                                               #   ≈ 1.33m（推导见 Deployment_Guide §绕障几何）；车与障碍
+                                               #   距离 <1.33m 时，纯前进无论怎么打舵都会剐蹭（V0.0.96
+                                               #   实车日志：车距障碍 1.0m、满舵 0.386rad 死磕 20s 零位移
+                                               #   → Failed to make progress 循环）。倒车段用于
+                                               #   ①创造 ≥1.33m 提前量 ②多点掉头（前进/倒车交替）。
+                                               #   V0.0.82 曾因"本 fork 控制器不支持倒车跟随"退回 DUBIN；
+                                               #   V0.0.93 起控制器已换 MPPI，V0.0.97 同步放开
+                                               #   MPPI vx_min=-0.20（PathAngleCritic 据此自动允许倒车），
+                                               #   侧向/后向安全由 safety_guard【后方走廊】判据兜底。
       angle_quantization_bins: 72              # 文档 9.2：航向角量化(5°/bin)
       minimum_turning_radius: 1.9              # 文档 9.2：最小转弯半径(m)
-      reverse_penalty: 2.0                     # 文档 9.2：倒车惩罚（DUBIN 下不生效，保留供回切 REEDS_SHEPP）
-      change_penalty: 0.5                      # 文档 9.2：前进/倒车切换惩罚（同上）
+      reverse_penalty: 1.5                     # 文档 9.2：倒车代价惩罚（V0.0.97 由 2.0 下调）——
+                                               #   REEDS_SHEPP 下生效：1.5 使"倒 0.3~0.5m 换取向"
+                                               #   仍贵于前进（避免无谓倒车），但便宜到能在窄处
+                                               #   被规划器选中（2.0 时规划器宁愿报规划失败）
+      change_penalty: 0.3                      # 文档 9.2：前进/倒车切换惩罚（V0.0.97 由 0.5 下调）——
+                                               #   多点掉头需 2~3 次方向切换，惩罚过大即退回死锁
       downsample_obstacle_heuristic: true      # 文档 9.2：障碍物启发式降采样
-      allow_reversing: false                   # V0.0.82：与 DUBIN 匹配，规划路径不含倒车段
+      allow_reversing: true                    # ⚠ 本 fork nav2_smac_planner【没有此参数】（已核对
+                                               #   src/navigation2/nav2_smac_planner/src/smac_planner_hybrid.cpp：
+                                               #   仅读取 motion_model_for_search / reverse_penalty /
+                                               #   change_penalty / minimum_turning_radius）。此行保留
+                                               #   仅为与上游 Nav2 配置同名可读，实际不产生任何效果——
+                                               #   倒车自由度完全由上方 motion_model_for_search 决定
       use_final_approach_orientation: false
       max_robot_pose_search_dist: 5.0
 
@@ -58,9 +75,30 @@ controller_server:
       batch_size: 1000                         # 采样轨迹数（Jetson 平衡实时性）
       vx_std: 0.2
       vy_std: 0.0                              # 阿克曼无横向速度
+      vy_max: 0.0                              # V0.0.97 显式声明：ConstraintCritic 读【父级】
+                                               # vy_max（默认 0.5）算反向速度上限
+                                               # min_vel_ = -√(vx_min²+vy_max²)，不声明会得到
+                                               # -0.54 而放过超速倒车；填 0.0 后恰为 vx_min
       wz_std: 0.4
       vx_max: 0.5                              # 与 desired_linear_vel/velocity_smoother 一致（V0.0.89 低速档）
-      vx_min: 0.0                              # 硬禁止倒车（与 velocity_smoother min_velocity 一致）
+      vx_min: -0.20                            # V0.0.97：0.0 → -0.20，放开【控制器级低速倒车】
+                                               #   几何依据（本参数是"能绕开障碍"的关键，详见
+                                               #   Deployment_Guide §绕障几何）：R_min=1.9m 的阿克曼
+                                               #   绕开正前方障碍需"提前转向距离"
+                                               #   s ≥ √(2R·(半宽0.32+余量0.10)) ≈ 1.33m；
+                                               #   车距障碍 <1.33m 时纯前进怎么打舵都会剐蹭——
+                                               #   V0.0.96 实车日志正是此情形：车贴障碍 1.0m、
+                                               #   满载舵角 0.386rad（=|v|/R_min 限幅值）死磕 20s
+                                               #   零位移 → "Failed to make progress" 循环 +
+                                               #   行为树倒车 0.45m 后又贴回 → FAULT 锁存。
+                                               #   倒车用于 ①先退到 ≥1.33m 提前量 ②多点掉头
+                                               #   （前进/倒车交替，单段倒车 ≤0.5m）。
+                                               #   物理兜底：safety_guard 检测 v<0 时切【后方走廊】
+                                               #   判据（后净空 < stop_dist 即零速）+ 地图边界监护；
+                                               #   velocity_smoother.min_velocity[0]=-0.20 同值钳制。
+                                               #   注：PathAngleCritic 按 vx_min<0 自动放开倒车
+                                               #   （path_angle_critic.cpp:30，日志由
+                                               #   "Reversing not allowed" 变 "Reversing allowed"）
       wz_max: 0.8                              # 角速度上限，与 velocity_smoother 一致
       ax_max: 0.3                              # 缓起步（与 RPP max_linear_accel 一致）
       ax_min: -1.5                             # 制动上限
@@ -115,10 +153,16 @@ controller_server:
         threshold_to_consider: 0.5
         forward_opposing_weight: 2.0
         reverse_opposing_weight: 0.5
-        reverse_penalty_weight: 1.0
+        reverse_penalty_weight: 0.5            # V0.0.97：1.0 → 0.5（配合 vx_min=-0.20）——
+                                               #   倒车时的"逆向代价"过高会让 MPPI 在窄处
+                                               #   宁可原地不动也不后退脱困
       PreferForwardCritic:
         enabled: true
-        cost_weight: 5.0                       # 强化前进偏好（禁倒车，与 vx_min=0 协同）
+        cost_weight: 1.5                       # V0.0.97：5.0 → 1.5。原权重与 vx_min=0 组合
+                                               #   使"前进"压倒一切：放开倒车后若仍 5.0，
+                                               #   MPPI 仍被锁在前进解上（前方净空被 safety_guard
+                                               #   按停 → 无可行解 → 原地抖动）。1.5 保留
+                                               #   "能前进就前进"的偏好，同时允许倒车换绕行自由度
         threshold_to_consider: 0.5
 
     general_goal_checker:
@@ -160,6 +204,13 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"   # 必填：loadPlugins() 缺失即 FATAL "Can not get 'plugin' param"
         enabled: true
+        footprint_clearing_enabled: true        # V0.0.97 显式声明（默认即 true，此处固化以求可读）：
+                                                #   每周期清除车体 footprint 内的观测标记。
+                                                #   与 V0.0.97 range_min 0.70（原 0.8）配套——车体
+                                                #   自反射实测可达 ~0.6m，减小 range_min 后自反射点
+                                                #   更可能进入扫描云；本开关是"车脚底被自己标成
+                                                #   致命栅格"（→ Starting point in lethal space）
+                                                #   的关键防线，勿关
         observation_sources: "lidar_cloud scan"   # Humble：ObstacleLayer 将该参数声明为空格分隔字符串，写成 YAML 列表会报 string_array 类型冲突
         lidar_cloud:
           topic: /perception/lidar/obstacle_cloud
@@ -216,6 +267,8 @@ local_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"   # 必填：loadPlugins() 缺失即 FATAL "Can not get 'plugin' param"
         enabled: true
+        footprint_clearing_enabled: true        # V0.0.97 显式声明（默认即 true）：见 global_costmap
+                                                #   同名注释——防自反射把车底标致命，勿关
         observation_sources: "lidar_cloud scan"   # Humble：ObstacleLayer 将该参数声明为空格分隔字符串，写成 YAML 列表会报 string_array 类型冲突
         lidar_cloud:
           topic: /perception/lidar/obstacle_cloud
@@ -272,9 +325,10 @@ velocity_smoother:
     # ⚠ V0.0.95 线性下限 0.0 → -0.20（关键）：本节点对【所有】速度源统一做绝对值钳制
     #   （velocity_smoother.cpp applyConstraints 前的 std::clamp），min_velocity[0]=0.0
     #   会把行为树 BackUp（倒车脱困）的负线速度直接钳成 0 —— 表现为“恢复行为报成功
-    #   但车不倒”，V0.0.94 现场即因此彻底失去倒车脱困能力。禁倒车应由控制器/规划器
-    #   层施加（MPPI vx_min=0 + Smac allow_reversing=false 均已禁止），此处只放开
-    #   “行为层倒车通道”，上限 -0.20m/s 与 BT 的 backup_speed 0.10m/s 留足余量。
+    #   但车不倒”，V0.0.94 现场即因此彻底失去倒车脱困能力。
+    # V0.0.97：本值同时是 MPPI vx_min 的硬上限（MPPI 已放开 vx_min=-0.20 用于绕障
+    #   与多点掉头）——两者必须同值，否则 MPPI 规划出倒车但被本节点钳成 0，
+    #   表现为"车辆原地不动、控制器无输出"。改任一必须同步另一。
     min_velocity: [-0.20, 0.0, -0.8]
     max_accel: [0.3, 0.0, 1.0]        # V0.0.89 与 RPP 一致，减小起步冲击
     max_decel: [-1.5, 0.0, -1.5]      # V0.0.89 0.5m/s 下足够制动

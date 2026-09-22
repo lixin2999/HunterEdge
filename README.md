@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V1.8（开发指南，对应软件基线 V0.0.96：在 V0.0.95 分层修复（航点“已到达”预检、阈值释放滞环、幽灵点门控、受限倒车脱困、D435 显式 profile）实车生效——车辆已能自主行驶约 5m、转向平滑、无抖振——之后，修复**残余死锁链**：**航点落在静态地图障碍的膨胀区内 → Nav2 起点格被判致命（`Starting point in lethal space!`）→ 从该点出发的全部规划失败 → 恢复池无运动行为 → 3 次 ABORT 后 `FAULT` 锁存**。新增：任务层**航点占据栅格 + 净空校验**（`waypoint_clearance_m` 0.50m）与**当前位姿净空告警**、受阻判据改**朝目标推进量**、**“ABORT 但已在到达半径内 ⇒ 判为完成”**；行为层**恢复池首位加受限倒车**（让规划失败也能物理脱困）；感知层相机 `initial_reset: true`）
+> **文档版本**：V1.9（开发指南，对应软件基线 V0.0.97：V0.0.96（航点占据/净空校验、位姿净空告警、受阻判据改推进量、ABORT 但已到达判完成、恢复池首位受限倒车、相机 `initial_reset`）经实车验证**全部生效**（相机恢复 30fps 出图、占位航点 (5.0,0.0) 被净空校验拒绝、`Running backup` 后真实后退）之后，修复**最后两个瓶颈**：① **阿克曼绕障几何死锁**（R_min 1.9m 要求“提前转向距离 ≥1.33m”，而碰撞闸 1.0m 在车能转向之前就按停 + MPPI `vx_min=0` 禁倒车 → 满舵 0.386rad 死磕 20s → `Failed to make progress` 循环）：安全层 `stop_dist 1.0→0.90`、`slow_dist 1.8→1.40`、`range_min 0.8→0.70`（维持盲区一致性）+ **放开控制器/规划器低速倒车**（MPPI `vx_min=-0.20`、`PreferForwardCritic 5.0→1.5`、Smac `REEDS_SHEPP`、`reverse_penalty 2.0→1.5`）；② **过期 goal 结果污染任务状态**（本节点取消后的旧结果以 ABORTED 返回 → 被当成新航点失败、一次受阻连跳 2 点 → FAULT 误锁存；且 `goal_handle_` 被旧结果清空 → 取消失效 → FAULT 后车辆仍满舵/倒车机动 10 分钟）：新增 **goal 世代号（epoch）** 门控 + `cancelCurrentGoal()` 判据放宽 + `goalResponseCallback` 持锁调用 `enterFault` 的自死锁修复；③ 任务层受阻判据加**绕障机动宽容**（`stall_path_allow_m` 1.0m）、`already_reached_dist 0.30→0.35`；④ 感知链饥饿处置（相机帧率 30→15fps、`footprint_clearing_enabled` 显式固化））
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -510,7 +510,7 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 - **定位门控**：`TransformAvailable(map→base_link)` 前置检查，定位不可用时立即阻断导航；
 - **感知保鲜**：`TimeExpired(2s)` 哨兵，感知超时时清除局部代价地图并等待恢复；
 - ~~动态减速~~（V0.0.82 移除 `SpeedController`：本 fork 该节点为按平滑速度调子树 tick 周期的装饰器，无"障碍物距离→限速"语义）；障碍物减速由 **MPPI** `CostCritic`/`PathAlignCritic`（近障碍自动降速，V0.0.93）+ approach 减速承担；
-- ~~阿克曼后退~~（V0.0.89 移除，**V0.0.95 有条件恢复**）：`BackUp` 在 `FollowPath` 失败恢复序列中恢复为**受限倒车**（`backup_dist=0.45m`、`backup_speed=0.10m/s`、`time_allowance=10s`）。V0.0.89 移除的顾虑是“倒车把车倒进更差的致命栅格 + AMCL 位姿跳变”；V0.0.93 起全局定位改为 NDT 点云重配准（不依赖倒车运动模型），且 `safety_guard` 在指令为负时自动切换**后方走廊**判据（`footprint_rear+self_margin` 起算，后净空 < `stop_dist` 即零速），外加地图边界监护兜底；实车证明“纯非运动恢复”在“阿克曼 + 车头正对障碍”时**永远无法脱困**（V0.0.94 日志：车原地抖动 56s 零位移）。**配套改动**：`velocity_smoother.min_velocity[0]` 由 `0.0` → `-0.20`（该节点对全部速度源做绝对值钳制，置 0 会把倒车指令直接钳成 0 → “恢复行为报成功但车不倒”）；控制器/规划层的禁倒车由 MPPI `vx_min=0` + Smac `allow_reversing=false` 继续保证。`Spin`（原地旋转）保持移除——阿克曼不能原地转向。
+- ~~阿克曼后退~~（V0.0.89 移除，**V0.0.95 有条件恢复**）：`BackUp` 在 `FollowPath` 失败恢复序列中恢复为**受限倒车**（`backup_dist=0.45m`、`backup_speed=0.10m/s`、`time_allowance=10s`）。V0.0.89 移除的顾虑是“倒车把车倒进更差的致命栅格 + AMCL 位姿跳变”；V0.0.93 起全局定位改为 NDT 点云重配准（不依赖倒车运动模型），且 `safety_guard` 在指令为负时自动切换**后方走廊**判据（`footprint_rear+self_margin` 起算，后净空 < `stop_dist` 即零速），外加地图边界监护兜底；实车证明“纯非运动恢复”在“阿克曼 + 车头正对障碍”时**永远无法脱困**（V0.0.94 日志：车原地抖动 56s 零位移）。**配套改动**：`velocity_smoother.min_velocity[0]` 由 `0.0` → `-0.20`（该节点对全部速度源做绝对值钳制，置 0 会把倒车指令直接钳成 0 → “恢复行为报成功但车不倒”）；控制器/规划层的禁倒车由 MPPI `vx_min=0` + Smac `allow_reversing=false` 继续保证。**V0.0.97 升级——倒车能力下沉到控制器/规划器**：MPPI `vx_min 0.0→-0.20`（`PathAngleCritic` 据此自动由 `Reversing not allowed` 变 `Reversing allowed`）、`PreferForwardCritic.cost_weight 5.0→1.5`、`PathAngleCritic.reverse_penalty_weight 1.0→0.5`、新增 `vy_max: 0.0`；Smac `motion_model_for_search DUBIN→REEDS_SHEPP`（配 `reverse_penalty 1.5`/`change_penalty 0.3`）。原因：R_min 1.9m 的阿克曼绕开正前方障碍需**提前转向距离** `s ≥ √(2R·c) ≈ 1.33m`，车距障碍 <1.33m 时纯前进无解，必须“先退再转”或多点掉头（旧 `DUBIN` + `vx_min=0` 使正常路径不含倒车段，只能靠恢复行为倒 0.45m 后又被 1.0m 碰撞闸按停 → 满舵死磕至 FAULT）。⚠ 本 fork **`allow_reversing` 参数并不存在**（已核对 `nav2_smac_planner/src/smac_planner_hybrid.cpp` 只读 `motion_model_for_search/reverse_penalty/change_penalty`），倒车自由度只由 `motion_model_for_search` 决定。`Spin`（原地旋转）保持移除——阿克曼不能原地转向。
 - ~~重规划提速~~（V0.0.85 1.0→2.0Hz，**V0.0.92 回退至 1.0Hz**）：实车复盘发现，2Hz 重规划在代价地图残留假障碍时会与脏图更新同频共振，导致控制器转向角全幅振荡（蛇形行驶）；1Hz + 起步清图同步门控（`clearCostmapsOnStart()`，V0.0.92）已足够覆盖动态障碍响应（safety_guard 物理碰撞闸 + MPPI 近障碍降速兜底），且不再放大感知噪声。**V0.0.94**：清图客户端类型由 `std_srvs/Empty` 修正为 Nav2 原生主类型 `nav2_msgs/ClearEntireCostmap`——CycloneDDS 下 `service_is_ready()` 的 graph 匹配只认主类型（`std_srvs/Empty` 仅序列化兼容副类型），误用 Empty 会导致清图门控永久 `global=PEND local=PEND`、goal 永不下发。
 
 ### 10.8 碰撞防护与安全约束（V0.0.85 新增 hunter_safety/safety_guard）
@@ -522,18 +522,18 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 
 | 能力 | 触发条件 | 动作 |
 |------|----------|------|
-| 碰撞急停 | 前方安全走廊（\|y\| ≤ corridor_half_width 0.45m）内**纵向净空** < stop_dist(1.0m，V0.0.91)；**V0.0.95 起带释放滞环**（恢复到 stop+0.25m 才放行） | 立即零速 COLLISION_STOP |
-| 碰撞限速 | 走廊纵向净空 < slow_dist(1.8m，V0.0.91)；**V0.0.95 起带释放滞环**（恢复到 slow+0.20m 才全速） | 线性限速至 max×(d−stop)/(slow−stop)，SLOWDOWN |
+| 碰撞急停 | 前方安全走廊（\|y\| ≤ corridor_half_width 0.45m）内**纵向净空** < stop_dist(0.90m，**V0.0.97 由 1.0 重标定**，依据见 Deployment_Guide §5.5.1：必须 < 阿克曼绕障“提前转向距离”1.33m，否则车在能转向之前被按停 = 几何死锁)；**V0.0.95 起带释放滞环**（恢复到 stop+0.25m 才放行） | 立即零速 COLLISION_STOP |
+| 碰撞限速 | 走廊纵向净空 < slow_dist(1.40m，**V0.0.97 由 1.8 重标定**，取“转向提前量 1.33m”量级，进入可转向区即已限速到 ≈0.3m/s)；**V0.0.95 起带释放滞环**（恢复到 slow+0.20m 才全速） | 线性限速至 max×(d−stop)/(slow−stop)，SLOWDOWN |
 | **阈值抖振抑制（V0.0.95）** | 净空在阈值附近微抖（实测 ±6mm：0.991↔1.006m） | 释放滞环使状态**不再每 0.1~0.2s 往返切换**（旧实现 56s 内 47 次 SLOWDOWN↔COLLISION_STOP，速度被反复归零 → 车“抖动不前进”+ 日志刷屏）；状态转移日志附带“滞环保持（释放阈值 X.XXm）” |
 | **幽灵点门控（V0.0.95）** | 走廊内最近回波纵向 ±`obstacle_cluster_span`(0.25m) 内回波点数 < `min_obstacle_points`(3) | 判为孤立噪点（单束噪声/玻璃反光/雨雾），不作为刹车依据，2s 节流 WARN 输出诊断；真障碍必有数点以上回波（可调 2，设 1 即恢复旧行为） |
-| 盲区一致性强制（V0.0.91） | 配置的 stop_dist ≤ /scan `range_min`+0.15（急停区落在感知盲区内） | 运行时强制抬升到 range_min+0.15 并一次性 ERROR 告警修参数（撞墙事故根因：range_min 0.8 > stop_dist 0.5） |
+| 盲区一致性强制（V0.0.91；**V0.0.97 参数重标定**） | 配置的 stop_dist ≤ /scan `range_min`+0.15（急停区落在感知盲区内） | 运行时强制抬升到 range_min+0.15 并一次性 ERROR 告警修参数（撞墙事故根因：range_min 0.8 > stop_dist 0.5）。**V0.0.97：`range_min 0.8→0.70`、`stop_dist 1.0→0.90`（0.70+0.15=0.85 < 0.90 ✔）；⚠ `range_min` 不得 < 0.65——V0.0.88 实测车体自反射可达 ~0.6m，再降自反射会变成“永久障碍”把车钉住** |
 | 感知 fail-safe | /scan 超时 0.5s 或未到达 | 零速（宁可停车不盲走）SCAN_TIMEOUT |
 | 指令看门狗 | 上游速度指令断流 >0.5s | 零速心跳 CMD_TIMEOUT |
 | 急停透传 | /estop=true | 零速（弥补 Nav2 goal 取消延迟窗口）ESTOP_PASS |
 | 阿克曼曲率钳制 | 恒生效 | \|w\| ≤ \|v\|/1.9（δ≤0.33rad，杜绝打满转向） |
 | 速度硬限 | 恒生效 | \|v\| ≤ 0.5m/s（第二重限速，V0.0.89） |
-| 测试模式碰撞急停 | 测试模式开启时同走廊净空 < test_stop_dist(1.0m，V0.0.91 原 0.5) | 立即零速 COLLISION_STOP【测试模式】 |
-| 测试模式减速 | 同走廊净空 < test_slow_dist(1.8m，V0.0.91 原 1.0) | 限速 ≤0.3m/s（test_max_linear_vel，V0.0.89） |
+| 测试模式碰撞急停 | 测试模式开启时同走廊净空 < test_stop_dist(0.90m，**V0.0.97 与正式模式同源**，原 1.0) | 立即零速 COLLISION_STOP【测试模式】 |
+| 测试模式减速 | 同走廊净空 < test_slow_dist(1.40m，**V0.0.97 与正式模式同源**，原 1.8) | 限速 ≤0.3m/s（test_max_linear_vel，V0.0.89） |
 | 测试模式异常中止 | 疑似碰撞卡死（指令>0.05m/s 而反馈≈0 持续 1s）/ **连续** `test_max_goal_aborts`(3) 次 goal ABORTED（EXECUTING 会清零，V0.0.89）/ goal 活跃但 /cmd_vel_nav 断流 >`plan_fail_timeout`(10s) | 零速锁存 TEST_ABORTED + /estop=true + 取消全部导航目标 |
 | 地图边界减速（V0.0.87） | 车辆距未建图(unknown)/界外栅格 < map_edge_slow_dist(1.0m，V0.0.89 原 1.5) | 线性限速至 max×(d−stop)/(slow−stop)，MAP_EDGE_SLOWDOWN |
 | 地图边界停车（V0.0.87） | 车辆距未建图(unknown)/界外栅格 < map_edge_stop_dist(0.4m，V0.0.89 原 0.5) | 立即零速 MAP_EDGE_STOP（回到已建图区域自动恢复）；测试模式下升级为中止锁存 TEST_ABORTED |
@@ -572,7 +572,7 @@ ros2 topic pub --once /safety/test_mode std_msgs/msg/Bool "{data: true}"   # 开
 ros2 topic pub --once /safety/test_mode std_msgs/msg/Bool "{data: false}"  # 关闭（恢复常规阈值）
 ```
 
-开启后 0.3m/s 限速巡航（V0.0.89，原 0.1 易导致“基本不动”）、前方安全走廊净空 <1.0m 急停 / <1.8m 减速（V0.0.91，原 0.5/1.0）；
+开启后 0.3m/s 限速巡航（V0.0.89，原 0.1 易导致“基本不动”）、前方安全走廊净空 <0.90m 急停 / <1.40m 减速（**V0.0.97 由 1.0/1.8 重标定**，见 Deployment_Guide §5.5.1）；
 并自动监控四类异常——疑似碰撞卡死、控制器断流（>`plan_fail_timeout` 10s，V0.0.89 原 2s）、Nav2 goal ABORTED（V0.0.89 起**连续**达 `test_max_goal_aborts`(3) 次才触发，EXECUTING 清零，避免起步期瞬时 ABORT 一票否决）、
 **地图越界（V0.0.87，距未建图/界外栅格 <0.4m）**——任一发生立即
 零速锁存（TEST_ABORTED）并发布 /estop=true（auto_mission 取消全部导航任务）；

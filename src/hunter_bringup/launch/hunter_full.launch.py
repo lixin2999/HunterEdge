@@ -120,9 +120,21 @@ def generate_launch_description():
                                                  #    dmesg 查掉线、关 USB 自动挂起）。
                                                  #    注：_isolated() 的 GroupAction(forwarding=False) 会清空
                                                  #    父作用域，故此处只能用字面量（不能用 LaunchConfiguration）。
-                                                 'depth_module.depth_profile': '640,480,30',
-                                                 'depth_module.infra_profile': '640,480,30',
-                                                 'rgb_camera.color_profile':   '640,480,30',
+                                                 # V0.0.97 帧率 30 → 15fps（修"感知链饥饿"）：
+                                                 #   相机修好后现场出现 planner_server/controller_server
+                                                 #   "The /perception/lidar/obstacle_cloud observation buffer
+                                                 #   has not been updated for 0.6~2.8 seconds"、频繁
+                                                 #   "Control loop missed its desired rate of 20Hz"、
+                                                 #   "Message Filter dropping message ... earlier than all the
+                                                 #   data in the transform cache" —— 典型 CPU/IO 饥饿：
+                                                 #   相机 30fps + vision_perception 15Hz + data_agent 录制
+                                                 #   /camera/color + /lidar_points 同时跑，抢占 Jetson CPU。
+                                                 #   降到 15fps（与 sensor_params.yaml 的 camera 声明一致）
+                                                 #   可砍掉约一半采集/编码/录制负载，深度感知仍满足低速
+                                                 #   避障需求（视觉链目标 15Hz，非 30Hz）。
+                                                 'depth_module.depth_profile': '640,480,15',
+                                                 'depth_module.infra_profile': '640,480,15',
+                                                 'rgb_camera.color_profile':   '640,480,15',
                                                  'rgb_camera.color_format':    'RGB8',
                                                  'depth_module.depth_format':  'Z16',
                                                  'enable_infra':  'false',
