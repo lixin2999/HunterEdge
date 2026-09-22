@@ -222,6 +222,21 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'self_margin': 0.12,
             'scan_timeout': 0.5,        # /scan 断流 fail-safe（s）
             'cmd_timeout': 0.5,         # 上游指令断流看门狗（s）
+            # V0.0.95 阈值滞环 + 幽灵点门控（修“阈值处原地抖动不前进/单点误急停”）：
+            #   现场日志净空在阈值附近 ±6mm 抖动（0.991↔1.006m）时，旧实现每 0.1~0.2s
+            #   在 SLOWDOWN↔COLLISION_STOP 间往返切换（56s 内 47 次），速度被反复归零，
+            #   车辆“抖动但不前进”，并刷屏掩盖其它故障 → 引入释放滞环：已急停后须
+            #   净空恢复到 stop+0.25m 才放行，已减速后须恢复到 slow+0.20m 才全速。
+            #   ⚠ 与行为树 BackUp 的强耦合：滞环 < BT 的 backup_dist（0.45m），
+            #     否则“倒完仍不放行”→ 车辆被滞环锁死原地（本版取 0.25 vs 0.45，
+            #     余量 0.20m）。改任一值时必须同步核算。
+            'stop_release_hysteresis': 0.25,   # 退出 STOP 的滞环（m）
+            'slow_release_hysteresis': 0.20,   # 退出 SLOWDOWN 的滞环（m）
+            # 幽灵点门控：走廊内最近回波纵向 ±0.25m 内回波点数 < 3 时判为孤立噪点
+            #   （单束噪声/玻璃反光/雨雾），不作为刹车依据；真障碍必有数点以上回波。
+            #   ⚠ 极细立柱/远距离薄结构可下调为 2；设为 1 即恢复旧行为（不抑制）。
+            'min_obstacle_points': 3,
+            'obstacle_cluster_span': 0.25,
             'enable_test_mode': False,  # 测试模式运行时经 /safety/test_mode 开关
             # V0.0.89 窄小测试场地低速档：测试模式限速抬到 0.3m/s（原 0.1 “基本不动”），
             # 碰撞阈值适配场地尺度（急停 1.0/减速 1.8，V0.0.91 与 range_min 对齐），

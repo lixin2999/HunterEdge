@@ -103,6 +103,13 @@ private:
   bool tryReleaseSelfEstop();  // 自触发急停（障碍物类）解除：危险消除后发布 /estop=false
   bool waypointInsideMap(const Waypoint & wp);  // 航点在已采集地图区域内（边界+边距+非未建图栅格，V0.0.82/0.0.87）
   std::string waypointMapCheckDetail(const Waypoint & wp);  // 越界原因（空=通过）：矩形边界外 / 未建图(unknown)栅格
+  // V0.0.95 航点“已到达”预检：车已在航点到达半径内（位置重合）时不得再发 goal——
+  //   “目标=当前位姿”对阿克曼是退化目标（左/右满舵都到不了），MPPI 会持续打满转向而
+  //   纵向零进挪，ProgressChecker(0.1m/10s) 必判 Failed to make progress，
+  //   BT 恢复池（非运动：清图+Wait）也救不了 → 车辆原地抖动、任务卡死。
+  bool waypointAlreadyReached(const Waypoint & wp, double & dist, double & yaw_err);
+  // V0.0.95 当前 map 系位姿快照（/relocalization/pose）；未收到位姿返回 false（调用方放行旧行为）
+  bool currentMapPose(double & x, double & y);
 
   // ---- Nav2 就绪门控（bt_navigator lifecycle 状态） ----
   void queryNavigatorState();    // 异步查询 bt_navigator 状态（1Hz 节流，不阻塞主循环）
@@ -204,6 +211,14 @@ private:
   int wp_fail_count_{0};           // 连续失败计数
   bool goal_in_flight_{false};     // 是否有 goal 在飞
   std::string fault_reason_;       // FAULT 锁存原因（V0.0.91，仅日志用）
+  // V0.0.95 受阻（无法绕行）计数：goal 在途而长时间无位移时递增，供日志与诊断
+  int blocked_count_{0};
+  double goal_start_x_{0.0};       // 发送当前 goal 时的 map 系位姿（受阻判定基准）
+  double goal_start_y_{0.0};
+  // V0.0.95 主动取消标记：取消与换点已由取消方（受阻/超时/降级）完成，
+  //   resultCallback 收到 CANCELED 时据此跳过重复的 fail_count++ 与换点，
+  //   否则一次受阻会连跳两个航点并提前触发 FAULT。
+  bool goal_cancel_by_mission_{false};
 
   // ---- 静态地图边界缓存（/map transient_local；V0.0.82 矩形边界校验，
   //      V0.0.87 增加未建图(unknown)栅格校验） ----
@@ -245,6 +260,10 @@ private:
   double goal_timeout_{60.0};          // 单点导航超时（s）
   double nav_active_wait_timeout_{60.0}; // NAVIGATING 中等待 bt_navigator 激活的超时（s）
   double nav_retry_backoff_{2.0};      // goal 被拒/失败后的重试退避（s）
+  // V0.0.95 航点“已到达”预检与受阻检测
+  double already_reached_dist_{0.30};  // 航点到达判定半径（m）：车与航点位置重合即跳过，不再发 goal
+  double stall_detect_time_{25.0};     // 受阻判定时长（s）：goal 在途而位移停滞超此时长判“无法绕行”
+  double stall_move_eps_{0.15};        // 受阻判定位移下限（m）：窗口内 map 系位移小于此值即停滞
   // 障碍物等待
   double obstacle_wait_timeout_{30.0}; // 障碍物等待超时（s）
   // 最大速度（仅日志/合规性检查；实际限速由 Nav2 params 控制）

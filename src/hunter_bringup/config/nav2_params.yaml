@@ -260,8 +260,14 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.5, 0.0, 0.8]     # V0.0.89 测试场地：线速度上限 0.5m/s（原 0.8，与 RPP desired_linear_vel 一致），角速度 0.8rad/s
-    min_velocity: [0.0, 0.0, -0.8]    # V0.0.89 线性下限置 0：硬禁止倒车（角速度保留 ± 以转向）
+    max_velocity: [0.5, 0.0, 0.8]     # V0.0.89 测试场地：线速度上限 0.5m/s（原 0.8，与 MPPI vx_max 一致），角速度 0.8rad/s
+    # ⚠ V0.0.95 线性下限 0.0 → -0.20（关键）：本节点对【所有】速度源统一做绝对值钳制
+    #   （velocity_smoother.cpp applyConstraints 前的 std::clamp），min_velocity[0]=0.0
+    #   会把行为树 BackUp（倒车脱困）的负线速度直接钳成 0 —— 表现为“恢复行为报成功
+    #   但车不倒”，V0.0.94 现场即因此彻底失去倒车脱困能力。禁倒车应由控制器/规划器
+    #   层施加（MPPI vx_min=0 + Smac allow_reversing=false 均已禁止），此处只放开
+    #   “行为层倒车通道”，上限 -0.20m/s 与 BT 的 backup_speed 0.10m/s 留足余量。
+    min_velocity: [-0.20, 0.0, -0.8]
     max_accel: [0.3, 0.0, 1.0]        # V0.0.89 与 RPP 一致，减小起步冲击
     max_decel: [-1.5, 0.0, -1.5]      # V0.0.89 0.5m/s 下足够制动
     odom_topic: "/localization/odom"

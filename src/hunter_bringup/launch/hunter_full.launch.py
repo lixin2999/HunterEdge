@@ -98,7 +98,32 @@ def generate_launch_description():
     # camera_link），驱动 TF 树无消费者，关闭即修复；副作用仅 RViz 失去
     # realsense 原生 TF 视角，调试需要时可单独补静态发布器。
     camera_driver  = _isolated(src('realsense2_camera','launch', 'rs_launch.py'),
-                               launch_arguments={'publish_tf': 'false'})
+                               launch_arguments={'publish_tf': 'false',
+                                                 # V0.0.95 相机可用性修复（D435 深度流启动失败）：
+                                                 # 现场日志：驱动先落默认 profile（depth/infra 848x480x30）
+                                                 # 再"停传感器→重开"，重开时 xioctl(VIDIOC_QBUF) 报
+                                                 # "No such device" → Failed to resolve the request:
+                                                 # Z16 848x480 → 整机相机 0Hz，vision_perception 持续
+                                                 # 超时、health_monitor 报 camera 0Hz、融合退化为单雷达源。
+                                                 # 处置：① 显式声明分辨率/帧率，避免默认 profile 与实际
+                                                 # 需求不一致引发的 stop/start 重配（该重配正是掉节点时刻）；
+                                                 # ② 降到 640x480x30（与 sensor_params.yaml camera
+                                                 # resolution 对齐），USB 带宽与曝光稳定裕度更好；
+                                                 # ③ initial_reset：设备残留/枚举异常（dmesg 见 USB 掉线、
+                                                 #    /dev/video* 消失）时置 'true' 强制复位后重枚举。
+                                                 #    注：_isolated() 的 GroupAction(forwarding=False) 会清空
+                                                 #    父作用域，故此处只能用字面量（不能用 LaunchConfiguration）；
+                                                 #    需要临时复位时把 'false' 改 'true' 后重启本 launch。
+                                                 'depth_module.depth_profile': '640,480,30',
+                                                 'depth_module.infra_profile': '640,480,30',
+                                                 'rgb_camera.color_profile':   '640,480,30',
+                                                 'rgb_camera.color_format':    'RGB8',
+                                                 'depth_module.depth_format':  'Z16',
+                                                 'enable_infra':  'false',
+                                                 'enable_infra1': 'false',
+                                                 'enable_infra2': 'false',
+                                                 'enable_sync':   'false',
+                                                 'initial_reset': 'false'})
     imu_driver     = _isolated(src('ch10x_driver',     'launch', 'ch10x_driver.launch.py'))
 
     # ---- 2. CAN 驱动（hunter_base，文档 11） ----

@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V1.5（开发指南，对应软件基线 V0.0.93：**方案A 定位架构重构**——`odom→base_link` TF 单一所有权（底盘与 EKF 均 `publish_tf=false`，FAST-LIO2 独占并帧名归一 `camera_init/body`→`odom/base_link`）；新增 `hunter_relocalization`（NDT 点云对先验 .pcd 配准）发布 `map→odom` 替代 AMCL；局部控制 RPP→MPPI（Ackermann 模型）；健康闸门改判 `/relocalization/pose`，彻底根治因 TF 双发布者打架导致的“无法自主导航巡航”）
+> **文档版本**：V1.7（开发指南，对应软件基线 V0.0.95：在 V0.0.94“**开启自主巡航车辆原地抖动不前进**”故障链（航点[0] 与车辆起始位姿重合 0.19m → “目标=自身”退化 goal → 阿克曼无法原地转向 → `Failed to make progress` 循环；同时 `safety_guard` 走廊净空贴着急停阈值 ±6mm 抖动导致 56s 内 47 次 `SLOWDOWN↔COLLISION_STOP` 状态往返、速度被反复归零；BT 恢复池 V0.0.89 起只有“清图+Wait”非运动手段、无法脱困）基础上分层修复：**任务层新增航点“已到达”预检与受阻（stall）检测**、**安全层新增阈值释放滞环与幽灵点门控**、**行为层恢复受限倒车脱困（BackUp 0.45m，配套放开 `velocity_smoother` 倒车通道）**、**感知层修复 D435 启动 profile 致相机 0Hz**）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -329,6 +329,12 @@ ros2 launch hunter_bringup hunter_full.launch.py \
   map_yaml_path:=/home/agilex/HunterEdge/maps/hunter_map.yaml
 ```
 
+> ⚠️ **【巡航前置检查（V0.0.95 实车教训）】** 切 AUTO 前确认：① 车头正前方 **≥2m** 净空
+> （V0.0.94 实车即因起点正前方 ~1m 处障碍 + 航点[0]与车位重合，出现原地抖动不前进）；
+> ② `waypoints` 首点与车辆起始位姿距离 **>0.30m**（否则该航点被判“已到达”跳过；全部航点
+> 都在 0.30m 内会直接 FAULT 锁存）；③ 相机彩色流正常（`ros2 topic hz /camera/camera/color/image_raw`），
+> 否则避障退化为单雷达源（见 §13.8 相机全程 0Hz 条目）。
+
 > 💡 **【开发者视角】** 模块化启动便于逐模块联调；`hunter_full.launch.py` 的参数开关见上表（设计文档 §4.4）。
 
 ### 7.6 坐标系与 TF 树（V0.0.93 方案A 修订）
@@ -339,7 +345,7 @@ ros2 launch hunter_bringup hunter_full.launch.py \
 |-------|--------|------|
 | `base_link → rslidar` / `camera_color_optical_frame` / `imu` | `robot_state_publisher`（URDF 静态外参，文档 7.4/附录D） | 相机外参唯一来源（`camera_color_joint`：xyz 0.40/0/0.30，rpy 0/-π/2/π/2） |
 | `odom → base_link` | **FAST-LIO2**（`laserMapping.cpp` 唯一广播；底盘 `hunter_base` 与 EKF 均 `publish_tf=false`） | LIO 紧耦合里程计；帧名已归一（原 camera_init/body） |
-| `map → odom` | **`hunter_relocalization`**（NDT 点云配准，V0.0.93 新增） | 将实时点云对齐先验全局 .pcd；替代 AMCL |
+| `map → odom` | **`hunter_relocalization`**（NDT 点云配准，V0.0.93 新增；V0.0.94 将 TF 广播与 NDT 解耦） | 将实时点云对齐先验全局 .pcd；替代 AMCL。**V0.0.94**：NDT 低频（2Hz）精炼 `T_map_odom_`，另用 **20Hz 定时器持续广播 `map→odom`**（取最新缓存值）避免下游外推失败；位姿刷新只由跳变闸门 `step_ok`+`fit<=fitness_hard_ceiling` 决定（运动时不冻结、可回弹），`fit<=fitness_max` 仅决定对外协方差置信度（带 `diverge_tolerance_cycles` 去抖） |
 
 - `realsense2_camera` 驱动在 `hunter_full.launch.py` 中固定传入 **`publish_tf: 'false'`**：驱动自建 `camera_link` 树与 URDF 对 `camera_color_optical_frame` 构成同 frame 双父，TF 树分裂为 `base_link` / `camera_link` 两棵，sensor_fusion `lookupTransform` 必败（报 `TF unconnected trees`，V0.0.70 现场问题）；驱动 TF 无任何消费者（相机外参唯一来源是 URDF；`align_depth` 在驱动内部完成不依赖 ROS TF），关闭无副作用，仅 RViz 少显示 realsense 原生 TF 视角；
 - 验证：`ros2 run tf2_ros tf2_echo base_link camera_color_optical_frame` 应输出 translation (0.40, 0.00, 0.30)、rotation 对应 rpy (0, −π/2, π/2)；调试可用 `ros2 run tf2_tools view_frames` 导出 frames.pdf 确认全树单棵连通。
@@ -436,7 +442,7 @@ hunter_full.launch.py (use_autonomous_nav:=true)
 | 无急停信号 | 订阅 `/estop` |
 | `SystemHealth` 非 `CRITICAL` | 订阅 `/system/health` |
 | 定位协方差迹 ≤ 0.5（可配） | 订阅 `/localization/odom` 协方差对角元素 |
-| **全局重定位(NDT) x+y 方差和 ≤ 0.10（可配，V0.0.93）** | 订阅 `/relocalization/pose`（hunter_relocalization 收敛时小协方差、未收敛时大协方差） |
+| **全局重定位(NDT) x+y 方差和 ≤ 0.10（可配，V0.0.93）** | 订阅 `/relocalization/pose`（hunter_relocalization 收敛时小协方差、未收敛时大协方差。**V0.0.94**：NDT 位姿刷新与对外置信度解耦——`fit<=fitness_max` 仅决定协方差且带 `diverge_tolerance_cycles` 连续失败去抖，运动畸变帧仍持续跟踪不冻结，避免虚假未收敛致秒退 IDLE） |
 | 感知数据新鲜度 ≤ 2s（可配） | 订阅 `/perception/fused_objects` 时间戳 |
 
 ### 10.3 任务状态机
@@ -446,10 +452,22 @@ IDLE ──[AUTO条件满足]──→ WAITING_LOCALIZE ──[收敛]──→ 
 IDLE ──[mapping模式]──→ MAPPING
 NAVIGATING ──[障碍物 < warn_dist]──→ OBSTACLE_AVOID ──[路清]──→ NAVIGATING
 NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
+NAVIGATING ──[航点受阻：stall_detect_time 内位移 < stall_move_eps]──→ 取消 goal 换点
+                                                          （连续达 max_wp_failures → FAULT）
+NAVIGATING ──[航点已在 already_reached_dist 内 / 越界]──→ 跳过该航点（不发 goal）
 NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁存：不发 goal、不重发，
                                                   需模式开关离开 AUTO 再切回）
 任意状态 ──[非AUTO/急停]──→ IDLE / ESTOP
 ```
+
+> **V0.0.95 任务层两条新防线**（对应“遇到障碍物无法绕开障碍物自动驾驶”）：
+> ① **航点“已到达”预检**：航点与 `/relocalization/pose` 位置重合（≤ `already_reached_dist` 0.30m）
+>    时视为已完成并跳过——goal 与自身位姿重合时 Smac 路径≈0 且要求终止朝向，阿克曼无法
+>    原地转向，MPPI 会持续打满转向（日志 `set steering angle: ±0.386428 rad` 即曲率钳制上限
+>    对应的最大内轮转角）而纵向零进挪，ProgressChecker(0.1m/10s) 必判 `Failed to make progress`；
+> ② **受阻（stall）检测**：goal 在途且 `stall_detect_time`(25s) 内 map 系位移 < `stall_move_eps`(0.15m)
+>    → 明确判“前方障碍无法绕行/航点无可达路径”，立即取消本 goal 并换点（连续 3 次 → FAULT 锁存），
+>    日志给出可判读结论，避免“原地抖动 90s 后静默换点”。
 
 ### 10.4 安全约束参数（`autonomous_nav_params.yaml`）
 
@@ -464,8 +482,11 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 | `perception_timeout` | 2 s | 感知数据超时阈值 |
 | `max_velocity` | 0.5 m/s | 巡航速度（V0.0.89 窄小测试场地低速档，与 MPPI vx_max/velocity_smoother/safety_guard 一致） |
 | `loop_waypoints` | `true` | 完成所有航点后是否循环 |
-| `goal_timeout` | 90 s | 单点导航超时（V0.0.89，非运动恢复周期变长） |
+| `goal_timeout` | 45 s | 单点导航超时（**V0.0.95 90→45**：受阻由 `stall_detect_time` 25s 内提前定性，本超时只兜底“缓慢但可达”的航点） |
 | `obstacle_wait_timeout` | 30 s | 障碍物等待超时后触发 ESTOP |
+| `already_reached_dist` | 0.30 m | **V0.0.95 新增**：航点“已到达”判定半径。航点与当前 map 系位姿距离 ≤ 此值时视为已完成并**跳过不发 goal**（修“目标=自身”退化 goal 死锁）。须 > 阿克曼停车精度且 ≥ 2× Nav2 `xy_goal_tolerance`(0.10m)。全部航点均在此半径内 → FAULT 锁存 |
+| `stall_detect_time` | 25 s | **V0.0.95 新增**：受阻判定时长。goal 在途且窗口内位移 < `stall_move_eps` → 判“前方障碍无法绕行/航点无可达路径”，取消本 goal 并换点。须 > 一轮 Nav2 恢复周期（ProgressChecker 10s + 清图 + 受限倒车脱困） |
+| `stall_move_eps` | 0.15 m | **V0.0.95 新增**：受阻判定位移下限（>2× 定位抖动） |
 
 ### 10.5 自动化工具节点
 
@@ -482,8 +503,8 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 - **定位门控**：`TransformAvailable(map→base_link)` 前置检查，定位不可用时立即阻断导航；
 - **感知保鲜**：`TimeExpired(2s)` 哨兵，感知超时时清除局部代价地图并等待恢复；
 - ~~动态减速~~（V0.0.82 移除 `SpeedController`：本 fork 该节点为按平滑速度调子树 tick 周期的装饰器，无"障碍物距离→限速"语义）；障碍物减速由 **MPPI** `CostCritic`/`PathAlignCritic`（近障碍自动降速，V0.0.93）+ approach 减速承担；
-- ~~阿克曼后退~~（V0.0.89 移除）：`BackUp`/`Spin` 等**运动型恢复已全部删除**——窄小测试场地内倒车会把车倒进更差的致命栅格、重定位位姿随之跳变，导致"只退不进"；恢复退化为"清除全局/局部代价地图 + `Wait` 后重试"的非运动组合，车辆**只前进不倒车**（velocity_smoother 同步硬禁倒车，与 MPPI vx_min=0 协同）。
-- ~~重规划提速~~（V0.0.85 1.0→2.0Hz，**V0.0.92 回退至 1.0Hz**）：实车复盘发现，2Hz 重规划在代价地图残留假障碍时会与脏图更新同频共振，导致控制器转向角全幅振荡（蛇形行驶）；1Hz + 起步清图同步门控（`clearCostmapsOnStart()`，V0.0.92）已足够覆盖动态障碍响应（safety_guard 物理碰撞闸 + MPPI 近障碍降速兜底），且不再放大感知噪声。
+- ~~阿克曼后退~~（V0.0.89 移除，**V0.0.95 有条件恢复**）：`BackUp` 在 `FollowPath` 失败恢复序列中恢复为**受限倒车**（`backup_dist=0.45m`、`backup_speed=0.10m/s`、`time_allowance=10s`）。V0.0.89 移除的顾虑是“倒车把车倒进更差的致命栅格 + AMCL 位姿跳变”；V0.0.93 起全局定位改为 NDT 点云重配准（不依赖倒车运动模型），且 `safety_guard` 在指令为负时自动切换**后方走廊**判据（`footprint_rear+self_margin` 起算，后净空 < `stop_dist` 即零速），外加地图边界监护兜底；实车证明“纯非运动恢复”在“阿克曼 + 车头正对障碍”时**永远无法脱困**（V0.0.94 日志：车原地抖动 56s 零位移）。**配套改动**：`velocity_smoother.min_velocity[0]` 由 `0.0` → `-0.20`（该节点对全部速度源做绝对值钳制，置 0 会把倒车指令直接钳成 0 → “恢复行为报成功但车不倒”）；控制器/规划层的禁倒车由 MPPI `vx_min=0` + Smac `allow_reversing=false` 继续保证。`Spin`（原地旋转）保持移除——阿克曼不能原地转向。
+- ~~重规划提速~~（V0.0.85 1.0→2.0Hz，**V0.0.92 回退至 1.0Hz**）：实车复盘发现，2Hz 重规划在代价地图残留假障碍时会与脏图更新同频共振，导致控制器转向角全幅振荡（蛇形行驶）；1Hz + 起步清图同步门控（`clearCostmapsOnStart()`，V0.0.92）已足够覆盖动态障碍响应（safety_guard 物理碰撞闸 + MPPI 近障碍降速兜底），且不再放大感知噪声。**V0.0.94**：清图客户端类型由 `std_srvs/Empty` 修正为 Nav2 原生主类型 `nav2_msgs/ClearEntireCostmap`——CycloneDDS 下 `service_is_ready()` 的 graph 匹配只认主类型（`std_srvs/Empty` 仅序列化兼容副类型），误用 Empty 会导致清图门控永久 `global=PEND local=PEND`、goal 永不下发。
 
 ### 10.8 碰撞防护与安全约束（V0.0.85 新增 hunter_safety/safety_guard）
 
@@ -494,8 +515,10 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 
 | 能力 | 触发条件 | 动作 |
 |------|----------|------|
-| 碰撞急停 | 前方安全走廊（\|y\| ≤ corridor_half_width 0.45m）内**纵向净空** < stop_dist(1.0m，V0.0.91) | 立即零速 COLLISION_STOP |
-| 碰撞限速 | 走廊纵向净空 < slow_dist(1.8m，V0.0.91) | 线性限速至 max×(d−stop)/(slow−stop)，SLOWDOWN |
+| 碰撞急停 | 前方安全走廊（\|y\| ≤ corridor_half_width 0.45m）内**纵向净空** < stop_dist(1.0m，V0.0.91)；**V0.0.95 起带释放滞环**（恢复到 stop+0.25m 才放行） | 立即零速 COLLISION_STOP |
+| 碰撞限速 | 走廊纵向净空 < slow_dist(1.8m，V0.0.91)；**V0.0.95 起带释放滞环**（恢复到 slow+0.20m 才全速） | 线性限速至 max×(d−stop)/(slow−stop)，SLOWDOWN |
+| **阈值抖振抑制（V0.0.95）** | 净空在阈值附近微抖（实测 ±6mm：0.991↔1.006m） | 释放滞环使状态**不再每 0.1~0.2s 往返切换**（旧实现 56s 内 47 次 SLOWDOWN↔COLLISION_STOP，速度被反复归零 → 车“抖动不前进”+ 日志刷屏）；状态转移日志附带“滞环保持（释放阈值 X.XXm）” |
+| **幽灵点门控（V0.0.95）** | 走廊内最近回波纵向 ±`obstacle_cluster_span`(0.25m) 内回波点数 < `min_obstacle_points`(3) | 判为孤立噪点（单束噪声/玻璃反光/雨雾），不作为刹车依据，2s 节流 WARN 输出诊断；真障碍必有数点以上回波（可调 2，设 1 即恢复旧行为） |
 | 盲区一致性强制（V0.0.91） | 配置的 stop_dist ≤ /scan `range_min`+0.15（急停区落在感知盲区内） | 运行时强制抬升到 range_min+0.15 并一次性 ERROR 告警修参数（撞墙事故根因：range_min 0.8 > stop_dist 0.5） |
 | 感知 fail-safe | /scan 超时 0.5s 或未到达 | 零速（宁可停车不盲走）SCAN_TIMEOUT |
 | 指令看门狗 | 上游速度指令断流 >0.5s | 零速心跳 CMD_TIMEOUT |
@@ -512,9 +535,20 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 > 规划路径均在已采集地图区域内——① Nav2 规划层：`global_costmap
 > track_unknown_space: true` + Smac `allow_unknown: false`，全局规划路径不穿越
 > 未采集区域；② 任务层：auto_mission 发送航点前校验（矩形边界+0.5m 边距+
-> 非 unknown 栅格），越界航点自动跳过；③ 执行层：safety_guard 地图边界监护
+> 非 unknown 栅格+**V0.0.95 已到达预检**），越界/已到达航点自动跳过；③ 执行层：safety_guard 地图边界监护
 > （/map + /relocalization/pose 距离场，上表最后两行），行驶中越界零速兜底。建图模式
 > 无 /map 与重定位位姿，③ 自动不介入。
+>
+> **V0.0.95 绕障能力（四层协同，对应“遇到障碍物无法绕开障碍物自动驾驶”）**：
+> ① **规划层**：`global_costmap.obstacle_layer` 的 `lidar_cloud` + `scan` 双源均
+> `marking+clearing`，真实障碍被标记后 Smac（DUBIN、`allow_reversing=false`）会给出绕行路径；
+> ② **行为层**：`FollowPath` 失败 → 清局部代价地图 → **受限倒车 0.45m** → 1Hz 重规划
+> （倒车换来前向净空，绕行路径得以成立）；
+> ③ **安全层**：倒车时走廊判据自动切到车后（后净空 < 1.0m 即零速），
+> `stop_release_hysteresis`(0.25m) < `backup_dist`(0.45m) 保证“倒完必放行”，
+> 地图边界监护防止倒出图外；
+> ④ **任务层**：若 25s 内仍零位移 → 判“受阻/无可达路径”，换点；连续 3 次 → FAULT 锁存
+> 并在日志给出处置指引（不再无声原地抖动）。
 
 分级预警：/safety/state（std_msgs/String）2Hz 心跳，格式 状态|原因；
 仅导航模式启动（mapping 模式 auto_mission cruise 直发 /cmd_vel，避免双发布者）。
@@ -729,6 +763,11 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | 视觉 0Hz，日志 `resize.cu:175 error (-217) no kernel image` | OpenCV CUDA 编译 ARCH 与实机 GPU 不符（如 sm_72 用于 Orin） | `cuobjdump --list-elf /usr/local/lib/libopencv_cudawarping.so.410` 应见 `sm_87`；按 §5.3 以 `CUDA_ARCH_BIN=8.7` 重编后重启节点即恢复 GPU（期间节点自动降级 CPU，感知不断流） |
 | sensor_fusion 报 `TF unconnected trees` | 相机 frame 双父（驱动 TF + URDF 并存，TF 树分裂） | 确认 `hunter_full.launch.py` 相机驱动为 `publish_tf: 'false'`；`ros2 run tf2_ros tf2_echo base_link camera_color_optical_frame` 验证外参；必要时 `tf2_tools view_frames` 看全树 |
 | 启动时一次性 `彩色图像超时 x.x s` | 启动竞态（视觉节点激活早于彩色流就绪） | 仅出现一次属良性，可忽略；反复出现才按"相机无图像"排查 |
+| **相机全程 0Hz**：`xioctl(VIDIOC_QBUF) failed: No such device` + `Failed to resolve the request: Z16 848x480`，`彩色图像超时` 持续递增、`health_monitor` 报 `camera 话题频率异常 0.0Hz`（V0.0.95 已修） | D435 驱动启动后先落默认 profile（depth/infra 848x480x30）再"停传感器→重开"，**重开瞬间 USB 设备节点消失**（ENODEV）→ 整机相机 0Hz，vision/fusion 退化为单雷达源 | ① V0.0.95 起 launch 已显式下发 `640,480,30`（避免默认 profile 触发的 stop/start 重配）并关闭 infra；② 仍复现按硬件链排查：`lsusb`、`dmesg \| grep -iE 'usb\|uvc\|xhci'`（找 disconnect/reset）、D435 直连 USB3 口勿经 HUB、关闭 USB 自动挂起；③ 设备枚举异常（`/dev/video*` 消失）时把 `hunter_full.launch.py` 相机 `initial_reset` 改 `'true'` 重启；④ 验证 `ros2 topic hz /camera/camera/color/image_raw`（应 ~30Hz） |
+| **自主巡航车辆原地抖动不前进**：`/safety/state` 在 `SLOWDOWN↔COLLISION_STOP` 间高频往返、`set steering angle` 恒为 ±0.386428、最终 `Failed to make progress`（V0.0.95 已修） | ① 航点与车辆当前位姿重合（"目标=自身"退化 goal，阿克曼无法原地转向）；② 走廊净空贴着急停阈值 ±6mm 抖振，速度被反复归零；③ BT 恢复池只有"清图+Wait"非运动手段，无法脱困 | V0.0.95 已分层修复（航点"已到达"预检 + 阈值释放滞环 + 受限倒车脱困 + 受阻检测）；现场仍复现时：① 确认车头前方 ≥2m 无障碍（`rviz2` 看 /scan 与 costmap，分清真实障碍/幽灵点）；② 看 `safety_guard` 启动日志确认 `释放滞环=+0.25/+0.20m`、`幽灵点门控=≥3 点` 已注入；③ 确认 `velocity_smoother min_velocity[0]=-0.20`（=0 会把倒车脱困钳成 0）；④ `waypoints` 首点不得与车位重合（见 `autonomous_nav_params.yaml` 航点布置约束） |
+| **自主巡航报 `[NAVIGATING] 航点[i] 受阻` 或 FAULT 锁存** | 前方真实障碍无法绕行 / 航点在障碍后无可达路径 / 全部航点与车位重合 | 先看 `/safety/state` 的走廊净空与 `幽灵点抑制` 告警区分真实障碍与噪点；移除障碍或人工把车移到空旷处；用 rviz2 重新标定航点；FAULT 需把模式开关离开 AUTO 再切回解除 |
+| **倒车脱困"报成功但车不倒"** | `velocity_smoother` 对全部速度源做绝对值钳制，`min_velocity[0]=0.0` 把负线速度钳成 0（V0.0.94 及以前默认） | `nav2_params.yaml` `velocity_smoother.min_velocity` 应为 `[-0.20, 0.0, -0.8]`（V0.0.95）；禁倒车由 MPPI `vx_min=0` + Smac `allow_reversing=false` 保证，不在平滑器上设 0 |
+| **日志被 `set steering angle: x` 刷屏（20~50Hz）** | 底盘驱动（`hunter_ros2/hunter_base`，vendor 目录）在每个 `/cmd_vel` 回调 `std::cout` 打印转向角，未节流 | 分析时过滤：`grep -v 'set steering angle' /tmp/hunt7.log`；或 `scripts/hunter_log.sh` 导出后离线过滤。驱动属 vendor 代码（git-ignored），不建议直接改 |
 | 一次性 `[TensorRT] Using an engine plan file across different models of devices` | `.engine` 非本机/本设备型号生成（换机或文件被旧引擎覆盖） | 不阻塞运行（话题 15Hz 正常）；目标机重生成：`trtexec --onnx=<绝对路径>/yolov8s.onnx --saveEngine=/data/models/yolov8s.engine --fp16` 后重启视觉节点 |
 | Ctrl+C 后 `maps/` 只有 `.pcd`，`.pgm/.yaml` 未生成（V0.0.88 前必现） | FAST-LIO2 在 `main()` 于 `spin` 返回**后**才写 PCD（20.7M 点 ≈ 664MB 需数秒至数十秒），而 Ctrl+C 同时终止 `pcd_to_map`，运行期 `MAPPING→非MAPPING` 跳变不会发生 → 原自动转换从不启动 | V0.0.88 起 `pcd_to_map` 退出时派生独立会话后台转换进程兜底：`tail -f maps/pcd_to_map_final.log`（应见 `PCD 已写完整 → 转换成功`），数十秒内 `ls -lh maps/` 应齐 `.pcd/.pgm/.yaml`；仍缺时手动兜底 `python3 ~/HunterEdge/install/auto_mission/lib/auto_mission/pcd_to_map --finalize --pcd-file ~/HunterEdge/maps/hunter_map.pcd --force` |
 
@@ -743,12 +782,12 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | 《自动驾驶车辆系统详细设计文档 V2.0》 | 本项目的设计基准；本文档全部参数、话题、CAN 协议、坐标系均可追溯至其对应章节 |
 | AI 编码任务清单 | 分模块开发任务（任务 00 ~ 任务 17），指导按模块开发与验收 |
 | `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程） |
-| `Deployment_Guide.md` | 部署操作文档 V1.5（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.0.93） |
+| `Deployment_Guide.md` | 部署操作文档 V1.7（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.0.95） |
 | `release.md` | 版本历史（V0.0.1 ~ 当前），记录每版主要功能与修复 |
 
 > **追溯原则**：本 README 中所有硬件参数（§2）、软件版本（§3）、话题（§8）、控制模式（§9）、限制（§13）均源自《自动驾驶车辆系统详细设计文档 V2.0》，未虚构功能。自主导航模块（§10）为在设计文档框架内的扩展实现。
 
 ---
 
-*HunterEdge 开发指南 · 文档版本 V1.5 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.93 现场实测修正（V0.0.89：窄小测试场地低速档；V0.0.91：走廊净空碰撞闸、`FAULT` 锁存态；V0.0.92：起步清图同步重试、行为树重规划回退 1Hz；V0.0.93：方案A 定位架构重构——TF 单一所有权、hunter_relocalization(NDT) 替代 AMCL、RPP→MPPI）*
+*HunterEdge 开发指南 · 文档版本 V1.7 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.95 现场实测修正（V0.0.89：窄小测试场地低速档；V0.0.91：走廊净空碰撞闸、`FAULT` 锁存态；V0.0.92：起步清图同步重试、行为树重规划回退 1Hz；V0.0.93：方案A 定位架构重构——TF 单一所有权、hunter_relocalization(NDT) 替代 AMCL、RPP→MPPI；V0.0.94：“开启自主巡航车辆原地不动”残余故障链彻底修复；V0.0.95：“遇到障碍物无法绕开障碍物自动驾驶”分层修复——任务层航点“已到达”预检与受阻(stall)检测、安全层阈值释放滞环与幽灵点门控、行为层受限倒车脱困（`velocity_smoother` 放开倒车通道 min_velocity[0] 0.0→−0.20）、感知层 D435 显式 profile 修相机 0Hz）*
 

@@ -85,6 +85,19 @@ public:
     declare_parameter<double>("footprint_rear", 0.37);       // 车体后缘 x
     declare_parameter<double>("footprint_half_width", 0.32); // 车体半宽
     declare_parameter<double>("self_margin", 0.12);          // 自车包络外扩余量（m）
+    // V0.0.95 阈值滞环 + 幽灵点门控（消除“原地抖动不前进”与单点误急停）
+    //   release_hysteresis：进入用 stop/slow_dist，【退出】用 +hysteresis。
+    //   现场日志净空在阈值附近 ±6mm 抖动（0.991↔1.006m）时，旧实现每 0.1~0.2s
+    //   在 SLOWDOWN↔COLLISION_STOP 间往返切换（56s 内 47 次），速度被反复归零 →
+    //   车辆“抖动但不前进”，且日志被状态转移刷屏。
+    //   min_obstacle_points/obstacle_cluster_span：走廊内最近回波纵向 ±span 内的
+    //   回波点数少于 min_obstacle_points 时判为孤立噪点（单束噪声/玻璃反光/
+    //   雨雾/幽灵点）忽略；真障碍（墙/人/车）在 16 线雷达上同一纵向跨度内必有
+    //   数点以上回波。默认 3 点/±0.25m 兼顾“薄立柱”与“噪点抑制”。
+    declare_parameter<double>("stop_release_hysteresis", 0.25);  // 退出 STOP 滞环（m）
+    declare_parameter<double>("slow_release_hysteresis", 0.20);  // 退出 SLOWDOWN 滞环（m）
+    declare_parameter<int>("min_obstacle_points", 3);            // 走廊内最少回波点数
+    declare_parameter<double>("obstacle_cluster_span", 0.25);    // 最近回波簇纵向跨度（m）
     declare_parameter<double>("scan_timeout", 0.5);        // /scan 超时（s）
     declare_parameter<double>("cmd_timeout", 0.5);         // 上游指令超时（s）
     declare_parameter<double>("control_rate", 20.0);       // 主循环频率（Hz）
@@ -119,6 +132,10 @@ public:
     footprint_rear_ = get_parameter("footprint_rear").as_double();
     footprint_half_width_ = get_parameter("footprint_half_width").as_double();
     self_margin_ = get_parameter("self_margin").as_double();
+    stop_release_hysteresis_ = get_parameter("stop_release_hysteresis").as_double();
+    slow_release_hysteresis_ = get_parameter("slow_release_hysteresis").as_double();
+    min_obstacle_points_ = get_parameter("min_obstacle_points").as_int();
+    obstacle_cluster_span_ = get_parameter("obstacle_cluster_span").as_double();
     scan_timeout_ = get_parameter("scan_timeout").as_double();
     cmd_timeout_ = get_parameter("cmd_timeout").as_double();
     control_rate_ = get_parameter("control_rate").as_double();
@@ -162,6 +179,23 @@ public:
         corridor_half_width_, footprint_half_width_ + self_margin_,
         footprint_half_width_ + self_margin_ + 0.05);
       corridor_half_width_ = footprint_half_width_ + self_margin_ + 0.05;
+    }
+    // V0.0.95 滞环与幽灵点门控参数合法性校验
+    if (stop_release_hysteresis_ < 0.0) {
+      RCLCPP_WARN(get_logger(), "stop_release_hysteresis < 0，按 0 处理（无滞环）");
+      stop_release_hysteresis_ = 0.0;
+    }
+    if (slow_release_hysteresis_ < 0.0) {
+      RCLCPP_WARN(get_logger(), "slow_release_hysteresis < 0，按 0 处理（无滞环）");
+      slow_release_hysteresis_ = 0.0;
+    }
+    if (min_obstacle_points_ < 1) {
+      RCLCPP_WARN(get_logger(), "min_obstacle_points < 1，按 1 处理（不抑制单点）");
+      min_obstacle_points_ = 1;
+    }
+    if (obstacle_cluster_span_ <= 0.0) {
+      RCLCPP_WARN(get_logger(), "obstacle_cluster_span ≤ 0，按 0.25m 处理");
+      obstacle_cluster_span_ = 0.25;
     }
     if (!enable_map_fence_) {
       RCLCPP_WARN(get_logger(),
@@ -278,11 +312,15 @@ public:
       "safety_guard 启动：v_max=%.2fm/s, R_min=%.2fm（|w|≤|v|/R_min）, "
       "stop=%.2fm, slow=%.2fm, 走廊±%.2fm（车体包络 %.2f/%.2f/%.2f+m%.2f）, "
       "扇区±%.0f°, scan超时%.2fs；"
+      "释放滞环=+%.2f/+%.2f m（退 STOP/退 SLOWDOWN，消除阈值抖振）；"
+      "幽灵点门控=≥%d 点/±%.2fm（少于则判孤立噪点忽略）；"
       "测试模式=%s（限速%.2fm/s, 急停%.1fm, 减速%.1fm, 卡死判定%.1fs, 断流判定%.1fs）；"
       "地图边界监护=%s（停车%.2fm, 减速%.2fm，/map+/relocalization/pose 就绪后生效）",
       max_linear_vel_, min_turn_radius_, stop_dist_, slow_dist_,
       corridor_half_width_, footprint_front_, footprint_rear_, footprint_half_width_,
       self_margin_, sector_half_rad_ * 180.0 / M_PI, scan_timeout_,
+      stop_release_hysteresis_, slow_release_hysteresis_,
+      min_obstacle_points_, obstacle_cluster_span_,
       test_mode_ ? "ON" : "OFF",
       test_max_linear_vel_, test_stop_dist_, test_slow_dist_,
       stall_timeout_, plan_fail_timeout_,
@@ -323,12 +361,22 @@ private:
   // 自车包络（footprint + self_margin 外扩）内的回波直接丢弃，取代上游
   //   pointcloud_to_laserscan 用大 range_min 粗截断的做法——后者会在车前
   //   造出“越近越安全”的盲区（本次撞墙根因：range_min 0.8 > stop_dist 0.5）。
-  // 返回 false 表示 /scan 缺失或超时；无有效障碍时 d_clear = +inf。
-  bool corridorClearance(bool forward, double & d_clear, double & y_at)
+  // 返回 false 表示 /scan 缺失或超时。返回 true 时输出：
+  //   d_clear     —— 走廊内最小纵向净空（m，有效障碍），无有效障碍 = +inf
+  //   y_at        —— 最近回波横向偏移（诊断用，即使被判噪点也保留）
+  //   raw_x       —— 走廊内最近回波纵向距离（含将被丢弃的噪点，诊断用）
+  //   cluster_pts —— 最近回波纵向 ±obstacle_cluster_span_ 内的回波点数
+  // V0.0.95 幽灵点门控：cluster_pts < min_obstacle_points_ 时视为孤立噪点
+  //   （单束噪声/玻璃反光/雨雾），d_clear 保持 +inf 不参与制动；
+  //   真障碍（墙/人/车/货架）在 16 线雷达同一纵向跨度内必有数点以上回波。
+  bool corridorClearance(
+    bool forward, double & d_clear, double & y_at, double & raw_x, int & cluster_pts)
   {
     std::lock_guard<std::mutex> lk(data_mutex_);
     d_clear = std::numeric_limits<double>::infinity();
     y_at = 0.0;
+    raw_x = std::numeric_limits<double>::infinity();
+    cluster_pts = 0;
     if (!scan_received_ || (now() - last_scan_time_).seconds() > scan_timeout_) {
       return false;
     }
@@ -340,6 +388,9 @@ private:
     const double self_x = (forward ? footprint_front_ : footprint_rear_) + self_margin_;
     const double self_y = footprint_half_width_ + self_margin_;
 
+    // 第 1 遍：走廊内最小纵向净空
+    double min_x = std::numeric_limits<double>::infinity();
+    double min_y = 0.0;
     double angle = static_cast<double>(scan.angle_min);
     for (const float r : scan.ranges) {
       // 归一化角度差到 [-π, π]
@@ -362,11 +413,50 @@ private:
       if (x <= self_x && std::fabs(y) <= self_y) {
         continue;                        // 自车包络内：车身/支架自身反射
       }
-      if (x < d_clear) {
-        d_clear = x;
-        y_at = y;
+      if (x < min_x) {
+        min_x = x;
+        min_y = y;
       }
     }
+    if (!std::isfinite(min_x)) {
+      return true;                       // 走廊内全为 inf/无效回波 → 无障碍
+    }
+    raw_x = min_x;
+    y_at = min_y;
+
+    // 第 2 遍：最近回波纵向跨度内的回波点数（幽灵点门控依据）
+    int pts = 0;
+    const double span = min_x + obstacle_cluster_span_;
+    angle = static_cast<double>(scan.angle_min);
+    for (const float r : scan.ranges) {
+      const double rel = std::remainder(angle - center, 2.0 * M_PI);
+      angle += static_cast<double>(scan.angle_increment);
+      if (std::fabs(rel) > sector_half_rad_) {
+        continue;
+      }
+      if (!std::isfinite(r) ||
+        r < static_cast<double>(scan.range_min) ||
+        r > static_cast<double>(scan.range_max))
+      {
+        continue;
+      }
+      const double x = static_cast<double>(r) * std::cos(rel);
+      const double y = static_cast<double>(r) * std::sin(rel);
+      if (x <= 0.0 || std::fabs(y) > corridor_half_width_) {
+        continue;
+      }
+      if (x <= self_x && std::fabs(y) <= self_y) {
+        continue;
+      }
+      if (x <= span) {
+        ++pts;
+      }
+    }
+    cluster_pts = pts;
+    if (pts < min_obstacle_points_) {
+      return true;                       // 孤立回波：d_clear 保持 +inf（噪点抑制）
+    }
+    d_clear = min_x;
     return true;
     // 走廊内全为 inf/无效回波 → +inf：视为无障碍。车前扇区全无回波属异常场景，
     // 由 SCAN_TIMEOUT 看门狗、costmap 的 scan 清障层与 health_monitor 兜底。
@@ -474,11 +564,21 @@ private:
     const bool forward = v_in >= 0.0;
     double dist = 0.0;
     double y_lat = 0.0;
-    if (!corridorClearance(forward, dist, y_lat)) {
+    double raw_x = 0.0;
+    int cluster_pts = 0;
+    if (!corridorClearance(forward, dist, y_lat, raw_x, cluster_pts)) {
       // 指令快照与取数之间存在并发窗口，期间 /scan 刚好断流 → 同样 fail-safe
       publishCmd(0.0, 0.0);
       transition(State::SCAN_TIMEOUT, "/scan 在指令快照期间超时，fail-safe 停车");
       return;
+    }
+    // V0.0.95 幽灵点抑制诊断：走廊内最近回波点数不足被判噪点时给出可判读日志
+    // （区分“真障碍挡路”与“单点噪声/玻璃反光造成的假急停”）
+    if (std::isfinite(raw_x) && cluster_pts < min_obstacle_points_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "走廊内最近回波 x=%.2fm（侧偏 %.2fm）仅 %d 点 < 最少 %d 点（±%.2fm 跨度），"
+        "判为孤立噪点忽略（幽灵点抑制）",
+        raw_x, y_lat, cluster_pts, min_obstacle_points_, obstacle_cluster_span_);
     }
 
     // 4.5 V0.0.86 测试模式生效参数：0.1m/s 限速 + 更严碰撞阈值
@@ -513,24 +613,44 @@ private:
 
     // 5. 碰撞闸分级：急停 → 线性限速 → 放行
     //    dist 为走廊内最小纵向净空（x），非斜距，与制动距离同一量纲
+    //    V0.0.95 释放滞环：进入用 stop_dist/slow_dist，退出用 +release_hysteresis。
+    //    实测（V0.0.94 现场日志）净空在阈值附近 ±6mm 抖动时，旧实现每 0.1~0.2s
+    //    在 SLOWDOWN↔COLLISION_STOP 间往返切换（56s 内 47 次状态转移），速度被
+    //    反复归零 → 车辆“抖动但不前进”，且日志被状态刷屏掩盖其它故障。
+    //    滞环使“已停”状态只有在净空明显恢复（+0.25m）后才放行，
+    //    物理含义：一次急停后必须等出足够余量再走，避免贴着阈值蹭行。
+    //    ⚠ 与行为树 BackUp 的强耦合：滞环必须 < backup_dist(0.45m)，否则
+    //    “倒完仍不放行”，车辆被滞环锁死原地（文档已标注）。
+    const bool stop_engaged = state_ == State::COLLISION_STOP;
+    const bool slow_engaged = state_ == State::SLOWDOWN;
+    const double stop_release = stop_d + stop_release_hysteresis_;
+    const double slow_release = slow_d + slow_release_hysteresis_;
+
     double v_allow = v_lim;
     std::string detail = std::string("正常放行") + test_tag;
     State next = State::OK;
-    if (dist < stop_d) {
+    const std::string echo_info = "，回波点 " + std::to_string(cluster_pts);
+    if (dist < stop_d || (stop_engaged && dist < stop_release)) {
       publishCmd(0.0, 0.0);
+      const std::string held = (dist >= stop_d)
+        ? "，滞环保持（释放阈值 " + std::to_string(stop_release).substr(0, 4) + "m）"
+        : "";
       transition(State::COLLISION_STOP,
         "行进方向走廊净空 " + std::to_string(dist).substr(0, 5) +
-        "m（侧偏 " + std::to_string(y_lat).substr(0, 5) + "m）< 急停距离 " +
-        std::to_string(stop_d).substr(0, 4) + "m" + test_tag);
+        "m（侧偏 " + std::to_string(y_lat).substr(0, 5) + "m" + echo_info + "）< 急停距离 " +
+        std::to_string(stop_d).substr(0, 4) + "m" + held + test_tag);
       return;
     }
-    if (dist < slow_d) {
+    if (dist < slow_d || (slow_engaged && dist < slow_release)) {
       v_allow = v_lim * (dist - stop_d) / (slow_d - stop_d);
       v_allow = std::max(v_allow, 0.0);
       next = State::SLOWDOWN;
+      const std::string held = (dist >= slow_d)
+        ? "，滞环保持（释放阈值 " + std::to_string(slow_release).substr(0, 4) + "m）"
+        : "";
       detail = "行进方向走廊净空 " + std::to_string(dist).substr(0, 5) +
-        "m（侧偏 " + std::to_string(y_lat).substr(0, 5) + "m），限速 " +
-        std::to_string(v_allow).substr(0, 5) + "m/s" + test_tag;
+        "m（侧偏 " + std::to_string(y_lat).substr(0, 5) + "m" + echo_info + "），限速 " +
+        std::to_string(v_allow).substr(0, 5) + "m/s" + held + test_tag;
     }
 
     // 5.5 V0.0.87 地图边界监护：行驶范围不得超出已采集（已建图）地图区域。
@@ -811,6 +931,11 @@ private:
   double footprint_rear_{0.37};
   double footprint_half_width_{0.32};
   double self_margin_{0.12};
+  // V0.0.95 阈值滞环与幽灵点门控
+  double stop_release_hysteresis_{0.25};
+  double slow_release_hysteresis_{0.20};
+  int min_obstacle_points_{3};
+  double obstacle_cluster_span_{0.25};
   bool blind_zone_warned_{false};   // 盲区参数矛盾仅告警一次
   double scan_timeout_{0.5};
   double cmd_timeout_{0.5};

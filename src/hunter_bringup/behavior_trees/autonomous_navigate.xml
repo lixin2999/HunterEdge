@@ -7,18 +7,22 @@
     2. 障碍物感知超时检查（TimeExpired 哨兵，感知数据停止后快速失效）
     3. （V0.0.82 移除 SpeedController：本 fork 该节点为按速度调 tick 周期的装饰器、
         无障碍物限速语义；动态减速由 RPP cost-regulation 机制承担）
-    4. （V0.0.89 测试场地优化）路径受阻时【取消一切倒退/原地旋转恢复】——
-       改为非运动恢复（清除代价地图 + 短暂 Wait 后重试），彻底杜绝
-       "车辆只后退不前进"。窄小场地内 BackUp 会把车倒进更差的致命栅格，
-       且倒车期间 AMCL 位姿反复跳变，实车验证弊大于利，故整体移除。
+    4. （V0.0.89 测试场地优化，V0.0.95 修正）路径受阻时的恢复策略：
+       V0.0.89 曾【取消一切倒退/原地旋转恢复】，只留“清图 + Wait”。实车证明
+       该策略在“阿克曼 + 车头正对障碍”时永远无法脱困（V0.0.94 日志：车原地
+       抖动 56s 零位移 → Fail to make progress 循环）。V0.0.95 起恢复**受限
+       倒车脱困**（BackUp 0.30m @ 0.10m/s，位于 FollowPath 失败恢复序列），
+       物理兜底：safety_guard 后方走廊判据（倒车时按 footprint_rear 判后净空）
+       + 地图边界监护；原地旋转（Spin）仍保持移除（阿克曼不能原地转向）。
     5. GoalUpdated 响应：外部实时更新目标点时立即中断重规划
 
   BT 节点说明（全部来自 bt_navigator plugin_lib_names，无自定义插件）：
     TransformAvailable       — 检查指定坐标系变换是否可用（端口：child/parent）
     ComputePathToPose        — SmacPlannerHybrid 全局规划
-    FollowPath               — RPP 局部跟踪控制（自带近障碍降速/近终点减速）
+    FollowPath               — MPPI 局部跟踪控制
     GoalUpdated              — 外部目标点是否已更新（条件节点）
-    Wait                     — 原地等待（非运动恢复，V0.0.89 起唯一恢复手段）
+    Wait                     — 原地等待（非运动恢复）
+    BackUp                   — 受限倒车脱困（V0.0.95 恢复，仅 FollowPath 失败时）
     ClearEntireCostmap       — 清除代价地图（全局/局部）
     RateController           — 限制子树执行频率
     RecoveryNode             — 带重试次数的恢复节点
@@ -30,8 +34,8 @@
     • 定位不可用 → 立即中止整棵树，禁止发出任何速度指令
     • 感知数据超时（TimeExpired 2s）→ 触发 ClearLocalCostmap 并 Wait，
       等待感知恢复，防止代价地图信息过期后盲目通行
-    • （V0.0.89）恢复行为不再包含任何倒退（BackUp）/原地旋转（Spin），
-      窄小测试场地内仅清除代价地图 + 等待后重试，避免"只退不进"与定位跳变
+    • （V0.0.95）恢复行为中的倒车为“受限倒车”：距离 ≤0.45m、速度 ≤0.10m/s，
+      且由 safety_guard 后方走廊 + 地图边界双重兜底；不含原地旋转
   =====================================================================
 -->
 <root main_tree_to_execute="MainTree">
@@ -118,13 +122,28 @@
 
             <FollowPath path="{path}" controller_id="FollowPath"/>
 
-            <!-- V0.0.89 跟踪失败恢复：仅清局部代价地图 + 短暂等待后重试，
-                 不再 BackUp（阿克曼窄场地倒车会恶化定位、且与"向前巡航"相悖） -->
+            <!-- V0.0.89 跟踪失败恢复：先清局部代价地图，再做【受限倒车脱困】，最后
+                 短暂等待后重试。V0.0.95 恢复 BackUp 的依据与安全边界：
+                   ① 阿克曼车辆无法原地转向，"车头正对障碍 + 目标在障碍另一侧/自身附近"
+                      时，纯非运动恢复（清图+Wait）永远无法脱困 —— 现场 V0.0.94 日志
+                      即为此情形（车原地抖动 56s 无位移，随后 Fail to make progress 循环）；
+                   ② V0.0.89 移除 BackUp 的顾虑是"倒进更差的致命栅格 + AMCL 位姿跳变"。
+                      V0.0.93 起全局定位改为 NDT 点云重配准（不依赖倒车运动模型），
+                      且 safety_guard 在指令为负时自动切换【后方走廊】判据
+                      （footprint_rear+self_margin 起算，净空 < stop_dist 即零速），
+                      外加 enable_map_fence 地图边界监护 → 倒车有双重物理兜底；
+                   ③ 距离/速度取保守值（0.45m / 0.10m/s），且必须 > safety_guard 的
+                      stop_release_hysteresis（0.25m）——否则"倒完仍不放行"，车辆
+                      被滞环锁死原地；倒车后 1Hz 重规划会重新给出绕行路径
+                      （Smac + costmap obstacle_layer 已标真实障碍）。
+                 注：倒车速度能通过 velocity_smoother 的前提是 nav2_params.yaml 的
+                 min_velocity[0] < 0（V0.0.95 由 0.0 → -0.20，见该文件注释）。 -->
             <Sequence name="TrackingRecovery">
               <ClearEntireCostmap
                 name="ClearLocalCostmap-Context"
                 service_name="local_costmap/clear_entirely_local_costmap"/>
-              <Wait wait_duration="2"/>
+              <BackUp backup_dist="0.45" backup_speed="0.10" time_allowance="10.0"/>
+              <Wait wait_duration="1"/>
             </Sequence>
 
           </RecoveryNode>

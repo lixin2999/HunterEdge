@@ -161,6 +161,10 @@ void AutoMissionNode::declareParameters()
   declare_parameter("max_wp_failures", 3);
   declare_parameter("goal_timeout", 60.0);
   declare_parameter("obstacle_wait_timeout", 30.0);
+  // V0.0.95 航点“已到达”预检与受阻检测（修“原地不动/无法绕行”）
+  declare_parameter("already_reached_dist", 0.30);
+  declare_parameter("stall_detect_time", 25.0);
+  declare_parameter("stall_move_eps", 0.15);
 
   // Nav2 就绪门控
   declare_parameter("nav_active_wait_timeout", 60.0);
@@ -201,6 +205,26 @@ void AutoMissionNode::declareParameters()
   max_wp_failures_        = static_cast<int>(get_parameter("max_wp_failures").as_int());
   goal_timeout_           = get_parameter("goal_timeout").as_double();
   obstacle_wait_timeout_  = get_parameter("obstacle_wait_timeout").as_double();
+  // V0.0.95 参数读取与合法性校验
+  already_reached_dist_   = get_parameter("already_reached_dist").as_double();
+  stall_detect_time_      = get_parameter("stall_detect_time").as_double();
+  stall_move_eps_         = get_parameter("stall_move_eps").as_double();
+  if (already_reached_dist_ <= 0.0) {
+    RCLCPP_WARN(get_logger(),
+      "already_reached_dist=%.2f ≤ 0，已按 0.30m 处理（禁用“已到达”预检会重现"
+      "“目标=当前位姿”死锁）", already_reached_dist_);
+    already_reached_dist_ = 0.30;
+  }
+  if (stall_detect_time_ < 5.0) {
+    RCLCPP_WARN(get_logger(),
+      "stall_detect_time=%.1fs 过小（< 5s），已按 5.0s 处理（须大于 Nav2 "
+      "ProgressChecker 的 movement_time_allowance=10s 之前的首轮恢复窗口）",
+      stall_detect_time_);
+    stall_detect_time_ = 5.0;
+  }
+  if (stall_move_eps_ < 0.0) {
+    stall_move_eps_ = 0.0;
+  }
   max_velocity_           = get_parameter("max_velocity").as_double();
   params_file_            = get_parameter("params_file").as_string();
   cruise_max_speed_       = get_parameter("cruise_max_speed").as_double();
@@ -877,6 +901,39 @@ void AutoMissionNode::mainLoop()
       // goal 超时检查
       if (goal_in_flight_) {
         const double elapsed = (this->now() - goal_send_time_).seconds();
+
+        // V0.0.95 受阻检测（stall）：goal 在途但窗口内位移停滞 → 判“前方障碍
+        // 无法绕行 / 无可达路径”。背景（V0.0.94 现场日志）：前方约 1.0m 处障碍
+        // 使 safety_guard 走廊净空贴着急停阈值抖动，MPPI 打满转向而纵向零进挪，
+        // Nav2 ProgressChecker 判 Failed to make progress；BT 恢复池（V0.0.89 起
+        // 仅非运动：清图+Wait）无法脱困，只能等到 goal_timeout=90s 才换点，其间
+        // 车辆原地不动且日志无明确结论。此处按“位移停滞”提前定性为受阻并换点/
+        // 锁存，配合 V0.0.95 行为树的受限倒车脱困（BackUp）形成完整绕障链。
+        if (std::isfinite(goal_start_x_)) {
+          double px = 0.0, py = 0.0;
+          const double moved = currentMapPose(px, py)
+            ? std::hypot(px - goal_start_x_, py - goal_start_y_) : 0.0;
+          if (elapsed > stall_detect_time_ && moved < stall_move_eps_) {
+            ++blocked_count_;
+            RCLCPP_ERROR(get_logger(),
+              "[NAVIGATING] 航点[%zu]%s 受阻：%.0fs 内位移仅 %.2fm（< %.2fm）"
+              "——前方障碍无法绕行或航点无可达路径，取消本 goal 并按失败处理"
+              "（第 %d 次受阻；请核对 /safety/state 的走廊净空与 /scan 是否真实障碍，"
+              "或重新标定该航点）",
+              current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
+              elapsed, moved, stall_move_eps_, blocked_count_);
+            cancelCurrentGoal();
+            wp_fail_count_++;
+            if (wp_fail_count_ >= max_wp_failures_) {
+              enterFault("航点受阻（前方障碍无法绕行）连续达上限");
+            } else {
+              current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
+              sendNextWaypoint();
+            }
+            break;
+          }
+        }
+
         if (elapsed > goal_timeout_) {
           RCLCPP_WARN(get_logger(),
             "[NAVIGATING] 航点[%zu]%s 导航超时（%.0fs），跳过该航点",
@@ -1236,6 +1293,61 @@ std::string AutoMissionNode::waypointMapCheckDetail(const Waypoint & wp)
 }
 
 // ==========================================================================
+// V0.0.95 当前 map 系位姿快照（/relocalization/pose）
+// 未收到全局重定位位姿时返回 false —— 调用方按“无法判定”走旧行为，
+// 不因缺少位姿而误判（定位门控 isLocalizationValid() 已在此之前拦截）。
+// ==========================================================================
+bool AutoMissionNode::currentMapPose(double & x, double & y)
+{
+  std::lock_guard<std::mutex> lk(data_mutex_);
+  if (!amcl_pose_received_) {
+    return false;
+  }
+  x = latest_amcl_pose_.pose.pose.position.x;
+  y = latest_amcl_pose_.pose.pose.position.y;
+  return true;
+}
+
+// ==========================================================================
+// V0.0.95 航点“已到达”预检
+//
+// 现场故障链（V0.0.94 日志）：航点[0]"0.0,0.0,0.0,起点" 与车辆起始位姿
+// (-0.16, 0.11) 仅差 0.19m → Nav2 收到“目标≈自身”的退化 goal：
+//   • Smac 规划的路径长度≈0，且要求终止朝向 yaw=0；
+//   • 阿克曼无法原地转向，MPPI 只能持续打满转向（日志 set steering angle
+//     恒为 ±0.386428 rad = 曲率钳制上限 |w|=|v|/R_min 对应的最大内轮转角）；
+//   • 纵向净挪 ≈0 → ProgressChecker(0.1m/10s) 必判 Failed to make progress；
+//   • V0.0.89 起 BT 恢复池只有非运动手段（清图+Wait），无法脱困 →
+//     “发送→10s 无进展→ABORT→恢复→再发送”静默循环，车原地不动。
+//
+// 处置：位置已在到达半径内（位置重合）即视为该航点已完成，跳过不发 goal；
+//   朝向不做判定（巡检任务不要求精确朝向；朝向对齐依赖原地转向，阿克曼
+//   不可行，强行要求必然死锁）。tolerance 取值须 > 阿克曼停车精度且
+//   ≥ 2× Nav2 xy_goal_tolerance(0.10m)，默认 0.30m。
+// ==========================================================================
+bool AutoMissionNode::waypointAlreadyReached(
+  const Waypoint & wp, double & dist, double & yaw_err)
+{
+  double px = 0.0, py = 0.0, pyaw = 0.0;
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    if (!amcl_pose_received_) {
+      dist = -1.0;
+      yaw_err = 0.0;
+      return false;                   // 无 map 系位姿：不跳过（定位门控兜底）
+    }
+    px = latest_amcl_pose_.pose.pose.position.x;
+    py = latest_amcl_pose_.pose.pose.position.y;
+    const auto & q = latest_amcl_pose_.pose.pose.orientation;
+    pyaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+  }
+  dist = std::hypot(wp.x - px, wp.y - py);
+  yaw_err = std::fabs(wrapAngle(wp.yaw - pyaw));
+  return dist <= already_reached_dist_;
+}
+
+// ==========================================================================
 // 向 Nav2 发送下一个航点
 // ==========================================================================
 void AutoMissionNode::sendNextWaypoint()
@@ -1267,39 +1379,51 @@ void AutoMissionNode::sendNextWaypoint()
     return;
   }
 
-  // ---- 航点越界校验（V0.0.82 矩形边界 / V0.0.87 未建图栅格） ----
-  // 目标超出静态地图边界或落在未建图(unknown)栅格上时，SmacPlannerHybrid
-  // 必报 "Goal pose is out of costmap!" → BT 恢复行为循环倒车/等待 →
-  // fail_count 耗尽（实车：航点 (5,5)/(0,5) 的 y=5 超出地图 y≤3.85）。
-  // 发送前校验，越界航点自动轮转到下一个边界内的航点；全部越界则回 IDLE
-  // 防止跳过风暴。
-  const std::string map_check = waypointMapCheckDetail(waypoints_[current_wp_idx_]);
-  if (!map_check.empty()) {
-    RCLCPP_ERROR(get_logger(),
-      "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 不在已采集地图区域内"
-      "（%s；边界 x[%.2f, %.2f] y[%.2f, %.2f]，安全边距 %.2fm），跳过该航点",
-      current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
-      waypoints_[current_wp_idx_].x, waypoints_[current_wp_idx_].y,
-      map_check.c_str(),
-      map_min_x_, map_max_x_, map_min_y_, map_max_y_, waypoint_map_margin_);
-    bool found_valid = false;
-    for (size_t step = 1; step <= waypoints_.size(); ++step) {
-      const size_t idx = (current_wp_idx_ + step) % waypoints_.size();
-      if (waypointInsideMap(waypoints_[idx])) {
-        current_wp_idx_ = idx;
-        found_valid = true;
-        break;
-      }
-    }
-    if (!found_valid) {
+  // ---- 航点预检（V0.0.95：已到达 + 越界双判，逐圈轮转） ----
+  // ① 已到达（V0.0.95 新增）：航点与当前 map 系位姿重合（≤ already_reached_dist）
+  //    时不得下发——"目标=当前位姿"对阿克曼是退化目标，必然 Fail to make progress
+  //    后原地抖动（见 waypointAlreadyReached() 注释的完整故障链）。
+  // ② 越界（V0.0.82/0.0.87）：目标超出静态地图边界或落在未建图(unknown)栅格上时，
+  //    SmacPlannerHybrid 必报 "Goal pose is out of costmap!" → BT 恢复行为空转 →
+  //    fail_count 耗尽（实车：航点 (5,5)/(0,5) 的 y=5 超出地图 y≤3.85）。
+  // 两者均按"跳过并轮转下一个航点"处理；整圈都不可用时锁存 FAULT（V0.0.95 起，
+  // 原先只回 IDLE —— 而 IDLE 下一拍又会重新进入 NAVIGATING 重发同一批不可用航点，
+  // 形成静默抖动且无对外故障上报，与 V0.0.91 的教训一致）。
+  size_t precheck_skips = 0;
+  while (precheck_skips < waypoints_.size()) {
+    const Waypoint & cand = waypoints_[current_wp_idx_];
+    const std::string map_check = waypointMapCheckDetail(cand);
+    if (!map_check.empty()) {
       RCLCPP_ERROR(get_logger(),
-        "[sendNextWaypoint] 全部航点均不在已采集地图区域内（边界外或未建图栅格），"
-        "停止巡航回 IDLE；请重新记录航点（建图模式 rviz Publish Point）或修正 waypoints 配置");
-      state_ = MissionState::IDLE;
-      return;
+        "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 不在已采集地图区域内"
+        "（%s；边界 x[%.2f, %.2f] y[%.2f, %.2f]，安全边距 %.2fm），跳过该航点",
+        current_wp_idx_, cand.label.c_str(), cand.x, cand.y, map_check.c_str(),
+        map_min_x_, map_max_x_, map_min_y_, map_max_y_, waypoint_map_margin_);
+      current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
+      ++precheck_skips;
+      continue;
     }
-    RCLCPP_WARN(get_logger(), "[sendNextWaypoint] 改发边界内的航点[%zu] %s",
-      current_wp_idx_, waypoints_[current_wp_idx_].label.c_str());
+    double reached_d = 0.0, reached_yaw = 0.0;
+    if (waypointAlreadyReached(cand, reached_d, reached_yaw)) {
+      RCLCPP_INFO(get_logger(),
+        "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 已在到达半径内"
+        "（距当前位姿 %.2fm ≤ %.2fm，朝向差 %.2f rad），视为已完成并跳过",
+        current_wp_idx_, cand.label.c_str(), cand.x, cand.y,
+        reached_d, already_reached_dist_, reached_yaw);
+      current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
+      ++precheck_skips;
+      continue;
+    }
+    break;
+  }
+  if (precheck_skips >= waypoints_.size()) {
+    enterFault(
+      "全部航点均不可用：或与当前位姿重合（已在到达半径内），或位于未建图/地图外区域");
+    return;
+  }
+  if (precheck_skips > 0) {
+    RCLCPP_WARN(get_logger(), "[sendNextWaypoint] 已跳过 %zu 个不可用航点，改发航点[%zu] %s",
+      precheck_skips, current_wp_idx_, waypoints_[current_wp_idx_].label.c_str());
   }
 
   const Waypoint & wp = waypoints_[current_wp_idx_];
@@ -1328,6 +1452,19 @@ void AutoMissionNode::sendNextWaypoint()
   nav_action_client_->async_send_goal(goal_msg, send_opts);
   goal_send_time_ = this->now();
   goal_in_flight_ = true;
+  // V0.0.95 受阻检测基准：记录发 goal 时的 map 系位姿（无位姿 → NaN，本航点不做受阻判定）
+  {
+    double px = 0.0, py = 0.0;
+    if (currentMapPose(px, py)) {
+      goal_start_x_ = px;
+      goal_start_y_ = py;
+    } else {
+      goal_start_x_ = std::numeric_limits<double>::quiet_NaN();
+      goal_start_y_ = std::numeric_limits<double>::quiet_NaN();
+    }
+    blocked_count_ = 0;
+    goal_cancel_by_mission_ = false;   // 新 goal 已发出，清除上一轮的主动取消标记
+  }
 
   RCLCPP_INFO(get_logger(),
     "[sendNextWaypoint] 发送航点[%zu] %s → (%.2f, %.2f, yaw=%.2f rad)",
@@ -1348,6 +1485,8 @@ void AutoMissionNode::cancelCurrentGoal()
   if (goal_handle_ && goal_in_flight_) {
     RCLCPP_INFO(get_logger(), "[cancelCurrentGoal] 取消当前导航 goal");
     nav_action_client_->async_cancel_goal(goal_handle_);
+    // V0.0.95：标记为"本节点主动取消"，使 resultCallback 不再重复计失败/换点
+    goal_cancel_by_mission_ = true;
   }
   goal_handle_ = nullptr;
   goal_in_flight_ = false;
@@ -1513,6 +1652,16 @@ void AutoMissionNode::resultCallback(
   {
     std::lock_guard<std::mutex> lk(goal_handle_mutex_);
     goal_handle_ = nullptr;
+  }
+
+  // V0.0.95：本节点主动取消（受阻换点/超时跳过/降级/急停）产生的 CANCELED
+  // 结果不再重复计失败与换点——取消方已完成，否则一次受阻会连跳两个航点。
+  if (result.code == rclcpp_action::ResultCode::CANCELED && goal_cancel_by_mission_) {
+    goal_cancel_by_mission_ = false;
+    RCLCPP_DEBUG(get_logger(),
+      "[Nav2] 航点[%zu] 的 goal 已按本节点指令取消，失败计数与换点由取消方处理",
+      current_wp_idx_);
+    return;
   }
 
   if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
