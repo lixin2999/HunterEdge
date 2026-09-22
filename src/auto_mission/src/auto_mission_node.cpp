@@ -11,8 +11,11 @@
 //   NAVIGATING ──[goal失败]────────▶ NAVIGATING（重试/跳过）或 IDLE
 //   OBSTACLE_AVOID ──[路清]────────▶ NAVIGATING（恢复）
 //   OBSTACLE_AVOID ──[超时/极近]───▶ ESTOP
-//   NAVIGATING ──[连续失败达上限]──▶ FAULT（V0.0.91：锁存停驻，不再静默重发）
-//   FAULT ──[模式离开 AUTO]────────▶ IDLE（人工确认后重新进入）
+//   NAVIGATING ──[单航点失败]──────▶ NAVIGATING（V0.1.00：放弃该点 + 清图重规划 +
+//                                        轮转下一个可用航点；连续失败只隔离【该点】）
+//   NAVIGATING ──[任务级失败达上限]▶ FAULT（V0.1.00：自愈态，不再是"永久锁存等人工解锁"）
+//   FAULT ──[静置 + 自检通过]──────▶ IDLE（自动清图、解除临时隔离并重启任务）
+//   FAULT ──[模式离开 AUTO]────────▶ IDLE（保留的人工复位通道：切回 AUTO 即重启）
 //   任意状态 ──[非AUTO/急停]────────▶ IDLE 或 ESTOP
 
 #include "auto_mission/auto_mission_node.hpp"
@@ -70,6 +73,45 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
   amcl_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
     "/relocalization/pose", rclcpp::QoS(rclcpp::KeepLast(5)).transient_local().reliable(),
     std::bind(&AutoMissionNode::amclPoseCallback, this, std::placeholders::_1));
+
+  // ---- V0.1.00 需求②：车身近身"假障碍占位"诊断数据源（均为系统已有话题） ----
+  // /local_costmap/costmap：帧=odom 的滚动局部代价地图，反映"Nav2 认为车身四周/
+  //   脚底有没有东西"；与激光目标(base_link)、融合目标(base_link，含仅相机确认者)
+  //   交叉比对即可自动区分"真障碍"与"脏图假障碍"，不再需要人拿 rviz2 看图。
+  // ⚠ QoS 必须与 Nav2Costmap2DPublisher 对齐（transient_local + reliable + KeepLast(1)），
+  //   且该 publisher 仅在"有订阅者"时发布、平时只在窗口几何变化时发整图 ——
+  //   故 nav2_params.yaml 的 local_costmap 需开 always_send_full_costmap:=true
+  //   （V0.1.00 同步改动），否则车辆停驻期间（正是需要诊断的时刻）拿不到刷新。
+  {
+    const auto grid_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+    local_costmap_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      local_costmap_topic_, grid_qos,
+      [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
+        std::lock_guard<std::mutex> lk(data_mutex_);
+        latest_local_costmap_ = msg;
+        last_local_costmap_arrive_ = this->now();
+      });
+
+    // 激光目标：lidar_perception 每帧必发（无目标也发空数组），故"话题新鲜 + 数组为空"
+    //   可正面解读为"近身确实没有实体"
+    lidar_objects_sub_ = create_subscription<hunter_msgs::msg::DetectedObjectArray>(
+      lidar_objects_topic_, rclcpp::SensorDataQoS(),
+      [this](const hunter_msgs::msg::DetectedObjectArray::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(data_mutex_);
+        latest_lidar_objects_ = *msg;
+        last_lidar_objects_arrive_ = this->now();
+      });
+
+    // 相机目标原始帧为 camera_color_optical_frame，本节点不引 TF 依赖做几何换算，
+    //   只用其【新鲜度 + 目标数】参与结论描述（相机确认的实体的几何判定走 fused_objects）
+    vision_objects_sub_ = create_subscription<hunter_msgs::msg::DetectedObjectArray>(
+      vision_objects_topic_, rclcpp::SensorDataQoS(),
+      [this](const hunter_msgs::msg::DetectedObjectArray::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(data_mutex_);
+        last_vision_objects_arrive_ = this->now();
+        vision_objects_count_ = static_cast<int>(msg->objects.size());
+      });
+  }
 
   // ---- 发布 ----
   status_pub_ = create_publisher<std_msgs::msg::String>("/auto_mission/status", 10);
@@ -131,8 +173,15 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
     std::bind(&AutoMissionNode::mainLoop, this));
 
   RCLCPP_INFO(get_logger(),
-    "auto_mission_node 启动：模式=%s，航点数=%zu，循环=%s",
-    mission_mode_.c_str(), waypoints_.size(), loop_waypoints_ ? "是" : "否");
+    "auto_mission_node 启动：模式=%s，航点数=%zu，循环=%s\n"
+    "  V0.1.00 任务自愈：逐点隔离=%s(冷却%.0fs/单点上限%d次/任务上限%d次)，"
+    "近身假障碍诊断=%s，地图可达性=%s，FAULT 自愈=%s(静置%.0fs/重试%.0fs~%.0fs)",
+    mission_mode_.c_str(), waypoints_.size(), loop_waypoints_ ? "是" : "否",
+    "开", wp_isolation_cooldown_, max_wp_failures_, max_consec_failures_,
+    self_check_enable_ ? "开" : "关",
+    reachability_enable_ ? "开" : "关",
+    fault_auto_recover_ ? "开" : "关", fault_hold_time_,
+    fault_retry_interval_, fault_retry_max_interval_);
 }
 
 // ==========================================================================
@@ -183,6 +232,44 @@ void AutoMissionNode::declareParameters()
   declare_parameter("nav_retry_backoff", 2.0);
   // V0.0.98 取消静置时长：主动取消后等旧 goal 结果回传的最长时间
   declare_parameter("goal_cancel_settle_time", 2.0);
+
+  // ================== V0.1.00 任务自愈四件套 ==================
+  // ---- 需求①：逐航点失败隔离与自动轮转 ----
+  // ⚠ max_wp_failures 语义变更：由"跨航点累计"改为【单个航点连续失败】阈值，
+  //   达阈值只隔离该航点（冷却后自动重试），不再锁存整条巡航线。
+  declare_parameter("wp_isolation_cooldown", 120.0);
+  // 任务级兜底：连续失败期间无任何一次成功到达，达此上限才进 FAULT（自愈态）
+  declare_parameter("max_consec_failures", 12);
+
+  // ---- 需求②：车身近身假障碍诊断（代价地图 vs 激光 + 相机） ----
+  declare_parameter("self_check_enable", true);
+  declare_parameter("self_check_margin", 0.35);
+  // 车身框与 nav2_params.yaml 的 local/global_costmap footprint 对齐：
+  //   前缘 0.45 / 后缘 0.37 / 半宽 0.32（base_link 系）
+  declare_parameter("self_check_box_front", 0.45);
+  declare_parameter("self_check_box_rear", 0.37);
+  declare_parameter("self_check_box_half_width", 0.32);
+  // Nav2 cost_translation_table：0=自由、99=INSCRIBED（内切）、100=LETHAL、-1=UNKNOWN
+  declare_parameter("self_check_cost_min", 99);
+  declare_parameter("self_check_confirm_count", 3);
+  declare_parameter("self_check_interval", 5.0);
+  declare_parameter("self_check_data_timeout", 1.0);
+  declare_parameter("local_costmap_topic", "/local_costmap/costmap");
+  declare_parameter("lidar_objects_topic", "/perception/lidar_objects");
+  declare_parameter("vision_objects_topic", "/perception/vision_objects");
+
+  // ---- 需求③：航点地图可达性（静态地图可通行连通域） ----
+  declare_parameter("reachability_enable", true);
+  declare_parameter("reach_clearance", 0.35);
+  declare_parameter("reach_recompute_dist", 1.0);
+  declare_parameter("reach_bfs_max_cells", 400000);
+
+  // ---- 需求④：FAULT 由"永久锁存等人工"改为自愈态 ----
+  declare_parameter("fault_auto_recover", true);
+  declare_parameter("fault_hold_time", 20.0);
+  declare_parameter("fault_retry_interval", 30.0);
+  declare_parameter("fault_retry_max_interval", 180.0);
+  declare_parameter("max_mission_recoveries", 5);
 
   // 速度（合规性）
   declare_parameter("max_velocity", 2.0);
@@ -280,6 +367,103 @@ void AutoMissionNode::declareParameters()
     goal_cancel_settle_time_ = 2.0;
   }
 
+  // ---- V0.1.00 参数读取与合法性校验 ----
+  // 需求①：逐航点隔离
+  wp_isolation_cooldown_ = get_parameter("wp_isolation_cooldown").as_double();
+  max_consec_failures_   = static_cast<int>(get_parameter("max_consec_failures").as_int());
+  if (max_wp_failures_ < 1) {
+    max_wp_failures_ = 1;   // 单点失败 1 次即隔离（不允许多次重复下发同一退化目标）
+  }
+  if (wp_isolation_cooldown_ < 10.0) {
+    RCLCPP_WARN(get_logger(),
+      "wp_isolation_cooldown=%.0fs 过小，已按 10s 处理（必须 > 一轮 Nav2 恢复 + 人工反应时间，"
+      "否则同一去不了的航点会被反复重试而形成慢循环）", wp_isolation_cooldown_);
+    wp_isolation_cooldown_ = 10.0;
+  }
+  if (max_consec_failures_ < max_wp_failures_ + 2) {
+    RCLCPP_WARN(get_logger(),
+      "max_consec_failures=%d 不大于单航点上限 max_wp_failures=%d，已按 %d 处理"
+      "（任务级兜底必须比单点隔离阈值宽，否则还来不及轮转就进了 FAULT）",
+      max_consec_failures_, max_wp_failures_, max_wp_failures_ + 2);
+    max_consec_failures_ = max_wp_failures_ + 2;
+  }
+  // 需求②：近身假障碍诊断
+  self_check_enable_        = get_parameter("self_check_enable").as_bool();
+  self_check_margin_        = get_parameter("self_check_margin").as_double();
+  self_check_box_front_     = get_parameter("self_check_box_front").as_double();
+  self_check_box_rear_      = get_parameter("self_check_box_rear").as_double();
+  self_check_box_half_width_ = get_parameter("self_check_box_half_width").as_double();
+  self_check_cost_min_      = static_cast<int>(get_parameter("self_check_cost_min").as_int());
+  self_check_confirm_count_ = static_cast<int>(get_parameter("self_check_confirm_count").as_int());
+  self_check_interval_      = get_parameter("self_check_interval").as_double();
+  self_check_data_timeout_  = get_parameter("self_check_data_timeout").as_double();
+  local_costmap_topic_      = get_parameter("local_costmap_topic").as_string();
+  lidar_objects_topic_      = get_parameter("lidar_objects_topic").as_string();
+  vision_objects_topic_     = get_parameter("vision_objects_topic").as_string();
+  if (self_check_box_front_ <= 0.0 || self_check_box_rear_ <= 0.0 ||
+    self_check_box_half_width_ <= 0.0)
+  {
+    RCLCPP_WARN(get_logger(),
+      "self_check_box_* 存在非正值（front=%.2f rear=%.2f half_width=%.2f），已按默认车身尺"
+      "寸 0.45/0.37/0.32m 处理（必须与 nav2 footprint 一致，否则近身判据整条失效）",
+      self_check_box_front_, self_check_box_rear_, self_check_box_half_width_);
+    self_check_box_front_ = 0.45;
+    self_check_box_rear_ = 0.37;
+    self_check_box_half_width_ = 0.32;
+  }
+  if (self_check_margin_ < 0.0) {
+    self_check_margin_ = 0.0;   // 0 = 只查“脚底”（原始车身框内）
+  }
+  self_check_cost_min_ = std::max(1, std::min(100, self_check_cost_min_));
+  self_check_confirm_count_ = std::max(1, self_check_confirm_count_);
+  if (self_check_interval_ < 1.0) {
+    self_check_interval_ = 1.0;
+  }
+  if (self_check_data_timeout_ < 0.3) {
+    self_check_data_timeout_ = 0.3;
+  }
+  // 需求③：地图可达性
+  reachability_enable_     = get_parameter("reachability_enable").as_bool();
+  reach_clearance_         = get_parameter("reach_clearance").as_double();
+  reach_recompute_dist_    = get_parameter("reach_recompute_dist").as_double();
+  reach_bfs_max_cells_     = static_cast<int>(get_parameter("reach_bfs_max_cells").as_int());
+  if (reach_clearance_ < 0.32) {
+    RCLCPP_WARN(get_logger(),
+      "reach_clearance=%.2fm 小于 Nav2 内切半径 0.32m，已按 0.35m 处理"
+      "（过小会把“实际过不去的窄缝”判成连通，可达性校验失去意义）", reach_clearance_);
+    reach_clearance_ = 0.35;
+  }
+  if (reach_recompute_dist_ < 0.2) {
+    reach_recompute_dist_ = 0.2;   // 节流：车位移动不足此距离不重建连通域
+  }
+  if (reach_bfs_max_cells_ < 10000) {
+    RCLCPP_WARN(get_logger(),
+      "reach_bfs_max_cells=%d 过小，已按 10000 格处理（BFS 被截断时不可达结论一律放行）",
+      reach_bfs_max_cells_);
+    reach_bfs_max_cells_ = 10000;
+  }
+  // 需求④：FAULT 自愈
+  fault_auto_recover_      = get_parameter("fault_auto_recover").as_bool();
+  fault_hold_time_         = get_parameter("fault_hold_time").as_double();
+  fault_retry_interval_    = get_parameter("fault_retry_interval").as_double();
+  fault_retry_max_interval_ = get_parameter("fault_retry_max_interval").as_double();
+  max_mission_recoveries_  = static_cast<int>(get_parameter("max_mission_recoveries").as_int());
+  if (fault_hold_time_ < 5.0) {
+    RCLCPP_WARN(get_logger(),
+      "fault_hold_time=%.0fs 过短（<5s，来不及移车/障碍离开），已按 5.0s 处理",
+      fault_hold_time_);
+    fault_hold_time_ = 5.0;
+  }
+  if (fault_retry_interval_ < 5.0) {
+    fault_retry_interval_ = 5.0;
+  }
+  if (fault_retry_max_interval_ < fault_retry_interval_) {
+    fault_retry_max_interval_ = fault_retry_interval_;
+  }
+  if (max_mission_recoveries_ < 1) {
+    max_mission_recoveries_ = 1;
+  }
+
   // 最大速度合规检查（文档规定 ≤ 2.0 m/s）
   if (max_velocity_ > 2.0) {
     RCLCPP_WARN(get_logger(),
@@ -302,6 +486,7 @@ void AutoMissionNode::loadWaypoints()
     }
     waypoints_.push_back(wp);
   }
+  syncWaypointRuntime();   // V0.1.00：逐航点运行时状态与航点表同尺寸
   RCLCPP_INFO(get_logger(), "共加载 %zu 个航点", waypoints_.size());
 }
 
@@ -413,6 +598,7 @@ bool AutoMissionNode::reloadWaypointsFromFile(std::string & msg)
   }
 
   waypoints_ = parsed;
+  syncWaypointRuntime();   // V0.1.00：新增航点以"零失败"入列，删除的裁掉尾部
   std::ostringstream oss;
   oss << "热重载成功，共 " << waypoints_.size() << " 个航点：";
   for (size_t i = 0; i < waypoints_.size(); ++i) {
@@ -438,6 +624,9 @@ void AutoMissionNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lk(data_mutex_);
   latest_odom_ = *msg;
+  // V0.1.00：/localization/odom 的位姿在 odom 系（ekf_params.world_frame=odom），
+  //   用于把 odom 系的局部代价地图格元换算回 base_link 做近身占位判定
+  last_odom_arrive_ = this->now();
 }
 
 void AutoMissionNode::fusedObjectsCallback(
@@ -767,6 +956,19 @@ void AutoMissionNode::mainLoop()
     return;
   }
 
+  // ---------- V0.1.00 需求④：模式边沿复位（遥控接管后切回 AUTO 即自动复驶） ----------
+  // 下降沿（离开 AUTO：遥控接管 / 切 ESTOP / 急停）→ 全量复位任务状态，含清除
+  //   【地图不可达】永久隔离（人工可能已移车 / 重标航点 / 换了地图）；
+  // 上升沿（切回 AUTO）无需特殊动作：state_ 已是 IDLE，IDLE 分支按 AUTO 条件
+  //   自动清图、进 WAITING_LOCALIZE/NAVIGATING 重启任务 —— 人工不再需要
+  //   "离开 AUTO 再切回"来解故障锁存（该通道保留为即时复位手段）。
+  // ESTOP 不在此复位：急停信号及其解除由上方/下方专属通道负责，避免抹除急停语义。
+  const bool mode_auto = (behavior.mode == "AUTO");
+  if (prev_mode_auto_ && !mode_auto && state_ != MissionState::ESTOP) {
+    resetMissionState("模式开关离开 AUTO（遥控接管 / 降级）", true);
+  }
+  prev_mode_auto_ = mode_auto;
+
   // ---------- 非 AUTO 立即降级 ----------
   if (behavior.mode != "AUTO") {
     if (state_ != MissionState::IDLE && state_ != MissionState::ESTOP) {
@@ -782,8 +984,9 @@ void AutoMissionNode::mainLoop()
 
   // ---------- health 检查 ----------
   if (health.overall_status == "CRITICAL") {
-    // FAULT 不因 health 恢复而被默默清除（V0.0.91）：故障锁存只能由
-    // “模式开关离开 AUTO 再回来”人工确认解除
+    // FAULT 不因 health 恢复而被默默清除：CRITICAL 期间不做自愈重试（下方
+    // faultRecoveryStep 的 AUTO 条件门控已含 health 非 CRITICAL），
+    // 待 health 恢复后由自愈流程自动复驶，或人工离开 AUTO 即时复位
     if (state_ != MissionState::IDLE && state_ != MissionState::ESTOP &&
       state_ != MissionState::FAULT)
     {
@@ -834,7 +1037,13 @@ void AutoMissionNode::mainLoop()
       } else {
         RCLCPP_INFO(get_logger(), "[IDLE→NAVIGATING] AUTO 条件满足，定位已收敛，清图后开始导航");
         current_wp_idx_ = 0;
-        wp_fail_count_ = 0;
+        // V0.1.00：任务启动即复位失败计数与临时隔离（保留地图不可达的永久判定）
+        consec_fail_ = 0;
+        goal_reject_count_ = 0;
+        for (auto & rt : wp_rt_) {
+          rt.fail_count = 0;
+          rt.isolated = rt.permanent;
+        }
         clearCostmapsOnStart();  // V0.0.92：清图后由 NAVIGATING 入口按序发送 goal
         state_ = MissionState::NAVIGATING;
         // V0.0.92：移除此处的 sendNextWaypoint() 调用。
@@ -858,7 +1067,12 @@ void AutoMissionNode::mainLoop()
         RCLCPP_INFO(get_logger(), "[WAITING_LOCALIZE→NAVIGATING] 定位已收敛，清图后开始导航");
         state_ = MissionState::NAVIGATING;
         current_wp_idx_ = 0;
-        wp_fail_count_ = 0;
+        consec_fail_ = 0;
+        goal_reject_count_ = 0;
+        for (auto & rt : wp_rt_) {
+          rt.fail_count = 0;
+          rt.isolated = rt.permanent;
+        }
         localize_wait_started_ = false;
         clearCostmapsOnStart();  // V0.0.92：清图后由 NAVIGATING 入口按序发送 goal
         // V0.0.92：同 IDLE→NAVIGATING，移除立即发 goal，由状态机等待清图完成
@@ -989,15 +1203,11 @@ void AutoMissionNode::mainLoop()
               goal_start_dist_ - progress, goal_path_len_, stall_path_allow_m_,
               blocked_count_);
             cancelCurrentGoal();
-            wp_fail_count_++;
-            if (wp_fail_count_ >= max_wp_failures_) {
-              enterFault("航点受阻（前方障碍无法绕行）连续达上限");
-            } else {
-              current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
-              // V0.0.98：不再立即发下一个 goal —— 由取消静置门控（goal_cancel_pending_
-              //   + settle）在"无在途 goal"重发路径等旧 goal 结果回传后再发，
-              //   消除"取消后毫秒级发新 goal 被旧 BT 失败状态波及"的竞态
-            }
+            // V0.1.00 需求①：不再"整条任务锁存"——只放弃当前航点（达阈值则仅隔离
+            // 该点）+ 清图重规划 + 轮转下一个可用航点；任务级兜底交给 consec_fail_
+            handleWaypointFailure(
+              "航点受阻（" + std::to_string(static_cast<int>(stall_detect_time_)) +
+              "s 内净推进不足：前方障碍无法绕行 / 车已停在障碍膨胀区致规划全失败）");
             break;
           }
           if (stalled && maneuvering) {
@@ -1013,17 +1223,37 @@ void AutoMissionNode::mainLoop()
 
         if (elapsed > goal_timeout_) {
           RCLCPP_WARN(get_logger(),
-            "[NAVIGATING] 航点[%zu]%s 导航超时（%.0fs），跳过该航点",
+            "[NAVIGATING] 航点[%zu]%s 导航超时（%.0fs），放弃该航点并重新规划",
             current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(), goal_timeout_);
           cancelCurrentGoal();
-          wp_fail_count_++;
-          if (wp_fail_count_ >= max_wp_failures_) {
-            enterFault("单航点导航超时连续达上限");
-          } else {
-            current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
-            // V0.0.98：同上，交给取消静置门控后重发，不立即发下一个 goal
-          }
+          // V0.1.00 需求①（用户日志对应的就是本分支）：超时不再锁存整条任务
+          handleWaypointFailure(
+            "单航点导航超时（>" + std::to_string(static_cast<int>(goal_timeout_)) + "s）");
           break;
+        }
+      }
+
+      // ---------- V0.1.00 需求②：近身假障碍周期巡检（NAVIGATING 中） ----------
+      // 背景（实车日志）：车停在脏图留下的假障碍上时，全局规划持续报
+      //   "Starting point in lethal space!" → 行为树清图→重试→再失败，车原地磨到
+      //   超时。本巡检把"人工用 rviz2 看图"前置为自动判定：代价地图标了车身
+      //   四周/脚底占位，而激光与相机均无实体 ⇒ 判为假障碍，主动清图重规划。
+      if (self_check_enable_ &&
+        (this->now() - last_self_check_).seconds() >= self_check_interval_)
+      {
+        last_self_check_ = this->now();
+        const SurroundReport rep = diagnoseSelfSurroundings();
+        if (rep.phantom_confirmed) {
+          RCLCPP_ERROR(get_logger(),
+            "[近身自检] 车身四周/脚底被代价地图标为占位（%d 格，最近距车身框 %.2fm），"
+            "但激光与相机在近身范围内均无实体 ⇒ 判定为【假障碍占位】，立即清图并重新规划：%s",
+            rep.occupied_cells, rep.nearest_cost_dist, rep.detail.c_str());
+          requestCostmapClear("近身自检判为假障碍占位");
+          // 清图后若本 goal 仍卡在原地，由 stall / goal_timeout 路径换点（已不再锁存）
+        } else if (rep.body_occupied && rep.valid) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+            "[近身自检] 车身近身占位且有传感器实体（真障碍/车体自反射）：不属假障碍，"
+            "需遥控移车或等人/物离开——%s", rep.detail.c_str());
         }
       }
 
@@ -1150,13 +1380,11 @@ void AutoMissionNode::mainLoop()
     case MissionState::FAULT:
     // ------------------------------------------------------------------
     {
-      // 故障锁存：停车、不重发 goal（非 AUTO 降级分支已在主循环上方将其重置为
-      // IDLE，能走到这里说明 AUTO 仍持有，即等待人工处置）
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "[FAULT] 任务已锁存（%s）：请检查 ①车身四周/脚底是否被假障碍占位（遥控移开后用 "
-        "rviz2 2D Pose Estimate 重定位）②定位是否跳变（map→odom）③航点是否可达；"
-        "处置后将模式开关离开 AUTO 再切回以重启任务",
-        fault_reason_.empty() ? "未记录原因" : fault_reason_.c_str());
+      // V0.1.00：FAULT 由"永久锁存 + 人工切开关解锁"改为【自愈态】——
+      //   静置 fault_hold_time 后周期性做：近身占位诊断 + 清图 + 航点可达性复判 +
+      //   AUTO 条件确认，条件满足即自动解除临时隔离并重启任务（自愈失败则按
+      //   fault_retry_interval × 轮次递增至 fault_retry_max_interval 重试，不永久锁死）。
+      faultRecoveryStep();
       break;
     }
 
@@ -1318,6 +1546,9 @@ void AutoMissionNode::mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr m
   map_min_y_ = msg->info.origin.position.y;
   map_max_x_ = map_min_x_ + static_cast<double>(msg->info.width) * msg->info.resolution;
   map_max_y_ = map_min_y_ + static_cast<double>(msg->info.height) * msg->info.resolution;
+  // V0.1.00：地图修订号自增 → 距离场/连通域缓存自动重建，之前基于旧图得出的
+  //   "永久隔离（不可达）"结论在新图下会重新判定（换图/重定位后无需人工解锁）
+  ++map_revision_;
   if (first_map) {
     RCLCPP_INFO(get_logger(),
       "auto_mission 已缓存静态地图边界：x[%.2f, %.2f] y[%.2f, %.2f]（航点安全边距 %.2fm）",
@@ -1560,36 +1791,65 @@ void AutoMissionNode::sendNextWaypoint()
     return;
   }
 
-  // ---- 航点预检（V0.0.95：已到达 + 越界双判，逐圈轮转） ----
-  // ① 已到达（V0.0.95 新增）：航点与当前 map 系位姿重合（≤ already_reached_dist）
-  //    时不得下发——"目标=当前位姿"对阿克曼是退化目标，必然 Fail to make progress
-  //    后原地抖动（见 waypointAlreadyReached() 注释的完整故障链）。
-  // ② 越界（V0.0.82/0.0.87）：目标超出静态地图边界或落在未建图(unknown)栅格上时，
-  //    SmacPlannerHybrid 必报 "Goal pose is out of costmap!" → BT 恢复行为空转 →
-  //    fail_count 耗尽（实车：航点 (5,5)/(0,5) 的 y=5 超出地图 y≤3.85）。
-  // 两者均按"跳过并轮转下一个航点"处理；整圈都不可用时锁存 FAULT（V0.0.95 起，
-  // 原先只回 IDLE —— 而 IDLE 下一拍又会重新进入 NAVIGATING 重发同一批不可用航点，
-  // 形成静默抖动且无对外故障上报，与 V0.0.91 的教训一致）。
+  // ---- 航点预检（V0.1.00：三级筛选，逐点隔离而不是一键锁存整条任务） ----
+  // ① 隔离态：临时隔离（导航失败累计）在冷却期满 wp_isolation_cooldown 后自动
+  //    重判并重试；永久隔离（地图判定不可达）同样按冷却周期复判，因而
+  //    移车/换图/重标航点后无需人工解锁；
+  // ② 地图校验（矩形界 / unknown / 占据 / 净空 / **可通行连通域**，需求③）：
+  //    这类失败与当次导航运气无关，属客观不可达 → 直接**永久隔离**，不再像
+  //    旧版那样逐圈重复下发、重复失败；
+  // ③ 已到达（车与航点重合，V0.0.95）：视为已完成并跳过（不计失败）。
+  // 三级筛完整圈无可用航点 → enterFault（V0.1.00 起为自愈态：自动诊断 + 周期重试）。
   size_t precheck_skips = 0;
   while (precheck_skips < waypoints_.size()) {
-    const Waypoint & cand = waypoints_[current_wp_idx_];
-    const std::string map_check = waypointMapCheckDetail(cand);
-    if (!map_check.empty()) {
-      RCLCPP_ERROR(get_logger(),
-        "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 不在已采集地图区域内"
-        "（%s；边界 x[%.2f, %.2f] y[%.2f, %.2f]，安全边距 %.2fm），跳过该航点",
-        current_wp_idx_, cand.label.c_str(), cand.x, cand.y, map_check.c_str(),
-        map_min_x_, map_max_x_, map_min_y_, map_max_y_, waypoint_map_margin_);
+    const size_t idx = current_wp_idx_;
+    const Waypoint & cand = waypoints_[idx];
+
+    // ① 隔离态筛选（冷却到期自动复判/解除）
+    promoteExpiredIsolation(idx);
+    if (idx < wp_rt_.size() && wp_rt_[idx].isolated) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "[sendNextWaypoint] 航点[%zu]%s 隔离中（%s），暂不下发，轮转下一个航点",
+        idx, cand.label.c_str(), wp_rt_[idx].last_reason.empty() ? "未记录" : "见隔离日志");
       current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
       ++precheck_skips;
       continue;
     }
+
+    // ②-a 地图矩形边界 / 未建图 / 占据栅格 / 净空校验（V0.0.82/0.0.87/0.0.96）
+    const std::string map_check = waypointMapCheckDetail(cand);
+    if (!map_check.empty()) {
+      RCLCPP_ERROR(get_logger(),
+        "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 地图校验不通过（%s；"
+        "边界 x[%.2f, %.2f] y[%.2f, %.2f]，安全边距 %.2fm）→ 永久隔离该航点",
+        idx, cand.label.c_str(), cand.x, cand.y, map_check.c_str(),
+        map_min_x_, map_max_x_, map_min_y_, map_max_y_, waypoint_map_margin_);
+      isolateWaypoint(idx, "地图校验：" + map_check, true);
+      current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
+      ++precheck_skips;
+      continue;
+    }
+
+    // ②-b 地图可达性（需求③）：在静态地图上做可通行连通域搜索，判定“从当前
+    //     车位能否沿可通行区域抵达该航点”——不可达的航点不该反复去试
+    const std::string reach_check = waypointReachabilityDetail(cand.x, cand.y);
+    if (!reach_check.empty()) {
+      RCLCPP_ERROR(get_logger(),
+        "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 按地图判定不可达：%s → 永久隔离该航点",
+        idx, cand.label.c_str(), cand.x, cand.y, reach_check.c_str());
+      isolateWaypoint(idx, "地图可达性：" + reach_check, true);
+      current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
+      ++precheck_skips;
+      continue;
+    }
+
+    // ③ 已到达预检
     double reached_d = 0.0, reached_yaw = 0.0;
     if (waypointAlreadyReached(cand, reached_d, reached_yaw)) {
       RCLCPP_INFO(get_logger(),
         "[sendNextWaypoint] 航点[%zu]%s (%.2f, %.2f) 已在到达半径内"
         "（距当前位姿 %.2fm ≤ %.2fm，朝向差 %.2f rad），视为已完成并跳过",
-        current_wp_idx_, cand.label.c_str(), cand.x, cand.y,
+        idx, cand.label.c_str(), cand.x, cand.y,
         reached_d, already_reached_dist_, reached_yaw);
       current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
       ++precheck_skips;
@@ -1599,7 +1859,8 @@ void AutoMissionNode::sendNextWaypoint()
   }
   if (precheck_skips >= waypoints_.size()) {
     enterFault(
-      "全部航点均不可用：或与当前位姿重合（已在到达半径内），或位于未建图/地图外区域");
+      "全部航点均不可用：或已隔离（导航失败累计/地图不可达），或已在到达半径内，"
+      "或位于未建图/地图外区域");
     return;
   }
   if (precheck_skips > 0) {
@@ -1732,29 +1993,857 @@ void AutoMissionNode::triggerEstop(const std::string & reason)
 }
 
 // ==========================================================================
-// 任务故障锁存（V0.0.91）
+// 任务故障停驻（V0.0.91 引入；V0.1.00 起为【自愈态】入口）
 //
-// 现场教训（问题②“遥控接管后重新自主，车停在原地不动”）：旧实现达失败上限时
-// 回到 IDLE，而 IDLE 分支下一拍就发现“AUTO 条件仍满足”→ 重置计数并重新
-// 从航点[0] 发送同一批不可规划的目标，形成 IDLE⇄NAVIGATING 静默抖动：
-//   • 车辆永不移动，也无任何对外故障上报，旁人无法从日志判断“已放弃”；
-//   • 行为树（V0.0.89 起）恢复池仅剩“清图 + Wait”非运动手段，帮不了
-//     “起点在致命栅格”——这种需要重定位/人工移车的死局。
-// 因此改为锁存到 FAULT：不再发 goal、不再重置计数，持续输出带处置指引的告警，
-// 需模式开关离开 AUTO（本节点主循环上方的降级分支会清回 IDLE）才能重启任务。
-// 注：不发 /estop——车已停且非危险场景，保持急停通道语义纯净。
+// 现场教训一（V0.0.91）：旧实现达失败上限时回到 IDLE，而 IDLE 分支下一拍就发现
+//   "AUTO 条件仍满足"→ 重置计数并从航点[0] 重发同一批不可规划目标，形成
+//   IDLE⇄NAVIGATING 静默抖动：车不动、无对外故障上报、旁人无法从日志判断已放弃。
+//   故改为锁存到 FAULT。
+// 现场教训二（V0.1.00，本次修正）：锁存只能靠"模式开关离开 AUTO 再切回"人工解除，
+//   而日志里那三类成因（近身假障碍占位 / 定位跳变 / 航点不可达）本节点完全有能力
+//   自己判定并处理。因此 FAULT 不再是一个终态，而是"停车 + 自动诊断 + 周期重试"
+//   的自愈态：静置 fault_hold_time 后由 faultRecoveryStep() 接手（见该函数）。
+//   人工通道保留：离开 AUTO 再切回仍是即时全量复位。
+// 注：不发 /estop —— 车已停且非危险场景，保持急停通道语义纯净。
 // ==========================================================================
 void AutoMissionNode::enterFault(const std::string & reason)
 {
+  const bool reentry = (state_ == MissionState::FAULT);
+  if (!reentry) {
+    ++mission_recovery_round_;
+  }
   fault_reason_ = reason;
-  RCLCPP_ERROR(get_logger(),
-    "[FAULT] 连续失败 %d/%d 次达上限（%s），停止巡航并锁存。"
-    "高频成因：起点位于致命栅格/定位跳变/假障碍累积——清图+等待无法自救，"
-    "需人工移车并用 rviz2 2D Pose Estimate 重定位，然后将模式开关离开 AUTO 再切回",
-    wp_fail_count_, max_wp_failures_, reason.c_str());
   cancelCurrentGoal();
-  wp_fail_count_ = 0;   // 计数归零，但锁存不因此解除（靠状态而非计数拦截重发）
+
+  // 进入 FAULT 即刻做一次自动诊断，把结论直接写给现场（需求②③）：
+  //   旧版本让人拿 rviz2 看图、猜"是假障碍还是定位跳变还是航点不可达"，
+  //   现在由本节点用代价地图 + 激光 + 相机 + 静态地图连通域给出可判读结论。
+  const SurroundReport rep = diagnoseSelfSurroundings();
+  size_t n_temp = 0, n_perm = 0;
+  for (size_t i = 0; i < wp_rt_.size(); ++i) {
+    if (!wp_rt_[i].isolated) {
+      continue;
+    }
+    if (wp_rt_[i].permanent) {
+      ++n_perm;
+    } else {
+      ++n_temp;
+    }
+  }
+  std::ostringstream oss;
+  oss << "近身占位诊断：";
+  if (!rep.valid) {
+    oss << "数据不足（代价地图/里程计/激光目标超时），本次不可判定";
+  } else if (!rep.body_occupied) {
+    oss << "车身四周/脚底无代价地图占位（非假障碍问题）";
+  } else if (rep.lidar_present || rep.fused_present) {
+    oss << "车身近身确有实体（激光/相机可见）⇒ 真障碍或车体自反射，需移车或清障";
+  } else {
+    oss << "代价地图占位而激光与相机均无实体 ⇒ 判定为【假障碍占位】，清图即可恢复";
+  }
+  oss << "｜" << rep.detail
+      << "｜航点：共 " << waypoints_.size()
+      << " 个，临时隔离 " << n_temp << " 个（冷却 "
+      << static_cast<int>(wp_isolation_cooldown_) << "s 后自动重试），永久隔离 " << n_perm
+      << " 个（地图判定不可达，换地图/移车后按冷却周期复判）";
+  fault_diagnosis_ = oss.str();
+
+  fault_enter_time_ = this->now();
+  fault_next_check_ = fault_enter_time_ + rclcpp::Duration::from_seconds(fault_hold_time_);
+  consec_fail_ = 0;   // 计数归零，但停驻不因此解除（靠状态而非计数拦截重发）
+
+  RCLCPP_ERROR(get_logger(),
+    "[FAULT] %s\n  → 第 %d 轮自愈，%.0fs 后自动复检（无需人工解锁）\n  → 自动诊断：%s\n"
+    "  → 自愈条件：AUTO 条件满足 + bt_navigator ACTIVE + 车身近身非【真实障碍】包围 + "
+    "至少 1 个按地图可达的航点；通过则自动清图、解除临时隔离并重启任务\n"
+    "  → 人工通道（仍可用）：遥控接管后将模式开关离开 AUTO 再切回 = 立即全量复位",
+    reason.c_str(), mission_recovery_round_, fault_hold_time_, fault_diagnosis_.c_str());
+
   state_ = MissionState::FAULT;
+}
+
+// ==========================================================================
+// V0.1.00 需求④：FAULT 自愈一步（由 mainLoop 在 FAULT 分支每 100ms 调用）
+//
+// 与旧"永久锁存"的区别：把人工处置清单里的三项（查假障碍、查定位、查航点可达）
+// 变成周期性自动执行的检查，并在条件满足时自行重启任务；条件不满足则按
+// fault_retry_interval × 轮次（上限 fault_retry_max_interval）放慢频率并持续
+// 输出可判读诊断，绝不永久锁死。
+// ==========================================================================
+void AutoMissionNode::faultRecoveryStep()
+{
+  const rclcpp::Time now = this->now();
+
+  if (!fault_auto_recover_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "[FAULT] 自愈已禁用（fault_auto_recover=false）：%s；人工处置：将模式开关离开 AUTO 再切回",
+      fault_reason_.empty() ? "未记录原因" : fault_reason_.c_str());
+    return;
+  }
+
+  const double remain = (fault_next_check_ - now).seconds();
+  if (remain > 0.0) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "[FAULT] 任务停驻中（%s），%.0fs 后自动复检｜%s",
+      fault_reason_.empty() ? "未记录原因" : fault_reason_.c_str(),
+      remain, fault_diagnosis_.empty() ? "诊断待生成" : fault_diagnosis_.c_str());
+    return;
+  }
+
+  // 先推进下一次检查时刻（即使本次检查失败也不会 10Hz 刷屏）
+  const double backoff = std::min(
+    fault_retry_interval_ * static_cast<double>(std::max(1, mission_recovery_round_)),
+    fault_retry_max_interval_);
+  fault_next_check_ = now + rclcpp::Duration::from_seconds(backoff);
+
+  if (!nav_active_.load()) {
+    queryNavigatorState();   // 刷新 bt_navigator 激活态（Nav2 重启过的场景）
+  }
+
+  // ① 近身占位诊断（需求②）：假障碍 → 清图；真障碍 → 不具备自愈条件
+  const SurroundReport rep = diagnoseSelfSurroundings();
+  const bool phantom_like =
+    rep.valid && rep.body_occupied && !rep.lidar_present && !rep.fused_present;
+  if (phantom_like) {
+    RCLCPP_ERROR(get_logger(),
+      "[FAULT] 自愈检查：%s ⇒ 判为【假障碍占位】，先清图再复检：%s",
+      "车身近身被代价地图占位而激光/相机无实体", rep.detail.c_str());
+    requestCostmapClear("FAULT 自愈：近身假障碍占位");
+  } else if (rep.valid && !rep.body_occupied) {
+    // 近身干净：若服务仍就绪再清一次（全图残留同样会让起点落入致命栅格）
+    requestCostmapClear("FAULT 自愈：例行清图后重规划");
+  }
+
+  // ② 航点复判（需求①③）：隔离冷却到期者重新纳入；地图不可读者转永久隔离
+  int available = 0;
+  int first_avail = -1;
+  for (size_t i = 0; i < waypoints_.size(); ++i) {
+    promoteExpiredIsolation(i);
+    if (i < wp_rt_.size() && wp_rt_[i].isolated) {
+      continue;
+    }
+    const std::string mc = waypointMapCheckDetail(waypoints_[i]);
+    if (!mc.empty()) {
+      isolateWaypoint(i, "地图校验：" + mc, true);
+      continue;
+    }
+    const std::string rr = waypointReachabilityDetail(waypoints_[i].x, waypoints_[i].y);
+    if (!rr.empty()) {
+      isolateWaypoint(i, "地图可达性：" + rr, true);
+      continue;
+    }
+    if (first_avail < 0) {
+      first_avail = static_cast<int>(i);
+    }
+    ++available;
+  }
+
+  // ③ 自愈门控
+  const bool stack_ok = isAutoConditionMet() && nav_active_.load();
+  const bool body_really_blocked =
+    rep.valid && rep.body_occupied && (rep.lidar_present || rep.fused_present);
+  RCLCPP_WARN(get_logger(),
+    "[FAULT] 自愈检查（第 %d 轮）：AUTO/Nav2就绪=%s，可用航点=%d/%zu，近身真障碍=%s，"
+    "近身假障碍=%s｜%s",
+    mission_recovery_round_, stack_ok ? "是" : "否", available, waypoints_.size(),
+    body_really_blocked ? "是" : "否", phantom_like ? "是（已清图）" : "否",
+    rep.detail.c_str());
+
+  if (!stack_ok || available <= 0 || body_really_blocked) {
+    std::ostringstream why;
+    if (!stack_ok) {
+      why << "AUTO 条件或 bt_navigator 未就绪（查定位收敛/感知新鲜度/health/Nav2 激活）；";
+    }
+    if (available <= 0) {
+      why << "无可用航点（全部被隔离：请核实地图/重标航点或人工移车）；";
+    }
+    if (body_really_blocked) {
+      why << "车身近身确有实体（激光/相机可见），需遥控移车或等障碍离开；";
+    }
+    RCLCPP_ERROR(get_logger(),
+      "[FAULT] 自愈未通过：%s%.0fs 后重试%s",
+      why.str().c_str(), backoff,
+      mission_recovery_round_ > max_mission_recoveries_ ?
+        "（已超过预期自愈轮次，建议人工介入：遥控移车 1m 以上→切回 AUTO）" : "");
+    return;
+  }
+
+  // ④ 自愈成功：解除临时隔离（保留地图不可达判定）并回 IDLE，由 IDLE 自动重启任务
+  RCLCPP_ERROR(get_logger(),
+    "[FAULT→IDLE] 自愈成功（第 %d 轮）：近身无真实障碍、AUTO 条件与 Nav2 就绪、"
+    "%d 个航点可用（首个：航点[%d]%s）→ 自动清图并重启自主导航",
+    mission_recovery_round_, available, first_avail,
+    (first_avail >= 0 && static_cast<size_t>(first_avail) < waypoints_.size()) ?
+      waypoints_[static_cast<size_t>(first_avail)].label.c_str() : "-");
+  resetMissionState("FAULT 自愈成功（自动复驶）", false);
+}
+
+// ==========================================================================
+// V0.1.00 需求①：使 wp_rt_ 与 waypoints_ 同尺寸（加载 / 热重载后调用）
+// ==========================================================================
+void AutoMissionNode::syncWaypointRuntime()
+{
+  if (wp_rt_.size() > waypoints_.size()) {
+    wp_rt_.resize(waypoints_.size());     // 航点减少：裁掉尾部运行时状态
+  }
+  while (wp_rt_.size() < waypoints_.size()) {
+    wp_rt_.emplace_back();               // 航点增加：新点以"零失败"入列
+  }
+  if (current_wp_idx_ >= waypoints_.size()) {
+    current_wp_idx_ = 0;
+  }
+}
+
+// ==========================================================================
+// V0.1.00 统一清图入口（需求①"重新规划导航"的具体动作）
+// 复用 V0.0.92/0.0.94 的清图 + 挂起重试机制：服务未就绪时置
+// costmaps_clear_pending_，由 NAVIGATING 入口每 100ms 重试，清图完成前不发新 goal
+// ==========================================================================
+void AutoMissionNode::requestCostmapClear(const std::string & why)
+{
+  clearCostmapsOnStart();
+  RCLCPP_INFO(get_logger(), "[清图] %s：已请求清除全局/局部代价地图（重新规划前置动作）",
+    why.c_str());
+}
+
+// ==========================================================================
+// V0.1.00 需求①：隔离单个航点
+//   permanent=false：临时隔离（导航失败累计），冷却期满自动重试
+//   permanent=true ：永久隔离（地图校验/可达性不通过），按冷却周期复判
+// ==========================================================================
+void AutoMissionNode::isolateWaypoint(size_t idx, const std::string & reason, bool permanent)
+{
+  if (idx >= waypoints_.size() || idx >= wp_rt_.size()) {
+    return;
+  }
+  WaypointRuntime & rt = wp_rt_[idx];
+  const bool was_isolated = rt.isolated;
+  rt.isolated = true;
+  rt.permanent = rt.permanent || permanent;   // 永久判定不因后续临时失败而降级
+  rt.isolated_at = this->now();
+  rt.last_reason = reason;
+
+  if (rt.permanent) {
+    if (was_isolated && permanent) {
+      return;   // 已报告过，不刷日志（复判时每轮只记一次）
+    }
+    RCLCPP_ERROR(get_logger(),
+      "[航点隔离] 航点[%zu]%s (%.2f, %.2f) 永久隔离：%s"
+      "（与当次导航运气无关；移车/换图/重标航点后按 %.0fs 冷却周期自动复判）",
+      idx, waypoints_[idx].label.c_str(), waypoints_[idx].x, waypoints_[idx].y,
+      reason.c_str(), wp_isolation_cooldown_);
+  } else if (!was_isolated) {
+    RCLCPP_ERROR(get_logger(),
+      "[航点隔离] 航点[%zu]%s 连续失败 %d/%d 次 → 隔离 %.0fs，期间轮转其他航点（%s）",
+      idx, waypoints_[idx].label.c_str(), rt.fail_count, max_wp_failures_,
+      wp_isolation_cooldown_, reason.c_str());
+  }
+}
+
+// ==========================================================================
+// V0.1.00 需求①③：隔离冷却到期时的自动复判
+//   临时隔离 → 直接解除（给航点一次全新的机会）；
+//   永久隔离 → 重跑地图校验 + 可达性：通过则解除（现场移车/重定位/换图后
+//   自然恢复，无需人工解锁），仍不通过则续一个冷却周期。
+// ==========================================================================
+void AutoMissionNode::promoteExpiredIsolation(size_t idx)
+{
+  if (idx >= wp_rt_.size() || idx >= waypoints_.size()) {
+    return;
+  }
+  WaypointRuntime & rt = wp_rt_[idx];
+  if (!rt.isolated) {
+    return;
+  }
+  if ((this->now() - rt.isolated_at).seconds() < wp_isolation_cooldown_) {
+    return;
+  }
+  const std::string label = waypoints_[idx].label;
+
+  if (!rt.permanent) {
+    rt.isolated = false;
+    rt.fail_count = 0;
+    RCLCPP_INFO(get_logger(),
+      "[航点隔离] 航点[%zu]%s 隔离冷却到期（%.0fs）→ 解除隔离，重新纳入巡航（上次原因：%s）",
+      idx, label.c_str(), wp_isolation_cooldown_, rt.last_reason.c_str());
+    return;
+  }
+
+  // 永久隔离：按地图事实复判
+  const std::string mc = waypointMapCheckDetail(waypoints_[idx]);
+  if (mc.empty()) {
+    const std::string rr = waypointReachabilityDetail(waypoints_[idx].x, waypoints_[idx].y);
+    if (rr.empty()) {
+      rt.isolated = false;
+      rt.permanent = false;
+      rt.fail_count = 0;
+      rt.last_reason.clear();
+      RCLCPP_INFO(get_logger(),
+        "[航点隔离] 航点[%zu]%s 永久隔离复判通过（地图已可通行）→ 解除隔离并重新纳入巡航",
+        idx, label.c_str());
+      return;
+    }
+    rt.isolated_at = this->now();   // 仍不可达 → 续一个冷却周期
+    rt.last_reason = "地图可达性：" + rr;
+    return;
+  }
+  rt.isolated_at = this->now();
+  rt.last_reason = "地图校验：" + mc;
+}
+
+// ==========================================================================
+// V0.1.00 需求①：轮转到下一个可用航点（false = 全部不可用）
+// ==========================================================================
+bool AutoMissionNode::advanceToNextAvailableWaypoint()
+{
+  if (waypoints_.empty()) {
+    return false;
+  }
+  const size_t n = waypoints_.size();
+  for (size_t step = 1; step <= n; ++step) {
+    const size_t idx = (current_wp_idx_ + step) % n;
+    promoteExpiredIsolation(idx);
+    if (idx < wp_rt_.size() && wp_rt_[idx].isolated) {
+      continue;
+    }
+    current_wp_idx_ = idx;
+    return true;
+  }
+  return false;
+}
+
+// ==========================================================================
+// V0.1.00 需求①：单航点失败的标准处置（代替旧的"整条任务锁存"）
+//   放弃当前航点 → 逐点计数（达阈值仅隔离该点）→ 近身假障碍诊断 → 清图重规划
+//   → 轮转下一个可用航点（重发由主循环经"取消静置门控"放行，不在此直发）
+// ⚠ 调用方必须已释放 goal_handle_mutex_（本函数会间接调用 cancel/clear/诊断，
+//   而诊断与清图均在主线程串行执行；历史上的 std::mutex 自死锁就出在这里）
+// ==========================================================================
+void AutoMissionNode::handleWaypointFailure(const std::string & reason)
+{
+  if (waypoints_.empty()) {
+    enterFault("无航点可执行（waypoints 未配置或全部解析失败）");
+    return;
+  }
+  const size_t idx = current_wp_idx_ % waypoints_.size();
+  int fail_count = max_wp_failures_;   // wp_rt_ 异常时按"已达上限"保守处理
+  if (idx < wp_rt_.size()) {
+    fail_count = ++(wp_rt_[idx].fail_count);
+    wp_rt_[idx].last_reason = reason;
+  }
+  ++consec_fail_;
+  goal_reject_count_ = 0;
+
+  const SurroundReport rep = diagnoseSelfSurroundings();   // 需求②：失败当下即定性
+  RCLCPP_ERROR(get_logger(),
+    "[航点失败] 航点[%zu]%s 第 %d/%d 次失败（%s）｜任务级连续失败 %d/%d｜自动诊断：%s",
+    idx, waypoints_[idx].label.c_str(), fail_count, max_wp_failures_,
+    reason.c_str(), consec_fail_, max_consec_failures_, rep.detail.c_str());
+
+  // ① 该点达上限 → 只隔离这一个航点
+  if (fail_count >= max_wp_failures_) {
+    isolateWaypoint(idx, reason, false);
+  }
+  // ② 需求①的"重新规划导航"：清两张代价地图（脏图/假膨胀是重规划失败的头号成因）
+  requestCostmapClear("航点失败后重新规划");
+  // ③ 任务级兜底：期间一次都没成功过且累计失败过多 → 进 FAULT（自愈态）
+  if (consec_fail_ >= max_consec_failures_) {
+    enterFault("任务级连续失败达上限（" + std::to_string(consec_fail_) + " 次）：" + reason);
+    return;
+  }
+  // ④ 放弃当前航点，轮转到下一个可用航点
+  if (!advanceToNextAvailableWaypoint()) {
+    enterFault("全部航点均已隔离（临时/永久），无可用目标");
+    return;
+  }
+  RCLCPP_WARN(get_logger(),
+    "[航点失败] 已放弃航点[%zu]，改发航点[%zu]%s（清图完成后由主循环重新下发并重新规划）",
+    idx, current_wp_idx_, waypoints_[current_wp_idx_].label.c_str());
+}
+
+// ==========================================================================
+// V0.1.00 需求④：任务状态全量复位
+//   clear_permanent=true ：连"地图不可达"判定一并清除（离开 AUTO 的人工复位，
+//                         因为人工可能已移车 / 重标航点 / 换了地图）；
+//   clear_permanent=false：仅解除临时隔离（自愈成功重启，客观不可达判定仍保留，
+//                         避免重启后立刻又去碰同一个不可达点）。
+// ==========================================================================
+void AutoMissionNode::resetMissionState(const std::string & why, bool clear_permanent)
+{
+  cancelCurrentGoal();
+  size_t n_iso = 0, n_perm = 0;
+  for (auto & rt : wp_rt_) {
+    if (rt.isolated) {
+      ++n_iso;
+    }
+    if (rt.permanent) {
+      ++n_perm;
+    }
+    rt.fail_count = 0;
+    if (rt.permanent && !clear_permanent) {
+      rt.isolated = true;      // 保留地图不可达判定
+      continue;
+    }
+    rt.isolated = false;
+    rt.permanent = false;
+    rt.last_reason.clear();
+  }
+  consec_fail_ = 0;
+  goal_reject_count_ = 0;
+  blocked_count_ = 0;
+  phantom_confirm_ = 0;
+  mission_recovery_round_ = 0;
+  current_wp_idx_ = 0;
+  goal_start_dist_ = -1.0;
+  goal_path_len_ = 0.0;
+  has_last_stall_pose_ = false;
+  goal_cancel_pending_ = false;
+  goal_cancel_by_mission_ = false;
+  // V0.1.00：自增 goal 世代号——上面 cancelCurrentGoal() 清掉了主动取消标记，
+  //   若不抬高世代号，旧 goal 的 CANCELED/ABORTED 结果会在复位后新任务已起
+  //   （state_=NAVIGATING）时被当成一次真失败；抬高后旧结果一律按过期丢弃。
+  ++goal_epoch_;
+  costmaps_clear_pending_.store(false);
+  localize_wait_started_ = false;
+  obstacle_wait_started_ = false;
+  nav_wait_started_ = false;
+  nav_retry_not_before_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  fault_reason_.clear();
+  fault_diagnosis_.clear();
+  state_ = MissionState::IDLE;
+
+  RCLCPP_INFO(get_logger(),
+    "[任务复位] %s：%s｜原有隔离 %zu 个（其中永久 %zu 个）已%s，"
+    "回到 IDLE，AUTO 条件满足即自动重启任务",
+    clear_permanent ? "全量（含地图不可达判定）" : "轻量（保留地图不可达判定）",
+    why.c_str(), n_iso, n_perm,
+    clear_permanent ? "全部清除" : "临时隔离已解除");
+}
+
+// ==========================================================================
+// V0.1.00 需求②：车身近身"假障碍占位"诊断
+//
+// 判据（三路信息交叉）：
+//   A 代价地图（/local_costmap/costmap，帧=odom）——车身框（含外扩边距）内有
+//     内切/致命格（cost ≥ self_check_cost_min）⇒ "Nav2 认为近身有东西"；
+//   B 激光目标（/perception/lidar_objects，base_link）与融合目标
+//     （/perception/fused_objects，base_link，含仅由相机确认的目标）——近身有实体
+//     ⇒ "传感器确实看到东西"；相机原始帧为 camera_color_optical_frame，本函数不做
+//     TF 换算，只以新鲜度/目标数参与结论描述；
+//   ⇒ A 成立而 B 不成立 ⇒ 【假障碍】（脏图、自反射、接管期压过旧栅格等）。
+// 防抖：连判 self_check_confirm_count 次才确认（单帧噪声不触发清图）。
+// odom→base_link 换算用 /localization/odom（EKF，world_frame=odom）的位姿做逆旋转，
+//   不引入 TF 依赖；若地图帧为 map/base_link 则自动改选对应位姿源（容错配置差异）。
+// ==========================================================================
+AutoMissionNode::SurroundReport AutoMissionNode::diagnoseSelfSurroundings()
+{
+  SurroundReport rep;
+  if (!self_check_enable_) {
+    rep.detail = "近身自检已禁用（self_check_enable=false）";
+    return rep;   // valid=false：调用方按"不可判定"处理
+  }
+
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr grid;
+  nav_msgs::msg::Odometry odom;
+  hunter_msgs::msg::DetectedObjectArray lidar_objs;
+  hunter_msgs::msg::DetectedObjectArray fused_objs;
+  geometry_msgs::msg::PoseWithCovarianceStamped reloc;
+  rclcpp::Time t_grid(0, 0, RCL_ROS_TIME), t_odom(0, 0, RCL_ROS_TIME);
+  rclcpp::Time t_lidar(0, 0, RCL_ROS_TIME), t_vision(0, 0, RCL_ROS_TIME);
+  int vision_count = 0;
+  bool reloc_ok = false;
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    grid       = latest_local_costmap_;
+    t_grid     = last_local_costmap_arrive_;
+    odom       = latest_odom_;
+    t_odom     = last_odom_arrive_;
+    lidar_objs = latest_lidar_objects_;
+    t_lidar    = last_lidar_objects_arrive_;
+    fused_objs = latest_fused_objects_;
+    t_vision   = last_vision_objects_arrive_;
+    vision_count = vision_objects_count_;
+    reloc      = latest_amcl_pose_;
+    reloc_ok   = amcl_pose_received_;
+  }
+  // 融合目标自身的新鲜度（与 isPerceptionAlive() 同源）
+  const rclcpp::Time now = this->now();
+  const double fused_age = (now - last_perception_stamp_).seconds();
+
+  const auto age_of = [&now](const rclcpp::Time & t) {
+    return (t.seconds() <= 0.0) ? 1e9 : (now - t).seconds();
+  };
+  const double grid_age  = age_of(t_grid);
+  const double odom_age  = age_of(t_odom);
+  const double lidar_age = age_of(t_lidar);
+  const double vision_age = age_of(t_vision);
+
+  const bool grid_ok  = (grid != nullptr) && grid_age <= self_check_data_timeout_;
+  const bool lidar_ok = lidar_age <= std::max(self_check_data_timeout_, 2.0);
+  const bool fused_ok = fused_age <= std::max(self_check_data_timeout_, 2.0);
+  rep.camera_alive = vision_age <= std::max(self_check_data_timeout_, 2.0);
+  // 可判定条件：代价地图新鲜 + 至少一路目标（激光或融合）新鲜
+  rep.valid = grid_ok && (lidar_ok || fused_ok);
+
+  // ---- 车身框（base_link）与代价地图帧→base_link 的位姿源选择 ----
+  const double m = self_check_margin_;
+  const double bx0 = -self_check_box_rear_, bx1 = self_check_box_front_;
+  const double by0 = -self_check_box_half_width_, by1 = self_check_box_half_width_;
+  double xr = 0.0, yr = 0.0, yawr = 0.0;
+  std::string pose_src = "odom";
+  if (grid_ok) {
+    std::string gf = grid->header.frame_id;
+    if (!gf.empty() && gf.front() == '/') {
+      gf.erase(0, 1);
+    }
+    if (gf == "base_link" || gf.empty()) {
+      xr = yr = yawr = 0.0;                 // 同帧：无需换算
+      pose_src = "base_link";
+    } else if (gf == "map" && reloc_ok) {
+      xr = reloc.pose.pose.position.x;
+      yr = reloc.pose.pose.position.y;
+      const auto & q = reloc.pose.pose.orientation;
+      yawr = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+      pose_src = "map";
+    } else {
+      // 默认：odom 帧（Nav2 local_costmap 标准配置）——需 EKF 位姿新鲜
+      if (odom_age > self_check_data_timeout_) {
+        rep.valid = false;
+      }
+      xr = odom.pose.pose.position.x;
+      yr = odom.pose.pose.position.y;
+      const auto & q = odom.pose.pose.orientation;
+      yawr = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    }
+  }
+
+  // ---- A：代价地图近身占位格统计 ----
+  if (grid_ok) {
+    const double res = grid->info.resolution;
+    const double ox  = grid->info.origin.position.x;
+    const double oy  = grid->info.origin.position.y;
+    const int w = static_cast<int>(grid->info.width);
+    const int h = static_cast<int>(grid->info.height);
+    const double c = std::cos(yawr), s = std::sin(yawr);
+    double best_d = 1e9;
+    if (res > 1e-6 && w > 0 && h > 0) {
+      for (int j = 0; j < h; ++j) {
+        const double wy = oy + (static_cast<double>(j) + 0.5) * res;
+        const double dyo = wy - yr;
+        for (int i = 0; i < w; ++i) {
+          if (grid->data[static_cast<size_t>(j) * w + i] < self_check_cost_min_) {
+            continue;
+          }
+          const double wx = ox + (static_cast<double>(i) + 0.5) * res;
+          const double dxo = wx - xr;
+          // odom → base_link：逆旋转变换（仅 2D，代价地图为程度图，无高度）
+          const double xb = c * dxo + s * dyo;
+          const double yb = -s * dxo + c * dyo;
+          if (xb < bx0 - m || xb > bx1 + m || yb < by0 - m || yb > by1 + m) {
+            continue;
+          }
+          ++rep.occupied_cells;
+          // 到【原始车身框】边缘的距离：0 = 在框内（即"脚底"）
+          const double ddx = std::max({bx0 - xb, xb - bx1, 0.0});
+          const double ddy = std::max({by0 - yb, yb - by1, 0.0});
+          best_d = std::min(best_d, std::hypot(ddx, ddy));
+        }
+      }
+    }
+    rep.body_occupied = rep.occupied_cells > 0;
+    rep.nearest_cost_dist = rep.body_occupied ?
+      (best_d >= 1e9 ? 0.0 : best_d) : 0.0;
+  }
+
+  // ---- B：激光 / 融合（含相机）目标是否在近身范围有实体 ----
+  // 目标以"中心 + 半径"包络参与判定（尺寸缺失时按 0.15m 最小半径兼容）
+  const auto near_body = [&](const hunter_msgs::msg::DetectedObject & o) {
+    const double oxo = o.pose.position.x, oyo = o.pose.position.y;
+    const double r = std::max(0.15, 0.5 * std::max(o.dimensions.x, o.dimensions.y));
+    const double ddx = std::max({bx0 - oxo, oxo - bx1, 0.0});
+    const double ddy = std::max({by0 - oyo, oyo - by1, 0.0});
+    return std::hypot(ddx, ddy) <= (r + m);
+  };
+  int lidar_near = 0, fused_near = 0;
+  if (lidar_ok) {
+    for (const auto & o : lidar_objs.objects) {
+      if (near_body(o)) {
+        ++lidar_near;
+      }
+    }
+    rep.lidar_present = lidar_near > 0;
+  }
+  if (fused_ok) {
+    for (const auto & o : fused_objs.objects) {
+      if (near_body(o)) {
+        ++fused_near;
+      }
+    }
+    rep.fused_present = fused_near > 0;
+  }
+
+  // ---- 结论与防抖 ----
+  rep.phantom = rep.valid && rep.body_occupied && !rep.lidar_present && !rep.fused_present;
+  if (rep.phantom) {
+    ++phantom_confirm_;
+  } else {
+    phantom_confirm_ = 0;
+  }
+  rep.phantom_confirmed = rep.phantom && phantom_confirm_ >= self_check_confirm_count_;
+
+  std::ostringstream oss;
+  oss << "代价地图(" << pose_src << " 帧, 龄期" <<
+      (grid_age > 1e8 ? 999.0 : grid_age) << "s): 近身占位格 " << rep.occupied_cells <<
+      " 格（最近距车身框 " << rep.nearest_cost_dist << "m，0=脚底）"
+      "｜激光目标: " << (lidar_ok ? std::to_string(lidar_objs.objects.size()) : std::string("超时"))
+      << " 个（近身 " << lidar_near << "）"
+      << "｜融合目标(含相机): "
+      << (fused_ok ? std::to_string(fused_objs.objects.size()) : std::string("超时"))
+      << " 个（近身 " << fused_near << "）"
+      << "｜相机目标: " << (rep.camera_alive ?
+        ("在线(" + std::to_string(vision_count) + " 目标)") : "超时/未接入")
+      << "｜假障碍计数 " << phantom_confirm_ << "/" << self_check_confirm_count_;
+  rep.detail = oss.str();
+  return rep;
+}
+
+// ==========================================================================
+// V0.1.00 需求③：地图可通行连通域缓存（惰性重建，独立 geom_mutex_）
+//
+// 两步派生：
+//   ① 距离场：每格到最近【占据/未建图】格的近似欧氏距离（5/7 chamfer 两遍扫描，
+//      1/10 格单位），用于把"太贴墙/太贴障"的格剔除出可通行集；
+//   ② 连通域：从当前车位所在可通行格出发做 8 邻域 BFS（斜向需两侧正交格均可通行，
+//      杜绝"贴对角缝穿墙"），预算超 reach_bfs_max_cells_ 则截断并标记结论不可靠。
+// 锁级次：先取 data_mutex_ 拷贝 shared_ptr 快照并释放，再拿 geom_mutex_ 算几秒级
+//   的派生数据（不持 data_mutex_ 跑长循环，避免阻塞 10Hz 主循环与回调）。
+// ==========================================================================
+bool AutoMissionNode::ensureReachabilityCache(double px, double py)
+{
+  if (!reachability_enable_) {
+    return false;
+  }
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr map_snap;
+  uint64_t rev = 0;
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    map_snap = latest_map_;
+    rev = map_revision_;
+  }
+  if (!map_snap) {
+    return false;   // 地图未就绪：不可判定（调用方放行）
+  }
+  const int w = static_cast<int>(map_snap->info.width);
+  const int h = static_cast<int>(map_snap->info.height);
+  const double res = map_snap->info.resolution;
+  const double ox = map_snap->info.origin.position.x;
+  const double oy = map_snap->info.origin.position.y;
+  if (w <= 0 || h <= 0 || res <= 1e-6) {
+    return false;
+  }
+  const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+  if (px < ox || py < oy || px >= ox + w * res || py >= oy + h * res) {
+    return false;   // 车位在图外：交由地图边界校验处理
+  }
+
+  std::lock_guard<std::mutex> gk(geom_mutex_);
+
+  // ---- ① 距离场（仅在地图修订号变化时重建） ----
+  if (occ_dist_rev_ != rev || occ_dist_field_.size() != n) {
+    const int32_t BIG = 1 << 20;
+    std::vector<int32_t> d(n, BIG);
+    for (size_t i = 0; i < n; ++i) {
+      const int8_t v = map_snap->data[i];
+      if (v >= 50 || v < 0) {
+        d[i] = 0;   // 占据 / 未建图 均为"障碍源"
+      }
+    }
+    for (int y = 0; y < h; ++y) {
+      const size_t row = static_cast<size_t>(y) * w;
+      for (int x = 0; x < w; ++x) {
+        const size_t i = row + x;
+        int32_t best = d[i];
+        if (x > 0) { best = std::min(best, d[i - 1] + 10); }
+        if (y > 0) { best = std::min(best, d[i - w] + 10); }
+        if (x > 0 && y > 0) { best = std::min(best, d[i - w - 1] + 14); }
+        if (x + 1 < w && y > 0) { best = std::min(best, d[i - w + 1] + 14); }
+        d[i] = best;
+      }
+    }
+    for (int y = h - 1; y >= 0; --y) {
+      const size_t row = static_cast<size_t>(y) * w;
+      for (int x = w - 1; x >= 0; --x) {
+        const size_t i = row + x;
+        int32_t best = d[i];
+        if (x + 1 < w) { best = std::min(best, d[i + 1] + 10); }
+        if (y + 1 < h) { best = std::min(best, d[i + w] + 10); }
+        if (x + 1 < w && y + 1 < h) { best = std::min(best, d[i + w + 1] + 14); }
+        if (x > 0 && y + 1 < h) { best = std::min(best, d[i + w - 1] + 14); }
+        d[i] = best;
+      }
+    }
+    occ_dist_field_.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+      occ_dist_field_[i] = (d[i] >= BIG) ?
+        1e6f : static_cast<float>(d[i]) * 0.1f * static_cast<float>(res);
+    }
+    occ_dist_rev_ = rev;
+    reach_rev_ = 0;   // 距离场变了 → 连通域必须重建
+  }
+
+  // ---- ② 可通行格判据 ----
+  const double min_clear = reach_clearance_;
+  const auto passable = [&](int x, int y) -> bool {
+    if (x < 0 || y < 0 || x >= w || y >= h) {
+      return false;
+    }
+    const size_t i = static_cast<size_t>(y) * w + x;
+    const int8_t v = map_snap->data[i];
+    if (v >= 50 || v < 0) {
+      return false;
+    }
+    return occ_dist_field_[i] >= static_cast<float>(min_clear);
+  };
+
+  int sx = static_cast<int>(std::floor((px - ox) / res));
+  int sy = static_cast<int>(std::floor((py - oy) / res));
+  sx = std::max(0, std::min(w - 1, sx));
+  sy = std::max(0, std::min(h - 1, sy));
+
+  // 车位本格不可通行（车停在障碍/膨胀区内）→ 1m 内找最近可通行格做 BFS 起点；
+  //   找不到则"无法判定"（返回 false 放行），杜绝把全部航点误判为不可达
+  if (!passable(sx, sy)) {
+    const int span = static_cast<int>(std::ceil(1.0 / res));
+    int bx = -1, by = -1;
+    double bd = 1e9;
+    for (int dy = -span; dy <= span; ++dy) {
+      for (int dx = -span; dx <= span; ++dx) {
+        if (!passable(sx + dx, sy + dy)) {
+          continue;
+        }
+        const double dd = std::hypot(static_cast<double>(dx), static_cast<double>(dy)) * res;
+        if (dd < bd) {
+          bd = dd;
+          bx = sx + dx;
+          by = sy + dy;
+        }
+      }
+    }
+    if (bx < 0) {
+      return false;
+    }
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+      "[地图可达性] 车当前所在格净空不足（<%.2fm），改以 %.2fm 外最近可通行格为连通域起点",
+      reach_clearance_, bd);
+    sx = bx;
+    sy = by;
+  }
+
+  // ---- ③ 连通域（地图变了 / 车位动了超阈 才重建） ----
+  const bool need_rebuild =
+    (reach_rev_ != rev) || (reach_mask_.size() != n) || (reach_cx0_ < 0) ||
+    (std::hypot(static_cast<double>(sx - reach_cx0_), static_cast<double>(sy - reach_cy0_)) *
+      res > reach_recompute_dist_);
+  if (need_rebuild) {
+    reach_mask_.assign(n, 0);
+    std::vector<int32_t> q;
+    q.reserve(4096);
+    const int32_t s0 = sy * w + sx;
+    reach_mask_[static_cast<size_t>(s0)] = 1;
+    q.push_back(s0);
+    reach_truncated_ = false;
+    static const int kOff[8][2] = {
+      {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+    size_t head = 0;
+    int expanded = 0;
+    for (; head < q.size(); ++head) {
+      if (++expanded > reach_bfs_max_cells_) {
+        reach_truncated_ = true;
+        break;
+      }
+      const int ci = q[head] % w;
+      const int cj = q[head] / w;
+      for (const auto & k : kOff) {
+        const int nx = ci + k[0];
+        const int ny = cj + k[1];
+        if (k[0] != 0 && k[1] != 0 && (!passable(ci + k[0], cj) || !passable(ci, cj + k[1]))) {
+          continue;   // 斜向需两侧正交格均可通行
+        }
+        if (!passable(nx, ny)) {
+          continue;
+        }
+        const size_t ni = static_cast<size_t>(ny) * w + nx;
+        if (reach_mask_[ni]) {
+          continue;
+        }
+        reach_mask_[ni] = 1;
+        q.push_back(ny * w + nx);
+      }
+    }
+    reach_rev_ = rev;
+    reach_cx0_ = sx;
+    reach_cy0_ = sy;
+    RCLCPP_INFO(get_logger(),
+      "[地图可达性] 连通域已重建（地图 %dx%d@%.2fm，净空门槛 %.2fm，可通行格 %d%s）",
+      w, h, res, reach_clearance_, expanded, reach_truncated_ ? "，已被预算截断" : "");
+  }
+  return true;
+}
+
+// ==========================================================================
+// V0.1.00 需求③：航点地图可达性明细
+//   返回空串 = 可达或"无法判定"（放行）；否则为不可达原因
+// ==========================================================================
+std::string AutoMissionNode::waypointReachabilityDetail(double wx, double wy)
+{
+  if (!reachability_enable_) {
+    return "";
+  }
+  double px = 0.0, py = 0.0;
+  if (!currentMapPose(px, py)) {
+    return "";    // 无全局位姿：不判定
+  }
+  if (!ensureReachabilityCache(px, py)) {
+    return "";    // 地图未就绪 / 车位无净空 / 信息不足：不判定（放行）
+  }
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr map_snap;
+  uint64_t rev = 0;
+  {
+    // 地图快照与其修订号必须在同一次 data_mutex_ 临界区内取，否则可能与
+    //   下方 geom_mutex_ 保护的缓存对不上（map_revision_ 裸读的数据竞争）
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    map_snap = latest_map_;
+    rev = map_revision_;
+  }
+  if (!map_snap) {
+    return "";
+  }
+  std::lock_guard<std::mutex> gk(geom_mutex_);
+  const int w = static_cast<int>(map_snap->info.width);
+  const int h = static_cast<int>(map_snap->info.height);
+  const double res = map_snap->info.resolution;
+  const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+  if (reach_mask_.size() != n || reach_rev_ != rev) {
+    return "";    // 缓存与本帧地图不对应：不判定
+  }
+  const int gx = static_cast<int>(std::floor(
+      (wx - map_snap->info.origin.position.x) / res));
+  const int gy = static_cast<int>(std::floor(
+      (wy - map_snap->info.origin.position.y) / res));
+  if (gx < 0 || gy < 0 || gx >= w || gy >= h) {
+    return "";    // 越界由 waypointMapCheckDetail 负责拦截
+  }
+  const size_t gi = static_cast<size_t>(gy) * w + gx;
+  if (reach_mask_[gi]) {
+    return "";    // 与车位同一可通行连通域
+  }
+  if (reach_truncated_) {
+    return "";    // BFS 被预算截断 → 不可达结论不可靠，放行
+  }
+  const double dist = std::hypot(wx - px, wy - py);
+  return "该航点与当前车位不在同一【可通行连通域】内（直线距离 " +
+    std::to_string(static_cast<int>(dist * 100.0) / 100.0) +
+    "m，静态地图判定不可达：被障碍割开或位于孤立区域）";
 }
 
 // ==========================================================================
@@ -1851,23 +2940,25 @@ void AutoMissionNode::goalResponseCallback(
     std::lock_guard<std::mutex> lk(goal_handle_mutex_);
     if (!handle) {
       goal_in_flight_ = false;
-      wp_fail_count_++;
-      // 退避 + 失败上限：杜绝 10Hz 高频重发；拒收达上限回 IDLE 等待条件重置
+      // V0.1.00：拒收单独计数（不再占用航点失败计数——bt_navigator 不接 goal
+      //   与"这个航点往不去"是两回事），接受即清零
+      ++goal_reject_count_;
       nav_retry_not_before_ = this->now() + rclcpp::Duration::from_seconds(nav_retry_backoff_);
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "[Nav2] goal 被服务端拒绝（fail_count=%d/%d），%.0fs 后重试",
-        wp_fail_count_, max_wp_failures_, nav_retry_backoff_);
-      if (wp_fail_count_ >= max_wp_failures_) {
+        "[Nav2] goal 被服务端拒收（连续 %d/%d 次），%.0fs 后重试",
+        goal_reject_count_, max_wp_failures_, nav_retry_backoff_);
+      if (goal_reject_count_ >= max_wp_failures_) {
         need_fault = true;
       }
     } else {
       goal_handle_ = handle;
+      goal_reject_count_ = 0;   // V0.1.00：一旦接受即证明 Nav2 健康，拒收计数归零
       RCLCPP_INFO(get_logger(), "[Nav2] goal 已被接受，开始导航至航点[%zu]",
         current_wp_idx_);
     }
   }
   if (need_fault) {
-    enterFault("goal 连续被 bt_navigator 拒收");
+    enterFault("goal 连续被 bt_navigator 拒收（Nav2 未就绪 / 并发上限 / lifecycle 非 ACTIVE）");
   }
 }
 
@@ -1894,7 +2985,7 @@ void AutoMissionNode::resultCallback(
 {
   // V0.0.97 过期结果门控（必须放在最前，先于任何状态清理）：
   //   世代号不同于当前值 ⇒ 本结果属于【已被本节点放弃的旧 goal】。这种结果
-  //   ① 不能计入 wp_fail_count_（否则一次受阻连跳 2 个航点 → FAULT 误锁存）；
+  //   ① 不能计入航点失败计数（否则一次受阻连跳 2 个航点 → 误进 FAULT）；
   //   ② 不能触发换点（换点由取消方完成）；
   //   ③ 更不能清空 goal_in_flight_/goal_handle_ —— 旧实现在回调开头无条件清空，
   //      导致在途（新）goal 的句柄丢失、后续 cancelCurrentGoal() 变空操作，
@@ -1959,7 +3050,13 @@ void AutoMissionNode::resultCallback(
           current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
           (result.code == rclcpp_action::ResultCode::ABORTED) ? "ABORTED" : "CANCELED",
           d, already_reached_dist_);
-        wp_fail_count_ = 0;
+        // V0.1.00："已到达"等价于本点成功 → 清该点计数与任务级计数
+        if (current_wp_idx_ < wp_rt_.size()) {
+          wp_rt_[current_wp_idx_].fail_count = 0;
+          wp_rt_[current_wp_idx_].isolated = false;
+        }
+        consec_fail_ = 0;
+        mission_recovery_round_ = 0;
         const size_t next_idx = current_wp_idx_ + 1;
         if (next_idx < waypoints_.size()) {
           current_wp_idx_ = next_idx;
@@ -1983,7 +3080,16 @@ void AutoMissionNode::resultCallback(
     RCLCPP_INFO(get_logger(),
       "[Nav2] 航点[%zu] %s 导航成功",
       current_wp_idx_, waypoints_[current_wp_idx_].label.c_str());
-    wp_fail_count_ = 0;  // 成功则重置失败计数
+    // V0.1.00：一次成功到达即同时清零：该点失败计数、任务级连续失败计数、
+    //   拒收计数与自愈轮次（航点能走通就说明之前的隔离/诊断已不适用）
+    if (current_wp_idx_ < wp_rt_.size()) {
+      wp_rt_[current_wp_idx_].fail_count = 0;
+      wp_rt_[current_wp_idx_].isolated = false;
+      wp_rt_[current_wp_idx_].last_reason.clear();
+    }
+    consec_fail_ = 0;
+    goal_reject_count_ = 0;
+    mission_recovery_round_ = 0;
 
     // 判断是否还有下一个航点
     const size_t next_idx = current_wp_idx_ + 1;
@@ -2009,22 +3115,24 @@ void AutoMissionNode::resultCallback(
     const char * reason =
       (result.code == rclcpp_action::ResultCode::ABORTED)   ? "ABORTED" :
       (result.code == rclcpp_action::ResultCode::CANCELED)  ? "CANCELED" : "UNKNOWN";
-    RCLCPP_WARN(get_logger(),
-      "[Nav2] 航点[%zu] %s 导航失败（%s），fail_count=%d/%d",
-      current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
-      reason, wp_fail_count_ + 1, max_wp_failures_);
-    wp_fail_count_++;
-    // 重试退避：给 Nav2 恢复/系统稳定留窗口，防止立刻重发
-    nav_retry_not_before_ = this->now() + rclcpp::Duration::from_seconds(nav_retry_backoff_);
-
-    if (wp_fail_count_ >= max_wp_failures_) {
-      enterFault("航点导航连续 ABORTED/CANCELED 达上限");
+    // V0.1.00：非导航态的残余结果不再参评（降级/急停已取消过 goal）
+    if (state_ != MissionState::NAVIGATING && state_ != MissionState::OBSTACLE_AVOID) {
+      RCLCPP_INFO(get_logger(),
+        "[Nav2] 航点[%zu] %s 结果 %s 到达于非导航态（%s），不计失败也不换点",
+        current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(), reason,
+        stateToString(state_).c_str());
       return;
     }
-    // 跳过当前航点，继续下一个
-    if (state_ == MissionState::NAVIGATING) {
-      current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
-      sendNextWaypoint();
+    RCLCPP_WARN(get_logger(),
+      "[Nav2] 航点[%zu] %s 导航失败（%s）",
+      current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(), reason);
+    // 重试退避：给 Nav2 恢复/系统稳定留窗口，防止立刻重发
+    nav_retry_not_before_ = this->now() + rclcpp::Duration::from_seconds(nav_retry_backoff_);
+    // V0.1.00 需求①：失败处置统一交给 handleWaypointFailure（逐点隔离 + 清图重规划
+    //   + 换点），不在本回调里直接换点重发——重发由 NAVIGATING 的"无在途 goal"
+    //   路径经清图/取消静置门控放行，避开旧版"ABORT→立即发下一点→被旧 BT 波及"
+    if (state_ == MissionState::NAVIGATING || state_ == MissionState::OBSTACLE_AVOID) {
+      handleWaypointFailure("Nav2 返回 " + std::string(reason));
     }
   }
 }

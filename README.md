@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V2.0（开发指南，对应软件基线 V0.0.98：V0.0.97（几何死锁修复：`stop_dist 0.90`/`slow_dist 1.40`/`range_min 0.70` + MPPI 放开倒车 + Smac `REEDS_SHEPP` + goal 世代号）经实车验证已消除“满舵死磕”，但车辆**仍**绕不开障碍物——本版修复第二层根因：① **安全层与避障层互斥（主因）**：旧碰撞闸把 (v,w) 指令只按行进方向**直线投影**求净空，绕障弧起点必落在走廊内 → MPPI 每生成绕障轨迹执行 0.1~0.3s 即被按停（“能规划、能出弧、就是走不出去”）——**V0.0.98 safety_guard 轨迹扫掠弧（swept-arc）碰撞闸**：行进中按指令积分真实阿克曼轨迹（前 `reaction_lag 0.4s` 直线、其后圆弧 |w|≤v/1.9、弧长等步长 5cm）+ 车体包络盒扫掠，输出与走廊同量纲的纵向等价净空，“绕得开就放行、真撞才拦”（新参 `reaction_lag 0.4`/`brake_decel 1.5`/`vel_trust_eps 0.03`）；② **MPPI 预测时域/critic 重标定**：时域 1.5s→**4.0s**（`50×0.08`，旧值 @0.25m/s 仅前瞻 0.38m 看不到绕障弧）、`batch_size 700`、`CostCritic 3→6`、`PathAlign 14→8`+`occupancy_ratio 0.05→0.15`（旧值使合理离径被饱和惩罚）；③ **取消竞态残留**：`Goal was canceled` 后 2ms 即发新 goal → 被旧 BT 失败状态波及 ABORTED → 新增 **`goal_cancel_settle_time 2.0s` 静置门控**；④ /scan 链降载（`angle_increment 1.0°` 360 束、`transform_tolerance 0.3`、`expected_update_rate 0.25`）。历史：V0.0.96（航点净空校验、恢复池倒车）、V0.0.97（绕障几何 + 世代号）修复均已实车验证生效）
+> **文档版本**：V2.2（开发指南，对应软件基线 **V0.1.00**：实车日志「`[FAULT] 任务已锁存（单航点导航超时连续达上限）……处置后将模式开关离开 AUTO 再切回以重启任务`」的彻底修复——`auto_mission` 任务层「**自愈四件套**」：① **逐航点失败隔离 + 自动轮转**（失败计数由「跨航点总量」下沉为「单个航点」，超时/受阻 → 放弃该点 + 清两张代价地图（重新规划）+ 改发下一个可用航点，隔离冷却 120s 后自动重试；任务级 `max_consec_failures`(12) 才兜底进 FAULT）；② **车身四周/脚底「假障碍占位」自动诊断**（`/local_costmap/costmap` × `/perception/lidar_objects` × `/perception/fused_objects`（含仅相机确认的目标）三路交叉：代价地图在车身框±35cm 内占位而两路传感器均无实体 ⇒ 判【假障碍】并自动清图，不再需要人拿 rviz2 看图）；③ **航点可达性按地图范围判定**（5/7 chamfer 净空场 + 8 邻域可通行连通域 BFS，与车位不在同一连通域 ⇒ 永久隔离该点并继续跑其他航点，按冷却周期自动复判）；④ **FAULT 由「永久锁存等人工解锁」改为自愈态**（静置 20s → 诊断 + 清图 + 全航点复判 + 三重门控 → 自动回 IDLE 重启；**遥控接管后切回 AUTO 即自动复驶**）。历史：V0.0.99（阿克曼几何参数一致性修正）、V0.0.98（safety_guard 轨迹扫掠弧碰撞闸 + MPPI 4.0s 时域 + 取消静置门控）、V0.0.97（绕障几何 + goal 世代号）、V0.0.96（航点净空校验、恢复池倒车）修复均已实车验证生效）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -374,13 +374,14 @@ ros2 launch hunter_bringup hunter_full.launch.py \
 | `/control/command` | `hunter_msgs/ChassisCommand` | 50Hz | 最终控制指令 |
 | `/remote/command` | `hunter_msgs/ChassisCommand` | 20Hz | 远程控制指令 |
 | `/system/health` | `hunter_msgs/SystemHealth` | 1Hz | 系统健康状态 |
-| `/auto_mission/status` | `std_msgs/String` | 10Hz | 自主任务状态（IDLE/MAPPING/NAVIGATING/OBSTACLE_AVOID/ESTOP） |
+| `/auto_mission/status` | `std_msgs/String` | 10Hz | 自主任务状态（IDLE/MAPPING/WAITING_LOCALIZE/NAVIGATING/OBSTACLE_AVOID/ESTOP/FAULT） |
 | `/auto_mission/current_waypoint` | `std_msgs/Int32` | 事件 | 当前执行的航点索引 |
 | `/pcd_to_map/status` | `std_msgs/String` | 事件 | PCD→地图转换状态（IDLE/CONVERTING/DONE/ERROR） |
 | `/navigate_to_pose` (action) | `nav2_msgs/NavigateToPose` | — | Nav2 单点导航 action 接口（方式B 外部下发） |
-| `/safety/state` | `std_msgs/String` | 2Hz | safety_guard 分级预警心跳（状态|原因；OK/SLOWDOWN/COLLISION_STOP/SCAN_TIMEOUT/CMD_TIMEOUT/ESTOP_PASS/TEST_ABORTED/MAP_EDGE_SLOWDOWN/MAP_EDGE_STOP） |
+| `/safety/state` | `std_msgs/String` | 2Hz | safety_guard 分级预警心跳（状态\|原因；OK/SLOWDOWN/COLLISION_STOP/SCAN_TIMEOUT/CMD_TIMEOUT/ESTOP_PASS/TEST_ABORTED/MAP_EDGE_SLOWDOWN/MAP_EDGE_STOP） |
 | `/safety/test_mode` | `std_msgs/Bool` | 事件 | 自动驾驶测试模式开关（true 开启 0.3m/s 限速+严阈值+异常自动中止，V0.0.89） |
 | `/cmd_vel_nav` | `geometry_msgs/Twist` | 20Hz | controller_server 原始速度指令（safety_guard 测试模式监控其断流） |
+| `/local_costmap/costmap` | `nav_msgs/OccupancyGrid` | 5Hz（= `publish_frequency`） | 局部代价地图整图（帧 `odom`）；**V0.1.00 起被 `auto_mission` 订阅用作“车身近身假障碍占位”诊断**，需 `local_costmap.always_send_full_costmap: true` 才会在几何不变时持续发整图 |
 
 > 自定义消息定义见设计文档 §4.3（`hunter_msgs`）。
 >
@@ -452,21 +453,33 @@ IDLE ──[AUTO条件满足]──→ WAITING_LOCALIZE ──[收敛]──→ 
 IDLE ──[mapping模式]──→ MAPPING
 NAVIGATING ──[障碍物 < warn_dist]──→ OBSTACLE_AVOID ──[路清]──→ NAVIGATING
 NAVIGATING ──[障碍物 < stop_dist]──→ ESTOP
-NAVIGATING ──[航点受阻：stall_detect_time 内位移 < stall_move_eps]──→ 取消 goal 换点
-                                                          （连续达 max_wp_failures → FAULT）
-NAVIGATING ──[航点已在 already_reached_dist 内 / 越界]──→ 跳过该航点（不发 goal）
-NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁存：不发 goal、不重发，
-                                                  需模式开关离开 AUTO 再切回）
+NAVIGATING ──[航点受阻：stall_detect_time 内净推进 < stall_move_eps
+            或 单航点超时 goal_timeout]──→ 取消 goal → 清图重规划 → 换下一个可用航点
+            └─ V0.1.00：失败计入【该航点】，达 max_wp_failures(3) 仅隔离该点
+                        （冷却 wp_isolation_cooldown=120s 后自动重试）
+NAVIGATING ──[航点已在 already_reached_dist 内 / 越界 / 占据栅格 / 净空不足
+            / 不在可通行连通域（V0.1.00）]──→ 跳过并隔离该航点（不发 goal）
+NAVIGATING ──[任务级连续失败达 max_consec_failures(12)、全部航点均被隔离、
+            或 goal 连续被拒收]──→ FAULT
+FAULT ──[静置 fault_hold_time(20s) 后周期自愈：诊断+清图+航点复判+三重门控通过]──→ IDLE
+                                                （V0.1.00：自动复驶，无需人工解锁）
+FAULT ──[模式离开 AUTO（遥控接管/降级）]──→ IDLE（全量复位，含清除地图不可达永久隔离）
 任意状态 ──[非AUTO/急停]──→ IDLE / ESTOP
 ```
 
-> **V0.0.95 任务层两条新防线**（对应“遇到障碍物无法绕开障碍物自动驾驶”）：
-> ① **航点“已到达”预检**：航点与 `/relocalization/pose` 位置重合（≤ `already_reached_dist` 0.30m）
+> **V0.1.00 任务层「自愈四件套」**（对应实车日志「任务已锁存（单航点导航超时连续达上限）…需将模式开关离开 AUTO 再切回」的彻底修复）：
+> ① **逐航点隔离与轮转**：`WaypointRuntime{fail_count, isolated, permanent, isolated_at, last_reason}` 数组 `wp_rt_` 取代旧的跨航点总量 `wp_fail_count_`；`handleWaypointFailure()` 统一处置“放弃当前航点 → 逐点计数 → 即时诊断 → 清图重规划 → `advanceToNextAvailableWaypoint()`”。A/B/C 三个不同航点各失败一次不再拖垮整条任务。
+> ② **近身假障碍自动诊断** `diagnoseSelfSurroundings()`：代价地图（车身框 + 外扩 `self_check_margin`）判“Nav2 认为近身有东西”× 激光/融合目标判“传感器确实看到东西”→ A∧¬B 即【假障碍占位】，连判 `self_check_confirm_count` 次后自动清图；结论直接写进 `[航点失败]`/`[FAULT]` 日志。⚠ 硬依赖 `nav2_params.yaml` `local_costmap.always_send_full_costmap: true`。
+> ③ **地图可达性** `ensureReachabilityCache()` + `waypointReachabilityDetail()`：静态地图上“非占据、非未建图且净空 ≥ `reach_clearance`”的 8 邻域连通域（斜向需两侧正交格可通行）；航点不在车位连通域 → 永久隔离（不逐圈重复失败）；信息不足/预算截断一律“不可判定→放行”（宁误放勿误杀）。
+> ④ **FAULT 自愈态** `faultRecoveryStep()`：静置 → 假障碍则清图 → 遍历航点复判（隔离到期推进 + 地图校验 + 可达性）→ 三重门控（AUTO 条件&Nav2 ACTIVE ∧ 可用航点≥1 ∧ 近身非真障碍包围）→ `resetMissionState()` 回 IDLE 自动重启；失败则按 `fault_retry_interval × 轮次`（上限 180s）退避重试，**永不锁死**。遥控接管后**切回 AUTO 即自动复驶**（`mainLoop()` 检测离开 AUTO 的下降沿做全量复位，回 IDLE 后由 IDLE 分支自动重启）。
+>
+> **V0.0.95 任务层两条旧防线**（仍有效）：
+> ① **航点“已到达”预检**：航点与 `/relocalization/pose` 位置重合（≤ `already_reached_dist` 0.35m）
 >    时视为已完成并跳过——goal 与自身位姿重合时 Smac 路径≈0 且要求终止朝向，阿克曼无法
 >    原地转向，MPPI 会持续打满转向（日志 `set steering angle: ±0.386428 rad` 即曲率钳制上限
 >    对应的最大内轮转角）而纵向零进挪，ProgressChecker(0.1m/10s) 必判 `Failed to make progress`；
 > ② **受阻（stall）检测**：goal 在途且朝目标推进量 < `stall_move_eps`(0.15m) 持续 `stall_detect_time`(25s)
->    → 明确判“前方障碍无法绕行/航点无可达路径”，取消本 goal 并换点（连续 3 次 → FAULT 锁存），
+>    → 明确判“前方障碍无法绕行/航点无可达路径”，取消本 goal 并换点（**V0.1.00 起：失败计入该航点，不再直接 FAULT**），
 >    日志给出可判读结论，避免“原地抖动 90s 后静默换点”。（V0.0.97 补：累计行程 ≥ `stall_path_allow_m` 1.0m
 >    视为绕障机动中不判受阻；V0.0.98 补：换点重发经 `goal_cancel_settle_time` 静置门控，不再取消后 2ms 立即重发）
 >
@@ -475,6 +488,8 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 >    膨胀区内”的航点（现场 (5.0,0.0) 即此类，车开到该点后 Smac 持续抛 `Starting point in lethal space!`）；
 > ④ **“ABORT 但已在到达半径内 ⇒ 判为完成”**：避免“车已到 0.07m 却因规划失败被整树 ABORT”被计成
 >    航点失败而快速累积到 FAULT。
+>
+> **V0.1.00 发送前预检扩为三级**（`sendNextWaypoint()`）：隔离态（含到期复判）→ 地图四级校验 **+ 可达性**（不通过＝**永久隔离**）→ 已到达。全部被筛掉才 `enterFault`。
 
 ### 10.4 安全约束参数（`autonomous_nav_params.yaml`）
 
@@ -489,6 +504,7 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 | `perception_timeout` | 2 s | 感知数据超时阈值 |
 | `max_velocity` | 0.5 m/s | 巡航速度（V0.0.89 窄小测试场地低速档，与 MPPI vx_max/velocity_smoother/safety_guard 一致） |
 | `loop_waypoints` | `true` | 完成所有航点后是否循环 |
+| `max_wp_failures` | 3 | **V0.1.00 语义变更**：由「跨航点累计」改为【单个航点】连续失败上限——达上限只**隔离该航点**（冷却后自动重试），不再锁存整条巡航线；跳航点的任务级兜底由 `max_consec_failures` 负责。`<1` 强制回 1 |
 | `goal_timeout` | 45 s | 单点导航超时（**V0.0.95 90→45**：受阻由 `stall_detect_time` 25s 内提前定性，本超时只兜底“缓慢但可达”的航点） |
 | `obstacle_wait_timeout` | 30 s | 障碍物等待超时后触发 ESTOP |
 | `already_reached_dist` | 0.35 m | **V0.0.95 新增；V0.0.97 由 0.30 上调**：航点“已到达”判定半径。航点与当前 map 系位姿距离 ≤ 此值时视为已完成并**跳过不发 goal**（修“目标=自身”退化 goal 死锁；0.304m 退化目标实例）。须 > 阿克曼停车精度且 ≥ 2× Nav2 `xy_goal_tolerance`(0.10m)，不宜 >0.4m。全部航点均在此半径内 → FAULT 锁存 |
@@ -497,6 +513,29 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 | `stall_detect_time` | 25 s | **V0.0.95 新增**：受阻判定时长。goal 在途且朝目标推进停滞 → 判“前方障碍无法绕行/航点无可达路径”，取消本 goal 并换点。须 > 一轮 Nav2 恢复周期（ProgressChecker 10s + 清图 + 受限倒车脱困） |
 | `stall_move_eps` | 0.15 m | **V0.0.95 新增**：受阻判定位移下限（>2× 定位抖动）。**V0.0.96 判据改“朝目标推进量”**（= 发 goal 时到航点距离 − 当前距离）——倒车脱困会增大到目标距离（推进量为负）仍判受阻，位移标量会被“后退”骗过 |
 | `waypoint_clearance_m` | 0.50 m | **V0.0.96 新增**：航点距最近**占据栅格**的最小净空。航点为占据栅格 / 净空不足 → 发送前拒绝并跳过（日志给实测值），全部被拒 → FAULT。必须 > Nav2 内切半径（footprint 半宽 0.32m）；必要性：滚动局部代价地图不含 static_layer，MPPI 不会避开仅存在于静态地图中的障碍，会把车开到该点，随后 Smac 持续报 `Starting point in lethal space!`（清图无效——`StaticLayer::reset()` 只置 `has_updated_data_` 并重新盖章） |
+| **V0.1.00 需求①——逐航点隔离与轮转** | | |
+| `wp_isolation_cooldown` | 120 s | 临时隔离（导航失败累计）冷却期满自动解除并清零该点失败数；【永久隔离】（地图不可达）也按本周期**复判**（重跑地图校验 + 可达性，通过即解除）——避免永久隔离成为新的死锁。`<10s` 强制回 10s |
+| `max_consec_failures` | 12 | 任务级兜底：连续失败期间**一次都没成功到达**过，达此上限才进 FAULT（自愈态）。必须 > `max_wp_failures`（内部校验：不足则自动抬到 `max_wp_failures+2`，否则来不及轮转就锁存） |
+| **V0.1.00 需求②——车身四周/脚底假障碍自动诊断（激光 + 相机交叉验证）** | | |
+| `self_check_enable` | `true` | 总开关；关闭后诊断降级为“不可判定”，不再自动清图 |
+| `self_check_interval` | 5.0 s | `NAVIGATING` 中周期巡检间隔（除周期巡检外，每次航点失败当下、每次 FAULT 自愈检查、进 FAULT 即刻均会跑一次） |
+| `self_check_margin` | 0.35 m | 车身框外扩监视边距（“车身四周”）；置 0 则只查“脚底”（原始车身框内） |
+| `self_check_box_front / _rear / _half_width` | 0.45 / 0.37 / 0.32 m | 车身框尺寸（base_link 系），**必须与 `nav2_params.yaml` 的 footprint 一致**；存在非正值则回退默认 0.45/0.37/0.32 |
+| `self_check_cost_min` | 99 | 代价地图“占据”阈值（Nav2 `cost_translation_table`：0=自由、99=内切、100=致命、-1=未知）；clamp 到 [1,100] |
+| `self_check_confirm_count` | 3 | 防抖：连判 N 次“假障碍”才触发自动清图（单帧噪声不致误动作） |
+| `self_check_data_timeout` | 1.0 s | 代价地图 / 里程计 / 激光目标新鲜度阈值；超时则结论为“不可判定”（绝不误判、绝不误清图） |
+| `local_costmap_topic` | `/local_costmap/costmap` | 诊断数据源 A（帧 `odom`）；⚠ **硬依赖 `nav2_params.yaml` `local_costmap.always_send_full_costmap: true`**——否则 `Costmap2DPublisher` 只在窗口几何变化时发整图，车辆停驻（正是需要诊断的时刻）时收到的是过期图 |
+| `lidar_objects_topic` / `vision_objects_topic` | `/perception/lidar_objects` / `/perception/vision_objects` | 诊断数据源 B（激光 base_link 直接参与几何判定；相机原始帧为 `camera_color_optical_frame`，本节点**不引 TF 依赖**，只取其新鲜度/目标数参与结论描述；相机确认实体的几何判定由 `/perception/fused_objects` 承载） |
+| **V0.1.00 需求③——航点可达性按地图范围判定** | | |
+| `reachability_enable` | `true` | 旧四级校验（矩形界/未建图/占据栅格/净空）之上的**第五级**：可通行连通域 |
+| `reach_clearance` | 0.35 m | 可通行格最小净空（≈内切半径 0.32 + 余量）；`<0.32` 自动抬到 0.35（过小会把实际过不去的窄缝判成连通） |
+| `reach_recompute_dist` | 1.0 m | 车位移动超此距离才重建连通域（节流）；地图修订号 `map_revision_` 变化则必重建 |
+| `reach_bfs_max_cells` | 400000 | BFS 预算（格数）；被截断时“不可达”结论不可靠 → **自动放行**（宁误放勿误杀）；`<10000` 强制回 10000 |
+| **V0.1.00 需求④——FAULT 自愈** | | |
+| `fault_auto_recover` | `true` | 置 `false` 可退回旧行为（只停驻等人工解锁） |
+| `fault_hold_time` | 20 s | 进 FAULT 后首次自愈检查前的静置时长（留给障碍离开/人工移车）；`<5s` 强制回 5s |
+| `fault_retry_interval` / `fault_retry_max_interval` | 30 s / 180 s | 自愈重试间隔随轮次递增（`interval × 轮次`，上限 `max_interval`）——防刷屏与慢死循环，但**永不锁死** |
+| `max_mission_recoveries` | 5 | 超过此轮次后仅提高告警强度并给人工建议（不锁死） |
 
 ### 10.5 自动化工具节点
 
@@ -600,7 +639,7 @@ src/
 │   ├── include/auto_mission/
 │   │   └── auto_mission_node.hpp
 │   ├── src/
-│   │   ├── auto_mission_node.cpp               ← 6态状态机 C++ 实现
+│   │   ├── auto_mission_node.cpp               ← 7 态状态机 C++ 实现（V0.1.00 含 FAULT 自愈与逐航点隔离）
 │   │   └── main.cpp
 │   └── scripts/
 │       ├── waypoint_recorder.py                ← 航点自动采集
@@ -781,10 +820,12 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | 启动时一次性 `彩色图像超时 x.x s` | 启动竞态（视觉节点激活早于彩色流就绪） | 仅出现一次属良性，可忽略；反复出现才按"相机无图像"排查 |
 | **相机全程 0Hz**：`xioctl(VIDIOC_QBUF) failed: No such device` + `Failed to resolve the request: Z16 848x480`，`彩色图像超时` 持续递增、`health_monitor` 报 `camera 话题频率异常 0.0Hz`（V0.0.95 已修） | D435 驱动启动后先落默认 profile（depth/infra 848x480x30）再"停传感器→重开"，**重开瞬间 USB 设备节点消失**（ENODEV）→ 整机相机 0Hz，vision/fusion 退化为单雷达源 | ① V0.0.95 起 launch 已显式下发 `640,480,30`（避免默认 profile 触发的 stop/start 重配）并关闭 infra；② 仍复现按硬件链排查：`lsusb`、`dmesg \| grep -iE 'usb\|uvc\|xhci'`（找 disconnect/reset）、D435 直连 USB3 口勿经 HUB、关闭 USB 自动挂起；③ 设备枚举异常（`/dev/video*` 消失）时把 `hunter_full.launch.py` 相机 `initial_reset` 改 `'true'` 重启；④ 验证 `ros2 topic hz /camera/camera/color/image_raw`（应 ~30Hz） |
 | **自主巡航车辆原地抖动不前进**：`/safety/state` 在 `SLOWDOWN↔COLLISION_STOP` 间高频往返、`set steering angle` 恒为 ±0.386428、最终 `Failed to make progress`（V0.0.95 已修） | ① 航点与车辆当前位姿重合（"目标=自身"退化 goal，阿克曼无法原地转向）；② 走廊净空贴着急停阈值 ±6mm 抖振，速度被反复归零；③ BT 恢复池只有"清图+Wait"非运动手段，无法脱困 | V0.0.95 已分层修复（航点"已到达"预检 + 阈值释放滞环 + 受限倒车脱困 + 受阻检测）；现场仍复现时：① 确认车头前方 ≥2m 无障碍（`rviz2` 看 /scan 与 costmap，分清真实障碍/幽灵点）；② 看 `safety_guard` 启动日志确认 `释放滞环=+0.25/+0.20m`、`幽灵点门控=≥3 点` 已注入；③ 确认 `velocity_smoother min_velocity[0]=-0.20`（=0 会把倒车脱困钳成 0）；④ `waypoints` 首点不得与车位重合（见 `autonomous_nav_params.yaml` 航点布置约束） |
-| **自主巡航报 `[NAVIGATING] 航点[i] 受阻` 或 FAULT 锁存** | 前方真实障碍无法绕行 / 航点在障碍后无可达路径 / 全部航点与车位重合 | 先看 `/safety/state` 的走廊净空与 `幽灵点抑制` 告警区分真实障碍与噪点；移除障碍或人工把车移到空旷处；用 rviz2 重新标定航点；FAULT 需把模式开关离开 AUTO 再切回解除 |
+| **自主巡航报 `[NAVIGATING] 航点[i] 受阻` 或 FAULT** | 前方真实障碍无法绕行 / 航点在障碍后无可达路径 / 全部航点与车位重合 | **V0.1.00 起不再需要人工解锁**：受阻/超时 → 放弃该点 + 清图重规划 + 轮转下一个可用航点；日志直接给自动诊断结论（近身真/假障碍 + 航点可达性）；进 FAULT 后按静置→复检自动复驶，或遥控接管后切回 AUTO 立即复位重启；若仍不动，看 `[FAULT] 自愈未通过：…` 里列的具体门控（Nav2 未就绪 / 无可用航点 / 近身确有实体） |
 | **倒车脱困"报成功但车不倒"** | `velocity_smoother` 对全部速度源做绝对值钳制，`min_velocity[0]=0.0` 把负线速度钳成 0（V0.0.94 及以前默认） | `nav2_params.yaml` `velocity_smoother.min_velocity` 应为 `[-0.20, 0.0, -0.8]`（V0.0.95）；禁倒车由 MPPI `vx_min=0` + Smac `allow_reversing=false` 保证，不在平滑器上设 0 |
 | **行驶一小段后停下，`planner_server` 持续报 `Starting point in lethal space! Cannot create feasible plan..`，清图/等待均无效，3 次后 `FAULT`（V0.0.96 已修）** | 车辆停在**静态地图障碍的膨胀区**内（起点格代价 LETHAL 254 / INSCRIBED 253）→ Smac 的 `areInputsValid()` 判起点无效；清图无效（本 fork `StaticLayer::reset()` 只置 `has_updated_data_`，静态障碍会重新盖章）；**滚动局部代价地图不含 static_layer**，MPPI 不会避开静态地图障碍，因而会把车一路开到那里 | V0.0.96 三层修复：① 任务层航点净空校验（`waypoint_clearance_m` 0.50m，占据栅格 + 净空双判，发送前拒绝并打印实测净空）；② 行为树恢复池**首位 BackUp 0.45m**（规划失败也能物理驶离膨胀区，1~2s 内生效）；③ 任务层“ABORT 但已在到达半径内 ⇒ 判为已到达”。**现场恢复手段**：`ros2 run teleop_twist_keyboard` 人工把车倒出膨胀区，或 rviz2 确认航点位置后重标 `waypoints` |
-| **自主巡航报"距静态地图障碍仅 x.xxm < 净空要求 0.50m（处于 Nav2 膨胀/致命区内）"并跳过该航点** | 航点标定在障碍旁/障碍上（仓库示例航点 (0,0)/(5,0)/(5,3)/(0,3) 为占位值，实测 (5.0,0.0) 不满足净空） | 设计行为（防止把车开进死局）：在 rviz2 中确认目标点四周 ≥0.5m 无占据（黑色）栅格，按 `autonomous_nav_params.yaml` 的标定步骤重标；全部航点被拒会 FAULT 锁存（模式开关离开 AUTO 再切回解锁） |
+| **自主巡航报"距静态地图障碍仅 x.xxm < 净空要求 0.50m（处于 Nav2 膨胀/致命区内）"并跳过该航点** | 航点标定在障碍旁/障碍上（仓库示例航点 (0,0)/(5,0)/(5,3)/(0,3) 为占位值，实测 (5.0,0.0) 不满足净空） | 设计行为（防止把车开进死局）：**V0.1.00 起该航点被永久隔离，巡航线继续跑其他点**，并在日志区分“地图校验”与“地图可达性”两类原因；在 rviz2 中确认目标点四周 ≥0.5m 无占据（黑色）栅格后按 `autonomous_nav_params.yaml` 的标定步骤重标（或遥控接管后切回 AUTO 触发全量复位重判），隔离按 `wp_isolation_cooldown`(120s) 周期自动复判 |
+| **`[FAULT] …→ 第 N 轮自愈` 循环不前进（车辆停驻不复驶）** | 三重自愈门控有一项未过：`AUTO 条件 & bt_navigator ACTIVE` / `可用航点≥1` / `近身非真实障碍包围` | 看 `[FAULT] 自愈检查（第 N 轮）：…` 一行即可定位：`AUTO/Nav2就绪=否`→查定位收敛/感知新鲜度/health/Nav2 激活；`可用航点=0/n`→全部航点被隔离，核实地图或重标航点；`近身真障碍=是`→激光/相机确实看到车身四周有东西，需遥控移车或清障（此类**不允许自动复位**，防碰撞）；超 `max_mission_recoveries`(5) 轮后告警会给人工建议，但仍不锁死 |
+| **近身假障碍诊断总给“数据不足（代价地图/里程计/激光目标超时），本次不可判定”** | `local_costmap.always_send_full_costmap` 未开（整图只在几何变化时发）、或 `odom→base_link` EKF 断流、或 `lidar_perception` 未发 `/perception/lidar_objects` | `ros2 topic hz /local_costmap/costmap` 应≈`publish_frequency`(5Hz)且**车辆静止时仍有数据**；`ros2 topic hz /localization/odom`（50Hz）、`/perception/lidar_objects`（10Hz，**无目标也发空数组**）；退化到“不可判定”是**安全侧行为**（宁可不自动清图也不误判），不影响需求①③④ |
 | **相机仍 0Hz（V0.0.96 已将 `initial_reset` 置 true 仍复现）** | 属 USB 链路级故障（供电/带宽/接触/枚举异常），非驱动参数问题 | 按 §13.8 相机条目硬件排查：D435 直连 USB3 口（勿经 HUB）、`dmesg \| grep -iE 'usb\|uvc'` 查掉线、关 USB 自动挂起、必要时更换线缆/接口。导航不受阻（`health=WARNING` 不拦 AUTO 门控），但视觉避障退化为单雷达源 |
 | **日志被 `set steering angle: x` 刷屏（20~50Hz）** | 底盘驱动（`hunter_ros2/hunter_base`，vendor 目录）在每个 `/cmd_vel` 回调 `std::cout` 打印转向角，未节流 | 分析时过滤：`grep -v 'set steering angle' /tmp/hunt7.log`；或 `scripts/hunter_log.sh` 导出后离线过滤。驱动属 vendor 代码（git-ignored），不建议直接改 |
 | 一次性 `[TensorRT] Using an engine plan file across different models of devices` | `.engine` 非本机/本设备型号生成（换机或文件被旧引擎覆盖） | 不阻塞运行（话题 15Hz 正常）；目标机重生成：`trtexec --onnx=<绝对路径>/yolov8s.onnx --saveEngine=/data/models/yolov8s.engine --fp16` 后重启视觉节点 |
@@ -801,13 +842,13 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 |------|------|
 | 《自动驾驶车辆系统详细设计文档 V2.0》 | 本项目的设计基准；本文档全部参数、话题、CAN 协议、坐标系均可追溯至其对应章节 |
 | AI 编码任务清单 | 分模块开发任务（任务 00 ~ 任务 17），指导按模块开发与验收 |
-| `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程，**V2.1** 对应软件基线 V0.0.99） |
-| `Deployment_Guide.md` | 部署操作文档 V2.1（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.0.99） |
+| `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程，**V2.2** 对应软件基线 V0.1.00） |
+| `Deployment_Guide.md` | 部署操作文档 **V2.2**（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.1.00） |
 | `release.md` | 版本历史（V0.0.1 ~ 当前），记录每版主要功能与修复 |
 
 > **追溯原则**：本 README 中所有硬件参数（§2）、软件版本（§3）、话题（§8）、控制模式（§9）、限制（§13）均源自《自动驾驶车辆系统详细设计文档 V2.0》，未虚构功能。自主导航模块（§10）为在设计文档框架内的扩展实现。
 
 ---
 
-*HunterEdge 开发指南 · 文档版本 V2.1 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.99 现场实测修正（V0.0.93：方案A 定位架构重构；V0.0.94：“原地不动”残余故障链修复；V0.0.95：“无法绕开障碍物”分层修复；V0.0.96：“行驶一小段立即停下”修复；V0.0.97：阿克曼绕障几何死锁 + 过期 goal 修复；V0.0.98：“V0.0.97 后仍无法绕开障碍物”第二层根因修复——safety_guard 轨迹扫掠弧碰撞闸、MPPI 4.0s 预测时域与 critic 重标定、auto_mission 取消静置门控、/scan 链降载；**V0.0.99：阿克曼几何参数一致性修正——safety_guard 轴距 0.65→0.46（与 README 硬件表/decision_making 统一，δ_max 18.9°→13.6°，非功能性）+ 独立调试启动 safety_guard.launch.py 与生产同步（修正滞留的 stop_dist=1.0 死锁值）**；重编 `hunter_safety hunter_bringup`）*
+*HunterEdge 开发指南 · 文档版本 V2.2 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.1.00 现场实测修正（V0.0.93：方案A 定位架构重构；V0.0.94：“原地不动”残余故障链修复；V0.0.95：“无法绕开障碍物”分层修复；V0.0.96：“行驶一小段立即停下”修复；V0.0.97：阿克曼绕障几何死锁 + 过期 goal 修复；V0.0.98：safety_guard 轨迹扫掠弧碰撞闸、MPPI 4.0s 预测时域与 critic 重标定、auto_mission 取消静置门控、/scan 链降载；V0.0.99：阿克曼几何参数一致性修正（轴距 0.65→0.46、调试 launch 与生产同步）；**V0.1.00：`auto_mission` 任务层「自愈四件套」——逐航点失败隔离与自动轮转（单点超时不再锁存整条任务）、车身四周/脚底假障碍自动诊断（局部代价地图 × 激光 × 相机）、航点可达性按静态地图可通行连通域判定、FAULT 由永久锁存改自愈态（接管后切回 AUTO 即自动复驶）；新增 23 个参数，`nav2_params.yaml` `local_costmap.always_send_full_costmap: true`；不新增任何话题/消息/服务；重编 `auto_mission hunter_bringup`）*
 

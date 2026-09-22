@@ -1,7 +1,12 @@
 // Copyright 2026 HUNTER Development Team
 // AUTO 模式自主任务调度节点头文件
 // 功能：航点巡航任务管理、AUTO 进入条件守护、障碍物安全约束（减速/避让/急停）、
-//       航点地图越界校验（矩形边界+安全边距+未建图栅格，V0.0.82/0.0.87）
+//       航点地图越界校验（矩形边界+安全边距+未建图栅格，V0.0.82/0.0.87）、
+//       V0.1.00 任务自愈四件套：
+//         ① 航点级失败隔离与自动轮转（单点超时/受阻不再拖垮整条巡航线）；
+//         ② 车身近身【假障碍占位】诊断（代价地图 vs 激光 + 相机双传感器交叉验证）；
+//         ③ 航点【地图可达性】判定（静态地图矩形/栅格/净空 + 可通行连通域）；
+//         ④ FAULT 由"永久锁存等人解锁"改为"自愈态"（遥控接管后切回 AUTO 即自动复驶）。
 #ifndef AUTO_MISSION__AUTO_MISSION_NODE_HPP_
 #define AUTO_MISSION__AUTO_MISSION_NODE_HPP_
 
@@ -48,8 +53,11 @@ enum class MissionState : uint8_t
   NAVIGATING,        // 正在执行导航目标
   OBSTACLE_AVOID,    // 障碍物减速等待
   ESTOP,             // 急停状态
-  FAULT,             // 任务故障锁存（V0.0.91）：连续规划失败达上限后停驻，
-                     // 不再静默重发；需模式开关离开 AUTO 再回来才能解除
+  FAULT,             // 任务故障停驻（V0.0.91 引入锁存语义）：连续失败达上限后停驻，
+                     // 不再静默重发；
+                     // V0.1.00 起为【自愈态】：停驻期间周期性做近身占位诊断 + 航点可达性
+                     // 复检，条件满足即自动清图、解隔离并重启任务（模式开关离开 AUTO 再切回
+                     // 仍是即时的人工复位通道）
 };
 
 // ---------------------------------------------------------------------------
@@ -95,12 +103,50 @@ private:
   bool isPerceptionAlive();      // 感知数据是否新鲜（< 2s）
   double nearestObstacleDist();  // 最近融合障碍物距离（base_link，前向扇区）
 
+  // ---- V0.1.00 航点级失败隔离（需求①：单航点失败只废该点，不废整条任务） ----
+  struct WaypointRuntime
+  {
+    int fail_count{0};              // 该航点连续失败次数（达 max_wp_failures → 隔离）
+    bool isolated{false};           // 隔离中：本轮不再下发
+    bool permanent{false};          // 永久隔离：地图不可达（换地图修订号 / 任务复位后重判）
+    rclcpp::Time isolated_at{0, 0, RCL_ROS_TIME};
+    std::string last_reason;        // 最近一次失败/隔离原因（日志判读用）
+  };
+
+  // ---- V0.1.00 车身近身占位诊断结论（需求②：假障碍由激光 + 相机共同判定） ----
+  struct SurroundReport
+  {
+    bool valid{false};              // 数据新鲜度足够，本次判据可用（false = 不可判定）
+    bool body_occupied{false};      // 代价地图在车身框（含外扩边距）内标了内切/致命格
+    bool lidar_present{false};      // 激光感知在近身范围内有目标
+    bool fused_present{false};      // 融合目标（含仅相机确认者）在近身范围内有目标
+    bool camera_alive{false};       // 相机目标话题在线（新鲜度判据）
+    bool phantom{false};            // 单次判据成立：地图占位而双传感器均无实体
+    bool phantom_confirmed{false};  // 连续 self_check_confirm_count 次成立（防抖）
+    int occupied_cells{0};          // 车身框内被占格数
+    double nearest_cost_dist{0.0};  // 最近占位格到【原始车身框】边缘的距离（m，0=框内/脚底）
+    std::string detail;             // 可直接读给现场的结论串
+  };
+
   // ---- 导航控制 ----
   void sendNextWaypoint();
   void cancelCurrentGoal();
   void triggerEstop(const std::string & reason);
-  void enterFault(const std::string & reason);  // 任务故障锁存（V0.0.91）：停止巡航并等待人工处置
+  void enterFault(const std::string & reason);  // 任务故障停驻（V0.1.00 起为自愈态入口）
   void clearCostmapsOnStart();                  // 任务（重）启动时异步清一次全局/局部代价地图（V0.0.91）
+  // ---- V0.1.00 任务自愈 ----
+  void syncWaypointRuntime();                        // 使 wp_rt_ 与 waypoints_ 同尺寸（加载/热重载后）
+  void requestCostmapClear(const std::string & why); // 统一清图入口（置挂起标志，由 NAVIGATING 门控重试）
+  void isolateWaypoint(size_t idx, const std::string & reason, bool permanent);  // 隔离某航点
+  void promoteExpiredIsolation(size_t idx);          // 冷却到期的临时隔离自动解除
+  bool advanceToNextAvailableWaypoint();             // 轮转到下一个可用航点（false = 全部不可用）
+  void handleWaypointFailure(const std::string & reason);  // 放弃当前航点 → 诊断 → 清图重规划 → 换点
+  void resetMissionState(const std::string & why, bool clear_permanent);
+  void faultRecoveryStep();                          // FAULT 自愈：周期诊断，条件满足自动重启任务
+  SurroundReport diagnoseSelfSurroundings();         // 近身假障碍诊断（代价地图 vs 激光/相机）
+  bool ensureReachabilityCache(double px, double py);  // 地图可通行连通域（惰性重建，geom_mutex_）
+  // 航点可达性明细：空串 = 可达或"无法判定"（放行）；否则为不可达原因（需求③）
+  std::string waypointReachabilityDetail(double wx, double wy);
   bool tryReleaseSelfEstop();  // 自触发急停（障碍物类）解除：危险消除后发布 /estop=false
   bool waypointInsideMap(const Waypoint & wp);  // 航点在已采集地图区域内（边界+边距+非未建图栅格+净空，V0.0.82/0.0.87/0.0.96）
   std::string waypointMapCheckDetail(const Waypoint & wp);  // 拒绝原因（空=通过）：边界外 / 未建图 / 占据栅格 / 净空不足
@@ -159,6 +205,14 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr amcl_sub_;  // V0.0.92
 
+  // ---- V0.1.00 近身假障碍诊断数据源（均为系统已有话题，只新增订阅，不新增话题） ----
+  // /local_costmap/costmap：Nav2 局部代价地图（帧=odom，滚动窗口，含动态障碍层）
+  // /perception/lidar_objects：激光感知目标（base_link）
+  // /perception/vision_objects：相机目标（camera_color_optical_frame，本节点只用其新鲜度/计数）
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr local_costmap_sub_;
+  rclcpp::Subscription<hunter_msgs::msg::DetectedObjectArray>::SharedPtr lidar_objects_sub_;
+  rclcpp::Subscription<hunter_msgs::msg::DetectedObjectArray>::SharedPtr vision_objects_sub_;
+
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr waypoint_idx_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr estop_pub_;
@@ -202,6 +256,15 @@ private:
   geometry_msgs::msg::PoseWithCovarianceStamped latest_amcl_pose_;
   bool amcl_pose_received_{false};  // 收到过至少一帧 /relocalization/pose
 
+  // ---- V0.1.00 近身诊断缓存（data_mutex_ 保护） ----
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr latest_local_costmap_;
+  rclcpp::Time last_local_costmap_arrive_{0, 0, RCL_ROS_TIME};
+  hunter_msgs::msg::DetectedObjectArray latest_lidar_objects_;
+  rclcpp::Time last_lidar_objects_arrive_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_vision_objects_arrive_{0, 0, RCL_ROS_TIME};
+  int vision_objects_count_{0};              // 相机最近一帧目标数（仅用于结论描述）
+  rclcpp::Time last_odom_arrive_{0, 0, RCL_ROS_TIME};  // /localization/odom 到达时刻
+
   // ---- 建图模式自动巡航缓存 ----
   nav_msgs::msg::Odometry latest_lio_odom_;   // FAST-LIO2 /Odometry（odom 系，原 camera_init）
   rclcpp::Time last_lio_odom_arrive_{0, 0, RCL_SYSTEM_TIME};  // 最近一次到达时刻（本节点时钟）
@@ -216,9 +279,20 @@ private:
   // ---- 航点列表与索引 ----
   std::vector<Waypoint> waypoints_;
   size_t current_wp_idx_{0};
-  int wp_fail_count_{0};           // 连续失败计数
-  bool goal_in_flight_{false};     // 是否有 goal 在飞
-  std::string fault_reason_;       // FAULT 锁存原因（V0.0.91，仅日志用）
+  // V0.1.00 需求①：失败计数下沉到【逐个航点】（旧 wp_fail_count_ 为跨航点总量，
+  //   三个不同航点各失败一次就把整条任务锁存，而实际只是"那一个点去不了"）
+  std::vector<WaypointRuntime> wp_rt_;
+  int consec_fail_{0};                 // 期间无任何一次成功到达的累计失败次数（任务级兜底）
+  int goal_reject_count_{0};           // bt_navigator 连续拒收计数（接受即清零）
+  int mission_recovery_round_{0};      // 已进行的任务自愈轮次（一次成功后清零，决重试间隔）
+  bool goal_in_flight_{false};         // 是否有 goal 在飞
+  std::string fault_reason_;           // FAULT 停驻原因（V0.0.91，仅日志用）
+  std::string fault_diagnosis_;        // 进入 FAULT 时的自动诊断结论（需求②③的可判读输出）
+  rclcpp::Time fault_enter_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time fault_next_check_{0, 0, RCL_ROS_TIME};   // 下一次自愈重试检查时刻
+  rclcpp::Time last_self_check_{0, 0, RCL_ROS_TIME};    // 上一次近身巡检时刻
+  int phantom_confirm_{0};             // 假障碍连续判定计数（防抖）
+  bool prev_mode_auto_{false};         // 上一拍是否处于 AUTO（用于检测"接管后切回"边沿）
   // V0.0.95 受阻（无法绕行）计数：goal 在途而长时间无位移时递增，供日志与诊断
   int blocked_count_{0};
   // V0.0.96 受阻判定基准：发 goal 时车辆到该航点的距离（负值 = 位姿未知，本航点不做受阻判定）。
@@ -257,6 +331,20 @@ private:
   //   障碍，会把车一路开到航点；一旦车停在静态障碍的膨胀/致命区内，此后所有规划全部失败。
   //   默认 0.50 > Nav2 inscribed_radius(0.32) + 定位误差余量；改小会在障碍旁制造死局。
   double waypoint_clearance_m_{0.50};
+
+  // ---- V0.1.00 地图可达性（可通行连通域）派生几何缓存 ----
+  // ⚠ 锁级次：latest_map_ 归 data_mutex_ 保护，而距离场/BFS 可达秒级计算，因而不
+  //   能持 data_mutex_ 跑完（会阻塞 10Hz 主循环的全部回调）；改用独立的 geom_mutex_
+  //   + 地图快照（shared_ptr 拷贝）计算，既无嵌套加锁也无自死锁风险。
+  std::mutex geom_mutex_;
+  uint64_t map_revision_{0};            // /map 每收到一新地图自增（使旧缓存/永久隔离失效）
+  std::vector<float> occ_dist_field_;   // 每格到最近占据栅格的近似欧氏距离（m，3-4 chamfer）
+  uint64_t occ_dist_rev_{0};            // occ_dist_field_ 对应的地图修订号
+  std::vector<uint8_t> reach_mask_;     // 从当前车位出发的可通行连通域（1=可达）
+  uint64_t reach_rev_{0};               // reach_mask_ 对应的地图修订号
+  int reach_cx0_{-1};                   // reach_mask_ 计算起点格（地图变化/车位移动超阈则重建）
+  int reach_cy0_{-1};
+  bool reach_truncated_{false};         // BFS 达上限被截断 ⇒ 不可达结论不可靠（放行）
 
   // ---- 定位等待计时 ----
   rclcpp::Time localize_wait_start_;
@@ -323,6 +411,37 @@ private:
   double obstacle_wait_timeout_{30.0}; // 障碍物等待超时（s）
   // 最大速度（仅日志/合规性检查；实际限速由 Nav2 params 控制）
   double max_velocity_{2.0};
+
+  // ---- V0.1.00 需求①：航点隔离与任务级兜底 ----
+  double wp_isolation_cooldown_{120.0};   // 临时隔离冷却（s），到期后自动重新接受该航点
+  int max_consec_failures_{12};           // 任务级连续失败上限（无任何成功到达时），达上限进 FAULT 自愈
+
+  // ---- V0.1.00 需求②：近身假障碍诊断（激光 + 相机 vs 代价地图） ----
+  bool self_check_enable_{true};
+  double self_check_margin_{0.35};        // 车身框外扩监视边距（m）——"车身四周"
+  double self_check_box_front_{0.45};     // 车身框前缘（base_link x，与 nav2 footprint 一致）
+  double self_check_box_rear_{0.37};      // 车身框后缘（base_link -x）
+  double self_check_box_half_width_{0.32};  // 车身框半宽（base_link |y|）
+  int self_check_cost_min_{99};           // 代价地图"占据"阈值（Nav2 转换表：99=内切、254→100=致命）
+  int self_check_confirm_count_{3};       // 连续判定次数（防抖，避免单帧噪声触发清图）
+  double self_check_interval_{5.0};       // NAVIGATING 中周期巡检间隔（s）
+  double self_check_data_timeout_{1.0};   // 代价地图/里程计/激光目标新鲜度阈值（s）
+  std::string local_costmap_topic_{"/local_costmap/costmap"};
+  std::string lidar_objects_topic_{"/perception/lidar_objects"};
+  std::string vision_objects_topic_{"/perception/vision_objects"};
+
+  // ---- V0.1.00 需求③：地图可达性（连通域） ----
+  bool reachability_enable_{true};
+  double reach_clearance_{0.35};          // 连通域可通行格的最小净空（m，≈内切半径 0.32+余量）
+  double reach_recompute_dist_{0.5};      // 车位移动超此距离才重建连通域（节流）
+  int reach_bfs_max_cells_{400000};       // BFS 预算上限（超限被截断 ⇒ 不可达结论放行）
+
+  // ---- V0.1.00 需求④：FAULT 自愈 ----
+  bool fault_auto_recover_{true};
+  double fault_hold_time_{20.0};          // 进 FAULT 后首次自愈检查前的静置时长（s）
+  double fault_retry_interval_{30.0};     // 自愈重试基础间隔（s），随轮次递增
+  double fault_retry_max_interval_{180.0};  // 自愈重试间隔上限（s）
+  int max_mission_recoveries_{5};         // 超此轮次后仅放慢重试频率并给人工介入结论（不永久锁死）
 
   // ---- 建图模式自动巡航参数 ----
   std::string params_file_;              // autonomous_nav_params.yaml 路径（launch 传入，供热重载）

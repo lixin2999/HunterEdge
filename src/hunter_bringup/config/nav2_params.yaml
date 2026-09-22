@@ -276,6 +276,15 @@ local_costmap:
     ros__parameters:
       update_frequency: 10.0                   # V0.0.82：原 5.0，高速/贴近障碍场景更快反应
       publish_frequency: 5.0                   # 原 2.0
+      # V0.1.00 新增：auto_mission 的"车身四周/脚底假障碍占位"诊断（需求②）订阅
+      # /local_costmap/costmap（nav_msgs/OccupancyGrid 整图）。Costmap2DPublisher
+      # 默认只在"窗口几何变化"时发整图、平时只发 *_updates（见
+      # nav2_costmap_2d/src/costmap_2d_publisher.cpp 的 publishCostmap()），而车辆
+      # 停驻待诊断时恰恰是"几何不变、只有代价变化"的场景 → 不开本项则诊断永远收到
+      # 过期图，假障碍判据失效。开销：200×200 格 @5Hz ≈ 0.2 MB/s（本机 DDS，可忽略）。
+      # ⚠ 关闭此项时 self_check_enable 的诊断结论会自动降级为"数据过期·不可判定"，
+      #   不会误判，但也不会再自动清图。
+      always_send_full_costmap: true
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
