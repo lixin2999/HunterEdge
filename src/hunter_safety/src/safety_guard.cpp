@@ -1,12 +1,17 @@
 // Copyright 2026 HUNTER Development Team
-// safety_guard — 碰撞防护与运动学安全约束节点（V0.0.87）
+// safety_guard — 碰撞防护与运动学安全约束节点（V0.0.98）
 //
 // 定位：串联在 velocity_smoother 与底盘（hunter_base 订阅 /cmd_vel）之间的
 // 【最后一道物理安全闸】，独立于感知融合链（直接消费 /scan），与决策层
 // （auto_mission OBSTACLE_AVOID/ESTOP）、模式仲裁（decision_making）
 // 互为冗余。职责：
-//   1. 碰撞闸：/scan 行进方向扇区最近障碍 < stop_dist → 立即零速；
-//      < slow_dist → 线性限速（碰撞预警分级 SLOWDOWN/COLLISION_STOP）
+//   1. 碰撞闸（V0.0.98 轨迹扫掠弧）：不再按"直线矩形走廊"判净空，而是把
+//      实际指令 (v,w) 积分成阿克曼预测轨迹（前 reaction_lag 秒直线 + 其后
+//      圆弧），扫描弧带扫掠区域到最近障碍的弧长距离 < stop_dist → 立即零速；
+//      < slow_dist → 线性限速（碰撞预警分级 SLOWDOWN/COLLISION_STOP）。
+//      静止/低速时退回直线走廊判据。旧直线走廊与阿克曼绕障弧线互斥——
+//      绕障横移期间直线投影恒有障碍，车被自己的安全闸按停（V0.0.97 现场
+//      "净空 0.569m 急停 0.1s 即释放→满舵死磕"的根源）
 //   2. 感知 fail-safe：/scan 超时或从未到达 → 零速（宁可停车不盲走）
 //   3. 急停透传：/estop=true → 零速（decision_making 只停任务调度，
 //      Nav2 goal 取消存在延迟，此处在速度指令通道兜底）
@@ -107,6 +112,16 @@ public:
     declare_parameter<double>("slow_release_hysteresis", 0.20);  // 退出 SLOWDOWN 滞环（m）
     declare_parameter<int>("min_obstacle_points", 3);            // 走廊内最少回波点数
     declare_parameter<double>("obstacle_cluster_span", 0.25);    // 最近回波簇纵向跨度（m）
+    // V0.0.98 轨迹扫掠弧碰撞闸（"精确计算转向角度/速度以绕障"的算法核心）：
+    //   reaction_lag：指令 (v,w) 的执行滞后——前 0.4s 按直线积分（转向机构/底盘
+    //     响应需时），其后才按指令角速度走圆弧。该设定使"贴到障碍跟前才打舵"
+    //     的乐观解无法骗过安全闸：直线段先撞上去即判接触。
+    //   brake_decel：弧前瞻覆盖距离所需的制动减速度，与 velocity_smoother.max_decel 一致。
+    //   vel_trust_eps：车速低于此值时不信任"弧意图"（静止时按直线走廊评估），
+    //     防止"停着时也判净空=∞→立即放行"的抖动。
+    declare_parameter<double>("reaction_lag", 0.4);              // 指令执行滞后（s）
+    declare_parameter<double>("brake_decel", 1.5);               // 制动减速度（m/s²）
+    declare_parameter<double>("vel_trust_eps", 0.03);            // 弧判据最低车速（m/s）
     declare_parameter<double>("scan_timeout", 0.5);        // /scan 超时（s）
     declare_parameter<double>("cmd_timeout", 0.5);         // 上游指令超时（s）
     declare_parameter<double>("control_rate", 20.0);       // 主循环频率（Hz）
@@ -146,6 +161,9 @@ public:
     slow_release_hysteresis_ = get_parameter("slow_release_hysteresis").as_double();
     min_obstacle_points_ = get_parameter("min_obstacle_points").as_int();
     obstacle_cluster_span_ = get_parameter("obstacle_cluster_span").as_double();
+    reaction_lag_ = get_parameter("reaction_lag").as_double();
+    brake_decel_ = get_parameter("brake_decel").as_double();
+    vel_trust_eps_ = get_parameter("vel_trust_eps").as_double();
     scan_timeout_ = get_parameter("scan_timeout").as_double();
     cmd_timeout_ = get_parameter("cmd_timeout").as_double();
     control_rate_ = get_parameter("control_rate").as_double();
@@ -206,6 +224,18 @@ public:
     if (obstacle_cluster_span_ <= 0.0) {
       RCLCPP_WARN(get_logger(), "obstacle_cluster_span ≤ 0，按 0.25m 处理");
       obstacle_cluster_span_ = 0.25;
+    }
+    if (reaction_lag_ < 0.0) {
+      RCLCPP_WARN(get_logger(), "reaction_lag < 0，按 0.4s 处理");
+      reaction_lag_ = 0.4;
+    }
+    if (brake_decel_ < 0.3) {
+      RCLCPP_WARN(get_logger(), "brake_decel=%.2f 过小（弧前瞻会爆炸），按 1.5m/s² 处理", brake_decel_);
+      brake_decel_ = 1.5;
+    }
+    if (vel_trust_eps_ < 0.01) {
+      RCLCPP_WARN(get_logger(), "vel_trust_eps=%.3f 过小，按 0.03m/s 处理", vel_trust_eps_);
+      vel_trust_eps_ = 0.03;
     }
     if (!enable_map_fence_) {
       RCLCPP_WARN(get_logger(),
@@ -324,6 +354,8 @@ public:
       "扇区±%.0f°, scan超时%.2fs；"
       "释放滞环=+%.2f/+%.2f m（退 STOP/退 SLOWDOWN，消除阈值抖振）；"
       "幽灵点门控=≥%d 点/±%.2fm（少于则判孤立噪点忽略）；"
+      "V0.0.98 轨迹扫掠弧=行进中启用（v>%.2fm/s 时按指令(v,w)积分判净空，静止用直线走廊；"
+      "反应滞后%.1fs，制动%.1fm/s²，前瞻=slow+v²/2a+0.3m≤3m）；"
       "测试模式=%s（限速%.2fm/s, 急停%.1fm, 减速%.1fm, 卡死判定%.1fs, 断流判定%.1fs）；"
       "地图边界监护=%s（停车%.2fm, 减速%.2fm，/map+/relocalization/pose 就绪后生效）",
       max_linear_vel_, min_turn_radius_, stop_dist_, slow_dist_,
@@ -331,6 +363,7 @@ public:
       self_margin_, sector_half_rad_ * 180.0 / M_PI, scan_timeout_,
       stop_release_hysteresis_, slow_release_hysteresis_,
       min_obstacle_points_, obstacle_cluster_span_,
+      vel_trust_eps_, reaction_lag_, brake_decel_,
       test_mode_ ? "ON" : "OFF",
       test_max_linear_vel_, test_stop_dist_, test_slow_dist_,
       stall_timeout_, plan_fail_timeout_,
@@ -472,6 +505,137 @@ private:
     // 由 SCAN_TIMEOUT 看门狗、costmap 的 scan 清障层与 health_monitor 兜底。
   }
 
+  // V0.0.98 轨迹扫掠弧净空（"精确计算转向角度/速度以绕障"的算法核心）：
+  // 把指令 (v,w) 按阿克曼运动学积分成候选轨迹——前 reaction_lag_ 秒按直线行进
+  //   （转向机构/底盘响应需时，"贴到障碍跟前才打舵"的规避解在直线段即判接触），
+  //   其后按指令角速度走圆弧（|w| 钳制到 |v|/R_min，与第 7 步曲率钳制一致，
+  //   物理不可执行的弧不予采信）。
+  // 输出与直线走廊同量纲：d_arc = 首次接触时已行驶弧长 + 行进方向车体边缘到
+  //   中心的距离（把"弧上何时撞上"折算回"当前纵向等价净空"，STOP/SLOWDOWN
+  //   阈值与滞环无需任何改动即可复用）。
+  // 候选点筛选不再限扇区半角：绕障弧线会侧向扫到初始角度 60°+ 的障碍
+  //   （墙角/桌角），按"扫掠域内接圆盒"粗选（斜边长 ≤ s_need 的矩形）。
+  // 幽灵点门控：接触后 0.2s 窗口内累计接触点数 < min_obstacle_points_ 判孤立
+  //   噪点（真障碍碰盒角必有连续多点），d_arc 保持 +inf 不参与制动。
+  // 返回 false = /scan 缺失或超时（与 corridorClearance 同语义）。
+  // 算力：候选点 ≤ 扫掠域内回波 × 积分步 ≤ 60（darc=5cm，前瞻 ≤3m，与车速无关），
+  //   每拍 ≤ 2.2万次盒内判定（若干乘加），20Hz 下 <2% 单核——远低于被砍的
+  //   MPPI batch 开销。
+  bool sweptArcClearance(
+    double v, double w, double slow_d, double & s_contact, int & hit_pts)
+  {
+    s_contact = std::numeric_limits<double>::infinity();
+    hit_pts = 0;
+    // 锁内拷贝扫描快照（与 corridorClearance 同样的并发约定）
+    sensor_msgs::msg::LaserScan scan;
+    {
+      std::lock_guard<std::mutex> lk(data_mutex_);
+      if (!scan_received_ || (now() - last_scan_time_).seconds() > scan_timeout_) {
+        return false;
+      }
+      scan = last_scan_;
+    }
+
+    // 车体包络盒（含 self_margin 外扩）：在"航向系"（+x=行进方向）下积分，
+    //   lead_edge=沿行进方向车体边缘，trail_edge=其反方向边缘
+    const double front = footprint_front_ + self_margin_;
+    const double rear = footprint_rear_ + self_margin_;
+    const double half = footprint_half_width_ + self_margin_;
+    const bool forward = (v >= 0.0);
+    const double lead_edge = forward ? front : rear;    // 沿行进方向车体边缘
+    const double trail_edge = forward ? rear : front;   // 逆行进方向车体边缘
+
+    // 前瞻弧长：slow 线 + 本车速制动距离 + 0.3m 余量，上限 3m（≈低速 4s，
+    //   与 MPPI 预测时域同量级；更远处下一拍会重新评估，无需一次扫完）
+    const double speed = std::fabs(v);
+    const double s_need = std::min(
+      slow_d + speed * speed / (2.0 * std::max(brake_decel_, 0.1)) + 0.3, 3.0);
+
+    // 指令角速度钳制：与第 7 步阿克曼曲率钳制同式，保证评估的弧真实可执行
+    const double w_lim = speed / min_turn_radius_;
+    const double w_cmd = std::clamp(w, -w_lim, w_lim);
+
+    // 候选回波 → 航向系坐标（倒车时以 -x 为"行进前方"），按扫掠域盒粗选
+    std::vector<std::pair<double, double>> pts;
+    pts.reserve(scan.ranges.size());
+    double angle = static_cast<double>(scan.angle_min);
+    for (const float r : scan.ranges) {
+      const double rr = static_cast<double>(r);
+      const double a = angle;
+      angle += static_cast<double>(scan.angle_increment);
+      if (!std::isfinite(rr) ||
+        rr < static_cast<double>(scan.range_min) ||
+        rr > static_cast<double>(scan.range_max))
+      {
+        continue;
+      }
+      const double gpx = rr * std::cos(a);   // base_link 系
+      const double gpy = rr * std::sin(a);
+      const double px = forward ? gpx : -gpx;  // 航向系：+x = 行进方向
+      const double py = forward ? gpy : -gpy;
+      // 扫掠域粗选：弧任一点的相对位置必落在该盒内
+      if (px > -(trail_edge + 0.05) && px < s_need + lead_edge + 0.05 &&
+        std::fabs(py) < half + s_need)
+      {
+        pts.emplace_back(px, py);
+      }
+    }
+    if (pts.empty()) {
+      return true;                          // 扫掠域无障碍：净空 = inf
+    }
+
+    // 轨迹积分（按弧长等步长，darc=5cm → 步数恒 ≤ s_need/0.05 ≤ 60，与车速无关）：
+    // 位姿 (X,Y,θ) 在航向系下描述当前车位；航向系始终以速度方向为 +x
+    //   （前进/倒车皆然，倒车时航向系基座旋转 π，速度方向变化率仍为 w）；
+    // 每步把候选点变换进步中车体系做包络盒接触判定；反应滞后期内
+    //   （已行驶弧长 ≤ speed×reaction_lag_）w=0 直行。
+    const double darc = 0.05;
+    const int steps = std::max(1, static_cast<int>(std::ceil(s_need / darc)));
+    const double s_lag = speed * reaction_lag_;          // 滞后对应的直线弧长
+    const double s_tail = std::max(0.2 * speed, 0.1);    // 幽灵点续扫弧长窗口
+    double X = 0.0, Y = 0.0, th = 0.0, arc = 0.0;
+    int first_hit_step = -1;
+    double first_hit_arc = 0.0;
+    std::vector<char> touched(pts.size(), 0);
+    for (int i = 1; i <= steps; ++i) {
+      const double w_eff = (arc + darc <= s_lag) ? 0.0 : w_cmd;
+      X += darc * std::cos(th);
+      Y += darc * std::sin(th);
+      th += w_eff * darc / std::max(speed, 0.05);          // dθ = w·dt = w·darc/v
+      arc += darc;
+      const double ct = std::cos(th), st = std::sin(th);
+      int step_hits = 0;
+      for (size_t k = 0; k < pts.size(); ++k) {
+        const double dx = pts[k].first - X;
+        const double dy = pts[k].second - Y;
+        const double lx = dx * ct + dy * st;      // 步中车体系纵向（行进方向）
+        const double ly = -dx * st + dy * ct;     // 步中车体系横向
+        if (lx <= lead_edge && lx >= -trail_edge && std::fabs(ly) <= half) {
+          if (!touched[k]) {
+            touched[k] = 1;
+            ++hit_pts;
+          }
+          ++step_hits;
+        }
+      }
+      if (step_hits > 0) {
+        if (first_hit_step < 0) {
+          first_hit_step = i;
+          first_hit_arc = arc;
+          s_contact = arc + lead_edge;            // 折算回"纵向等价净空"
+        }
+        if (arc - first_hit_arc >= s_tail) {
+          break;                                   // 续扫窗口足够判簇，提前终止
+        }
+      }
+    }
+    // 幽灵点门控（弧版）：接触簇点数不足 → 噪点放行（诊断日志由 tick 打）
+    if (std::isfinite(s_contact) && hit_pts < min_obstacle_points_) {
+      s_contact = std::numeric_limits<double>::infinity();
+    }
+    return true;
+  }
+
   void publishCmd(double v, double w)
   {
     geometry_msgs::msg::Twist out;
@@ -565,6 +729,12 @@ private:
     }
 
     // 4. 按行进方向取最近障碍（指令快照在锁内取，避免回调并发撕裂）
+    //    V0.0.98 双判据：静止/低速（|v|≤vel_trust_eps）用直线走廊净空；
+    //    行驶中（见 4.7）改按实际指令 (v,w) 的轨迹扫掠弧净空【替换】直线走廊——
+    //    不能取两者最小：绕障横移期间直线投影恒有障碍，取小等于回到
+    //    V0.0.97 "车被自己的安全闸按停"的几何死锁。静止时保留直线判据防抖
+    //    （避免"停着时弧净空=∞→放行→带舵起步撞上去"的极限环）；直线走廊的
+    //    横向/点数诊断量 y_lat/cluster_pts 两种状态下都照常刷新。
     double v_in = 0.0, w_in = 0.0;
     {
       std::lock_guard<std::mutex> lk(data_mutex_);
@@ -572,6 +742,7 @@ private:
       w_in = last_cmd_.angular.z;
     }
     const bool forward = v_in >= 0.0;
+    const bool moving = std::fabs(v_in) > vel_trust_eps_;
     double dist = 0.0;
     double y_lat = 0.0;
     double raw_x = 0.0;
@@ -621,8 +792,28 @@ private:
       }
     }
 
+    // 4.7 V0.0.98 行驶中扫掠弧判据：按实际指令 (v,w) 积分的候选轨迹评净空，
+    //   替换（非取小）直线走廊——阿克曼绕障必须横移离开直线走廊
+    //   （提前转向距离 s ≥ √(2R·c) ≈ 1.33m），旧直线判据把所有合法绕障弧
+    //   误拦为"碰撞"（V0.0.97 现场满舵死磕的直接成因）。需要 slow_d 定前瞻
+    //   距离，故放在盲区强制之后。
+    if (moving) {
+      double d_arc = std::numeric_limits<double>::infinity();
+      int arc_pts = 0;
+      if (!sweptArcClearance(v_in, w_in, slow_d, d_arc, arc_pts)) {
+        publishCmd(0.0, 0.0);
+        transition(State::SCAN_TIMEOUT, "/scan 在弧净空评估期间超时，fail-safe 停车");
+        return;
+      }
+      dist = d_arc;
+      if (std::isfinite(d_arc)) {
+        cluster_pts = arc_pts;   // 日志"回波点"改报弧接触簇点数（诊断更对口）
+      }
+    }
+
     // 5. 碰撞闸分级：急停 → 线性限速 → 放行
-    //    dist 为走廊内最小纵向净空（x），非斜距，与制动距离同一量纲
+    //    dist 为本拍采纳的净空判据：静止=直线走廊；行驶=轨迹扫掠弧（V0.0.98）；
+    //    均为沿行进方向的纵向/弧长等价距离，非斜距，与制动距离同一量纲
     //    V0.0.95 释放滞环：进入用 stop_dist/slow_dist，退出用 +release_hysteresis。
     //    实测（V0.0.94 现场日志）净空在阈值附近 ±6mm 抖动时，旧实现每 0.1~0.2s
     //    在 SLOWDOWN↔COLLISION_STOP 间往返切换（56s 内 47 次状态转移），速度被
@@ -640,13 +831,14 @@ private:
     std::string detail = std::string("正常放行") + test_tag;
     State next = State::OK;
     const std::string echo_info = "，回波点 " + std::to_string(cluster_pts);
+    const std::string gate = moving ? "扫掠弧净空" : "直线走廊净空";
     if (dist < stop_d || (stop_engaged && dist < stop_release)) {
       publishCmd(0.0, 0.0);
       const std::string held = (dist >= stop_d)
         ? "，滞环保持（释放阈值 " + std::to_string(stop_release).substr(0, 4) + "m）"
         : "";
       transition(State::COLLISION_STOP,
-        "行进方向走廊净空 " + std::to_string(dist).substr(0, 5) +
+        gate + " " + std::to_string(dist).substr(0, 5) +
         "m（侧偏 " + std::to_string(y_lat).substr(0, 5) + "m" + echo_info + "）< 急停距离 " +
         std::to_string(stop_d).substr(0, 4) + "m" + held + test_tag);
       return;
@@ -658,7 +850,7 @@ private:
       const std::string held = (dist >= slow_d)
         ? "，滞环保持（释放阈值 " + std::to_string(slow_release).substr(0, 4) + "m）"
         : "";
-      detail = "行进方向走廊净空 " + std::to_string(dist).substr(0, 5) +
+      detail = gate + " " + std::to_string(dist).substr(0, 5) +
         "m（侧偏 " + std::to_string(y_lat).substr(0, 5) + "m" + echo_info + "），限速 " +
         std::to_string(v_allow).substr(0, 5) + "m/s" + held + test_tag;
     }
@@ -947,6 +1139,10 @@ private:
   int min_obstacle_points_{3};
   double obstacle_cluster_span_{0.25};
   bool blind_zone_warned_{false};   // 盲区参数矛盾仅告警一次
+  // V0.0.98 轨迹扫掠弧碰撞闸
+  double reaction_lag_{0.4};        // 指令执行滞后（s）
+  double brake_decel_{1.5};         // 制动减速度（m/s²，与 velocity_smoother 一致）
+  double vel_trust_eps_{0.03};      // 弧判据最低车速（m/s）
   double scan_timeout_{0.5};
   double cmd_timeout_{0.5};
   double control_rate_{20.0};

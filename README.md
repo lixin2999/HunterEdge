@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V1.9（开发指南，对应软件基线 V0.0.97：V0.0.96（航点占据/净空校验、位姿净空告警、受阻判据改推进量、ABORT 但已到达判完成、恢复池首位受限倒车、相机 `initial_reset`）经实车验证**全部生效**（相机恢复 30fps 出图、占位航点 (5.0,0.0) 被净空校验拒绝、`Running backup` 后真实后退）之后，修复**最后两个瓶颈**：① **阿克曼绕障几何死锁**（R_min 1.9m 要求“提前转向距离 ≥1.33m”，而碰撞闸 1.0m 在车能转向之前就按停 + MPPI `vx_min=0` 禁倒车 → 满舵 0.386rad 死磕 20s → `Failed to make progress` 循环）：安全层 `stop_dist 1.0→0.90`、`slow_dist 1.8→1.40`、`range_min 0.8→0.70`（维持盲区一致性）+ **放开控制器/规划器低速倒车**（MPPI `vx_min=-0.20`、`PreferForwardCritic 5.0→1.5`、Smac `REEDS_SHEPP`、`reverse_penalty 2.0→1.5`）；② **过期 goal 结果污染任务状态**（本节点取消后的旧结果以 ABORTED 返回 → 被当成新航点失败、一次受阻连跳 2 点 → FAULT 误锁存；且 `goal_handle_` 被旧结果清空 → 取消失效 → FAULT 后车辆仍满舵/倒车机动 10 分钟）：新增 **goal 世代号（epoch）** 门控 + `cancelCurrentGoal()` 判据放宽 + `goalResponseCallback` 持锁调用 `enterFault` 的自死锁修复；③ 任务层受阻判据加**绕障机动宽容**（`stall_path_allow_m` 1.0m）、`already_reached_dist 0.30→0.35`；④ 感知链饥饿处置（相机帧率 30→15fps、`footprint_clearing_enabled` 显式固化））
+> **文档版本**：V2.0（开发指南，对应软件基线 V0.0.98：V0.0.97（几何死锁修复：`stop_dist 0.90`/`slow_dist 1.40`/`range_min 0.70` + MPPI 放开倒车 + Smac `REEDS_SHEPP` + goal 世代号）经实车验证已消除“满舵死磕”，但车辆**仍**绕不开障碍物——本版修复第二层根因：① **安全层与避障层互斥（主因）**：旧碰撞闸把 (v,w) 指令只按行进方向**直线投影**求净空，绕障弧起点必落在走廊内 → MPPI 每生成绕障轨迹执行 0.1~0.3s 即被按停（“能规划、能出弧、就是走不出去”）——**V0.0.98 safety_guard 轨迹扫掠弧（swept-arc）碰撞闸**：行进中按指令积分真实阿克曼轨迹（前 `reaction_lag 0.4s` 直线、其后圆弧 |w|≤v/1.9、弧长等步长 5cm）+ 车体包络盒扫掠，输出与走廊同量纲的纵向等价净空，“绕得开就放行、真撞才拦”（新参 `reaction_lag 0.4`/`brake_decel 1.5`/`vel_trust_eps 0.03`）；② **MPPI 预测时域/critic 重标定**：时域 1.5s→**4.0s**（`50×0.08`，旧值 @0.25m/s 仅前瞻 0.38m 看不到绕障弧）、`batch_size 700`、`CostCritic 3→6`、`PathAlign 14→8`+`occupancy_ratio 0.05→0.15`（旧值使合理离径被饱和惩罚）；③ **取消竞态残留**：`Goal was canceled` 后 2ms 即发新 goal → 被旧 BT 失败状态波及 ABORTED → 新增 **`goal_cancel_settle_time 2.0s` 静置门控**；④ /scan 链降载（`angle_increment 1.0°` 360 束、`transform_tolerance 0.3`、`expected_update_rate 0.25`）。历史：V0.0.96（航点净空校验、恢复池倒车）、V0.0.97（绕障几何 + 世代号）修复均已实车验证生效）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -466,8 +466,9 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 >    原地转向，MPPI 会持续打满转向（日志 `set steering angle: ±0.386428 rad` 即曲率钳制上限
 >    对应的最大内轮转角）而纵向零进挪，ProgressChecker(0.1m/10s) 必判 `Failed to make progress`；
 > ② **受阻（stall）检测**：goal 在途且朝目标推进量 < `stall_move_eps`(0.15m) 持续 `stall_detect_time`(25s)
->    → 明确判“前方障碍无法绕行/航点无可达路径”，立即取消本 goal 并换点（连续 3 次 → FAULT 锁存），
->    日志给出可判读结论，避免“原地抖动 90s 后静默换点”。
+>    → 明确判“前方障碍无法绕行/航点无可达路径”，取消本 goal 并换点（连续 3 次 → FAULT 锁存），
+>    日志给出可判读结论，避免“原地抖动 90s 后静默换点”。（V0.0.97 补：累计行程 ≥ `stall_path_allow_m` 1.0m
+>    视为绕障机动中不判受阻；V0.0.98 补：换点重发经 `goal_cancel_settle_time` 静置门控，不再取消后 2ms 立即重发）
 >
 > **V0.0.96 任务层第三条防线 + 到达语义修正**：
 > ③ **航点占据栅格 + 净空校验**（`waypoint_clearance_m` 0.50m）：发送前拒绝“落在静态地图障碍上/其
@@ -490,7 +491,9 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 | `loop_waypoints` | `true` | 完成所有航点后是否循环 |
 | `goal_timeout` | 45 s | 单点导航超时（**V0.0.95 90→45**：受阻由 `stall_detect_time` 25s 内提前定性，本超时只兜底“缓慢但可达”的航点） |
 | `obstacle_wait_timeout` | 30 s | 障碍物等待超时后触发 ESTOP |
-| `already_reached_dist` | 0.30 m | **V0.0.95 新增**：航点“已到达”判定半径。航点与当前 map 系位姿距离 ≤ 此值时视为已完成并**跳过不发 goal**（修“目标=自身”退化 goal 死锁）。须 > 阿克曼停车精度且 ≥ 2× Nav2 `xy_goal_tolerance`(0.10m)。全部航点均在此半径内 → FAULT 锁存 |
+| `already_reached_dist` | 0.35 m | **V0.0.95 新增；V0.0.97 由 0.30 上调**：航点“已到达”判定半径。航点与当前 map 系位姿距离 ≤ 此值时视为已完成并**跳过不发 goal**（修“目标=自身”退化 goal 死锁；0.304m 退化目标实例）。须 > 阿克曼停车精度且 ≥ 2× Nav2 `xy_goal_tolerance`(0.10m)，不宜 >0.4m。全部航点均在此半径内 → FAULT 锁存 |
+| `stall_path_allow_m` | 1.0 m | **V0.0.97 新增**：绕障机动宽容——自本 goal 发出起**累计行程** ≥ 此值即视为“多点掉头/倒车绕障中”，即使净推进 <`stall_move_eps` 也不判受阻（放开倒车后正常绕障是“倒 0.4m→进 0.5m→再倒”多段机动，净推进可长期偏小）；兜底 `goal_timeout` 45s |
+| `goal_cancel_settle_time` | 2.0 s | **V0.0.98 新增**：取消静置门控。本节点主动 cancel 旧 goal 后换点重发前等待旧结果收敛（CANCELED/ABORTED 先到即提前放行，超时兜底）——消除日志实证的“取消后 2ms 即发新 goal → 新 goal 被旧 BT 失败状态波及 ABORTED → fail_count 误累积→ FAULT”；<0.5 强制回 2.0，不建议 >5s；配套：`ABORTED + 本节点主动取消` 不计失败不换点 |
 | `stall_detect_time` | 25 s | **V0.0.95 新增**：受阻判定时长。goal 在途且朝目标推进停滞 → 判“前方障碍无法绕行/航点无可达路径”，取消本 goal 并换点。须 > 一轮 Nav2 恢复周期（ProgressChecker 10s + 清图 + 受限倒车脱困） |
 | `stall_move_eps` | 0.15 m | **V0.0.95 新增**：受阻判定位移下限（>2× 定位抖动）。**V0.0.96 判据改“朝目标推进量”**（= 发 goal 时到航点距离 − 当前距离）——倒车脱困会增大到目标距离（推进量为负）仍判受阻，位移标量会被“后退”骗过 |
 | `waypoint_clearance_m` | 0.50 m | **V0.0.96 新增**：航点距最近**占据栅格**的最小净空。航点为占据栅格 / 净空不足 → 发送前拒绝并跳过（日志给实测值），全部被拒 → FAULT。必须 > Nav2 内切半径（footprint 半宽 0.32m）；必要性：滚动局部代价地图不含 static_layer，MPPI 不会避开仅存在于静态地图中的障碍，会把车开到该点，随后 Smac 持续报 `Starting point in lethal space!`（清图无效——`StaticLayer::reset()` 只置 `has_updated_data_` 并重新盖章） |
@@ -522,10 +525,11 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 
 | 能力 | 触发条件 | 动作 |
 |------|----------|------|
-| 碰撞急停 | 前方安全走廊（\|y\| ≤ corridor_half_width 0.45m）内**纵向净空** < stop_dist(0.90m，**V0.0.97 由 1.0 重标定**，依据见 Deployment_Guide §5.5.1：必须 < 阿克曼绕障“提前转向距离”1.33m，否则车在能转向之前被按停 = 几何死锁)；**V0.0.95 起带释放滞环**（恢复到 stop+0.25m 才放行） | 立即零速 COLLISION_STOP |
-| 碰撞限速 | 走廊纵向净空 < slow_dist(1.40m，**V0.0.97 由 1.8 重标定**，取“转向提前量 1.33m”量级，进入可转向区即已限速到 ≈0.3m/s)；**V0.0.95 起带释放滞环**（恢复到 slow+0.20m 才全速） | 线性限速至 max×(d−stop)/(slow−stop)，SLOWDOWN |
+| 碰撞急停（**V0.0.98 双判据**） | 行进中（\|v\|>0.03m/s）按**轨迹扫掠弧净空**、静止/蠕行按**直线走廊净空** < stop_dist(0.90m，**V0.0.97 由 1.0 重标定**，依据见 Deployment_Guide §5.5.1：必须 < 阿克曼绕障“提前转向距离”1.33m)；**V0.0.95 起带释放滞环**（恢复到 stop+0.25m 才放行） | 立即零速 COLLISION_STOP（日志标注净空来源「扫掠弧/直线走廊」） |
+| 碰撞限速（**V0.0.98 双判据**） | 同上判据 < slow_dist(1.40m，**V0.0.97 由 1.8 重标定**，取“转向提前量 1.33m”量级，进入可转向区即已限速到 ≈0.2~0.3m/s——恰为绕障带速)；**V0.0.95 起带释放滞环**（恢复到 slow+0.20m 才全速） | 线性限速至 max×(d−stop)/(slow−stop)，SLOWDOWN |
+| **轨迹扫掠弧碰撞闸（V0.0.98 核心）** | 行进中把指令 (v,w) 按阿克曼运动学积分真实轨迹（前 `reaction_lag` 0.4s 直线、其后圆弧 \|w\|≤\|v\|/1.9，弧长等步长 5cm、前瞻 ≤3m），车用包络盒（半宽 0.44m）逐步扫掠求首次接触，输出与走廊**同量纲**的纵向等价净空 | **绕得开就放行、真撞才拦**——修 V0.0.97 后“MPPI 能出绕障弧但被执行 0.1~0.3s 就被直线走廊闸按停”的安全/避障互斥死锁；⚠ 不能改回“弧/走廊取小”（取小即回到 V0.0.97 死锁）；静止/蠕行（≤`vel_trust_eps` 0.03）仍用走廊防抖，/scan 断流 fail-safe 回退走廊+SCAN_TIMEOUT |
 | **阈值抖振抑制（V0.0.95）** | 净空在阈值附近微抖（实测 ±6mm：0.991↔1.006m） | 释放滞环使状态**不再每 0.1~0.2s 往返切换**（旧实现 56s 内 47 次 SLOWDOWN↔COLLISION_STOP，速度被反复归零 → 车“抖动不前进”+ 日志刷屏）；状态转移日志附带“滞环保持（释放阈值 X.XXm）” |
-| **幽灵点门控（V0.0.95）** | 走廊内最近回波纵向 ±`obstacle_cluster_span`(0.25m) 内回波点数 < `min_obstacle_points`(3) | 判为孤立噪点（单束噪声/玻璃反光/雨雾），不作为刹车依据，2s 节流 WARN 输出诊断；真障碍必有数点以上回波（可调 2，设 1 即恢复旧行为） |
+| **幽灵点门控（V0.0.95；V0.0.98 同弧生效）** | 判据源（走廊/弧）内最近回波纵向 ±`obstacle_cluster_span`(0.25m) 内回波点数 < `min_obstacle_points`(3)；弧判据下为接触后 0.2s×speed 弧长窗口内累计接触点 <3 | 判为孤立噪点（单束噪声/玻璃反光/雨雾），不作为刹车依据，2s 节流 WARN 输出诊断；真障碍必有数点以上回波（可调 2，设 1 即恢复旧行为） |
 | 盲区一致性强制（V0.0.91；**V0.0.97 参数重标定**） | 配置的 stop_dist ≤ /scan `range_min`+0.15（急停区落在感知盲区内） | 运行时强制抬升到 range_min+0.15 并一次性 ERROR 告警修参数（撞墙事故根因：range_min 0.8 > stop_dist 0.5）。**V0.0.97：`range_min 0.8→0.70`、`stop_dist 1.0→0.90`（0.70+0.15=0.85 < 0.90 ✔）；⚠ `range_min` 不得 < 0.65——V0.0.88 实测车体自反射可达 ~0.6m，再降自反射会变成“永久障碍”把车钉住** |
 | 感知 fail-safe | /scan 超时 0.5s 或未到达 | 零速（宁可停车不盲走）SCAN_TIMEOUT |
 | 指令看门狗 | 上游速度指令断流 >0.5s | 零速心跳 CMD_TIMEOUT |
@@ -784,6 +788,7 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | **相机仍 0Hz（V0.0.96 已将 `initial_reset` 置 true 仍复现）** | 属 USB 链路级故障（供电/带宽/接触/枚举异常），非驱动参数问题 | 按 §13.8 相机条目硬件排查：D435 直连 USB3 口（勿经 HUB）、`dmesg \| grep -iE 'usb\|uvc'` 查掉线、关 USB 自动挂起、必要时更换线缆/接口。导航不受阻（`health=WARNING` 不拦 AUTO 门控），但视觉避障退化为单雷达源 |
 | **日志被 `set steering angle: x` 刷屏（20~50Hz）** | 底盘驱动（`hunter_ros2/hunter_base`，vendor 目录）在每个 `/cmd_vel` 回调 `std::cout` 打印转向角，未节流 | 分析时过滤：`grep -v 'set steering angle' /tmp/hunt7.log`；或 `scripts/hunter_log.sh` 导出后离线过滤。驱动属 vendor 代码（git-ignored），不建议直接改 |
 | 一次性 `[TensorRT] Using an engine plan file across different models of devices` | `.engine` 非本机/本设备型号生成（换机或文件被旧引擎覆盖） | 不阻塞运行（话题 15Hz 正常）；目标机重生成：`trtexec --onnx=<绝对路径>/yolov8s.onnx --saveEngine=/data/models/yolov8s.engine --fp16` 后重启视觉节点 |
+| **已升 V0.0.97 后仍绕不开障碍：不再满舵死磕，但带转向的绕障轨迹每执行 0.1~0.3s 即被 `COLLISION_STOP（行进方向走廊净空 …）` 清零，车在 stop/slow 间往复抖振（V0.0.98 已修）** | 旧碰撞闸把 (v,w) 只按行进方向直线投影求净空，忽略 w 的横移避让分量——绕障弧起点必落在走廊内，安全层反过来封死避障层 | 升级 `hunter_safety`（轨迹扫掠弧碰撞闸，README §10.8 / Deployment_Guide §5.5.1(5)）+ `hunter_bringup`（MPPI 4.0s 时域）；验收：启动日志 `V0.0.98 轨迹扫掠弧=行进中启用`、行进中拦停措辞「扫掠弧净空」；配套 `auto_mission` 取消静置门控消除换点误判 FAULT |
 | Ctrl+C 后 `maps/` 只有 `.pcd`，`.pgm/.yaml` 未生成（V0.0.88 前必现） | FAST-LIO2 在 `main()` 于 `spin` 返回**后**才写 PCD（20.7M 点 ≈ 664MB 需数秒至数十秒），而 Ctrl+C 同时终止 `pcd_to_map`，运行期 `MAPPING→非MAPPING` 跳变不会发生 → 原自动转换从不启动 | V0.0.88 起 `pcd_to_map` 退出时派生独立会话后台转换进程兜底：`tail -f maps/pcd_to_map_final.log`（应见 `PCD 已写完整 → 转换成功`），数十秒内 `ls -lh maps/` 应齐 `.pcd/.pgm/.yaml`；仍缺时手动兜底 `python3 ~/HunterEdge/install/auto_mission/lib/auto_mission/pcd_to_map --finalize --pcd-file ~/HunterEdge/maps/hunter_map.pcd --force` |
 
 ---
@@ -796,13 +801,13 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 |------|------|
 | 《自动驾驶车辆系统详细设计文档 V2.0》 | 本项目的设计基准；本文档全部参数、话题、CAN 协议、坐标系均可追溯至其对应章节 |
 | AI 编码任务清单 | 分模块开发任务（任务 00 ~ 任务 17），指导按模块开发与验收 |
-| `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程） |
-| `Deployment_Guide.md` | 部署操作文档 V1.8（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.0.96） |
+| `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程，**V2.0** 对应软件基线 V0.0.98） |
+| `Deployment_Guide.md` | 部署操作文档 V2.0（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.0.98） |
 | `release.md` | 版本历史（V0.0.1 ~ 当前），记录每版主要功能与修复 |
 
 > **追溯原则**：本 README 中所有硬件参数（§2）、软件版本（§3）、话题（§8）、控制模式（§9）、限制（§13）均源自《自动驾驶车辆系统详细设计文档 V2.0》，未虚构功能。自主导航模块（§10）为在设计文档框架内的扩展实现。
 
 ---
 
-*HunterEdge 开发指南 · 文档版本 V1.8 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.96 现场实测修正（V0.0.89：窄小测试场地低速档；V0.0.91：走廊净空碰撞闸、`FAULT` 锁存态；V0.0.92：起步清图同步重试、行为树重规划回退 1Hz；V0.0.93：方案A 定位架构重构——TF 单一所有权、hunter_relocalization(NDT) 替代 AMCL、RPP→MPPI；V0.0.94：“开启自主巡航车辆原地不动”残余故障链彻底修复；V0.0.95：“遇到障碍物无法绕开障碍物自动驾驶”分层修复（航点“已到达”预检、阈值释放滞环、幽灵点门控、受限倒车脱困、`velocity_smoother` 倒车通道、D435 显式 profile）；V0.0.96：“行驶一小段路立即停下、不再漫游”修复——航点占据栅格 + 净空校验（`waypoint_clearance_m`）、当前位姿净空告警、受阻判据改“朝目标推进量”、“ABORT 但已到达 ⇒ 判完成”、行为树恢复池首位受限倒车脱困（治“起点格致命”类规划失败）、相机 `initial_reset: true`）*
+*HunterEdge 开发指南 · 文档版本 V2.0 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.98 现场实测修正（V0.0.93：方案A 定位架构重构；V0.0.94：“原地不动”残余故障链修复；V0.0.95：“无法绕开障碍物”分层修复；V0.0.96：“行驶一小段立即停下”修复；V0.0.97：阿克曼绕障几何死锁 + 过期 goal 修复；**V0.0.98：“V0.0.97 后仍无法绕开障碍物”第二层根因修复——safety_guard 轨迹扫掠弧碰撞闸（行进中按指令积分真实阿克曼轨迹+包络扫掠，“绕得开就放行、真撞才拦”）、MPPI 4.0s 预测时域与 critic 重标定、auto_mission 取消静置门控 `goal_cancel_settle_time`、/scan 链降载**；重编 `hunter_safety auto_mission hunter_bringup`）*
 

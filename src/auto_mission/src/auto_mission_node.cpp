@@ -181,6 +181,8 @@ void AutoMissionNode::declareParameters()
   // Nav2 就绪门控
   declare_parameter("nav_active_wait_timeout", 60.0);
   declare_parameter("nav_retry_backoff", 2.0);
+  // V0.0.98 取消静置时长：主动取消后等旧 goal 结果回传的最长时间
+  declare_parameter("goal_cancel_settle_time", 2.0);
 
   // 速度（合规性）
   declare_parameter("max_velocity", 2.0);
@@ -270,6 +272,13 @@ void AutoMissionNode::declareParameters()
   cruise_odom_timeout_    = get_parameter("cruise_odom_timeout").as_double();
   nav_active_wait_timeout_ = get_parameter("nav_active_wait_timeout").as_double();
   nav_retry_backoff_       = get_parameter("nav_retry_backoff").as_double();
+  goal_cancel_settle_time_ = get_parameter("goal_cancel_settle_time").as_double();
+  if (goal_cancel_settle_time_ < 0.5) {
+    RCLCPP_WARN(get_logger(),
+      "goal_cancel_settle_time=%.2f 过小（<0.5s 等于回到取消竞态窗口），按 2.0s 处理",
+      goal_cancel_settle_time_);
+    goal_cancel_settle_time_ = 2.0;
+  }
 
   // 最大速度合规检查（文档规定 ≤ 2.0 m/s）
   if (max_velocity_ > 2.0) {
@@ -985,7 +994,9 @@ void AutoMissionNode::mainLoop()
               enterFault("航点受阻（前方障碍无法绕行）连续达上限");
             } else {
               current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
-              sendNextWaypoint();
+              // V0.0.98：不再立即发下一个 goal —— 由取消静置门控（goal_cancel_pending_
+              //   + settle）在"无在途 goal"重发路径等旧 goal 结果回传后再发，
+              //   消除"取消后毫秒级发新 goal 被旧 BT 失败状态波及"的竞态
             }
             break;
           }
@@ -1010,7 +1021,7 @@ void AutoMissionNode::mainLoop()
             enterFault("单航点导航超时连续达上限");
           } else {
             current_wp_idx_ = (current_wp_idx_ + 1) % waypoints_.size();
-            sendNextWaypoint();
+            // V0.0.98：同上，交给取消静置门控后重发，不立即发下一个 goal
           }
           break;
         }
@@ -1040,6 +1051,25 @@ void AutoMissionNode::mainLoop()
       // 正常导航中，只在没有 goal 在飞时重新发送（防止重复发送）；
       // goal 被拒/失败后的退避窗口由 sendNextWaypoint 开头统一检查
       if (!goal_in_flight_) {
+        // V0.0.98 取消静置门控：主动取消后，bt_navigator 需时间完成旧 goal 的
+        //   取消与 BT 清理；立即发新 goal 会被同一轮失败波及（V0.0.97 现场：
+        //   取消→2ms 后发的航点[3]被接受 2ms 即 ABORTED，fail_count 假增）。
+        //   放行条件：旧 goal 结果已到 resultCallback（清 pending），或 settle
+        //   超时兜底（结果不回传：bt_navigator 重启/崩溃等场景）。
+        if (goal_cancel_pending_) {
+          const double settle_elapsed = (this->now() - goal_cancel_time_).seconds();
+          if (settle_elapsed > goal_cancel_settle_time_) {
+            goal_cancel_pending_ = false;
+            RCLCPP_WARN(get_logger(),
+              "[NAVIGATING] 取消静置超时（%.1fs，旧 goal 结果未回传），兜底恢复发送 goal",
+              goal_cancel_settle_time_);
+          } else {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+              "[NAVIGATING] 等待上一 goal 取消静置（%.1f/%.1fs，等旧结果回传），暂不发航点[%zu]",
+              settle_elapsed, goal_cancel_settle_time_, current_wp_idx_);
+            break;
+          }
+        }
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 3000,
           "[NAVIGATING] 无在途 goal，重新发送航点[%zu]", current_wp_idx_);
         sendNextWaypoint();
@@ -1632,6 +1662,7 @@ void AutoMissionNode::sendNextWaypoint()
     }
     blocked_count_ = 0;
     goal_cancel_by_mission_ = false;   // 新 goal 已发出，清除上一轮的主动取消标记
+    goal_cancel_pending_ = false;      // V0.0.98 新 goal 已发，取消静置完成
     // V0.0.97 绕障机动里程清零（受阻判据的"是否真的在动"依据）
     goal_path_len_ = 0.0;
     has_last_stall_pose_ = false;
@@ -1653,6 +1684,11 @@ void AutoMissionNode::sendNextWaypoint()
 void AutoMissionNode::cancelCurrentGoal()
 {
   std::lock_guard<std::mutex> lk(goal_handle_mutex_);
+  // V0.0.98 取消静置门控：无论是否拿到 handle，都记录"已请求取消"——
+  //   重发路径需等旧 goal 结果回传（resultCallback 清 pending）或 settle
+  //   超时，杜绝"取消后毫秒级发新 goal 被旧 BT 失败状态波及"的竞态。
+  goal_cancel_pending_ = true;
+  goal_cancel_time_ = this->now();
   // V0.0.97：判据由 "goal_handle_ && goal_in_flight_" 放宽为 "goal_handle_ 非空"。
   //   旧写法在"句柄已拿到、但 resultCallback 已把 goal_in_flight_ 置 false"的
   //   竞态下会静默跳过取消 → 行为树继续驱动车辆（现场 FAULT 后仍机动 10 分钟）。
@@ -1881,9 +1917,23 @@ void AutoMissionNode::resultCallback(
   // 结果不再重复计失败与换点——取消方已完成，否则一次受阻会连跳两个航点。
   if (result.code == rclcpp_action::ResultCode::CANCELED && goal_cancel_by_mission_) {
     goal_cancel_by_mission_ = false;
+    goal_cancel_pending_ = false;   // V0.0.98 取消已静置完成，重发路径可放行
     RCLCPP_DEBUG(get_logger(),
       "[Nav2] 航点[%zu] 的 goal 已按本节点指令取消，失败计数与换点由取消方处理",
       current_wp_idx_);
+    return;
+  }
+
+  // V0.0.98：主动取消时行为树已处失败态的结果会以【ABORTED（而非 CANCELED）】
+  //   回传且世代号匹配（bt_navigator 处理取消请求时对已失败 goal 报 ABORTED）。
+  //   这不是新一次失败：不计 fail_count、不换点（取消方已换），仅清静置标记
+  //   放行下一个 goal（旧实现在此会把"被取消的旧 goal"计成新航点的失败）。
+  if (result.code == rclcpp_action::ResultCode::ABORTED && goal_cancel_by_mission_) {
+    goal_cancel_by_mission_ = false;
+    goal_cancel_pending_ = false;
+    RCLCPP_INFO(get_logger(),
+      "[Nav2] 已主动取消的旧 goal 以 ABORTED 回传（取消时 BT 已处失败态），"
+      "不计入失败计数；取消静置完成，可发送下一个 goal");
     return;
   }
 

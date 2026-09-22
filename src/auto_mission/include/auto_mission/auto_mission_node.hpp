@@ -281,6 +281,13 @@ private:
   //        机动 10 分钟（1790056004~1790056157），现场看到"车不停乱动"。
   //   有了世代号，过期结果一律丢弃：既不误计失败，也不破坏在途 goal 的句柄。
   uint64_t goal_epoch_{0};
+  // V0.0.98 取消静置门控：cancelCurrentGoal() 后不得立即发下一个 goal。
+  //   现场（V0.0.97 日志）：取消后 2ms 即发航点[3]，bt_navigator 尚在清理旧
+  //   BT 的取消/恢复状态，新 goal 被同一轮失败波及（接受后 2ms ABORTED）。
+  //   改为：取消时置 pending，NAVIGATING 的"无在途 goal 重发"路径需等
+  //   旧 goal 结果到达（resultCallback 清 pending）或 settle 超时才放行。
+  bool goal_cancel_pending_{false};
+  rclcpp::Time goal_cancel_time_{0, 0, RCL_ROS_TIME};
 
   // ---- 参数 ----
   // 模式
@@ -301,6 +308,9 @@ private:
   double goal_timeout_{60.0};          // 单点导航超时（s）
   double nav_active_wait_timeout_{60.0}; // NAVIGATING 中等待 bt_navigator 激活的超时（s）
   double nav_retry_backoff_{2.0};      // goal 被拒/失败后的重试退避（s）
+  double goal_cancel_settle_time_{2.0};  // V0.0.98 主动取消后等待旧 goal 结果回传的
+                                         //   最长静置时长（s）：结果先到即放行；
+                                         //   超时无结果兜底放行（bt_navigator 重启等场景）
   // V0.0.95 航点“已到达”预检与受阻检测
   double already_reached_dist_{0.35};  // 航点到达判定半径（m）：车与航点位置重合即跳过，不再发 goal
                                        // V0.0.97：0.30 → 0.35（修"0.30m 微调目标被阻 25s"）

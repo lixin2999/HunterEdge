@@ -70,16 +70,27 @@ controller_server:
 
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
-      time_steps: 30                           # 预测时域步数（0.05s 步长 → 1.5s 前瞻）
-      model_dt: 0.05
-      batch_size: 1000                         # 采样轨迹数（Jetson 平衡实时性）
+      time_steps: 50                           # V0.0.98：30 → 50。预测时域是"能绕开障碍"
+      model_dt: 0.08                           #   的控制层前提：旧 30×0.05=1.5s 前瞻在 0.25m/s
+                                               #   绕行参考车速下仅 0.75m < 阿克曼提前转向距离
+                                               #   s≥√(2R·c)≈1.33m——MPPI "看不到"完整绕障弧，
+                                               #   只能选出贴障碍的贪心解（日志：满舵 0.386rad
+                                               #   持续 13~20s 零位移）。现时域 50×0.08=4.0s，
+                                               #   0.25m/s 下前瞻 1.0m、0.5m/s 下 2.0m，能覆盖
+                                               #   "倒车换提前量→打舵绕过"的完整机动序列；
+                                               #   代价：优化变量 50×2 维，配合 batch_size 下调
+                                               #   后总算力反而低于旧配置（防 20Hz 丢帧）
+      batch_size: 700                          # V0.0.98：1000 → 700（时域加长后的算力对冲：
+                                               #   700×50=3.5万 < 旧 1000×30=3万 → 相当；日志
+                                               #   "Control loop missed 20Hz" 频发，Jetson 需降载）
       vx_std: 0.2
       vy_std: 0.0                              # 阿克曼无横向速度
       vy_max: 0.0                              # V0.0.97 显式声明：ConstraintCritic 读【父级】
                                                # vy_max（默认 0.5）算反向速度上限
                                                # min_vel_ = -√(vx_min²+vy_max²)，不声明会得到
                                                # -0.54 而放过超速倒车；填 0.0 后恰为 vx_min
-      wz_std: 0.4
+      wz_std: 0.5                              # V0.0.98：0.4 → 0.5。绕障本质是打舵横移，
+                                               #   转向采样多样性不足时可行弧解碰不到
       vx_max: 0.5                              # 与 desired_linear_vel/velocity_smoother 一致（V0.0.89 低速档）
       vx_min: -0.20                            # V0.0.97：0.0 → -0.20，放开【控制器级低速倒车】
                                                #   几何依据（本参数是"能绕开障碍"的关键，详见
@@ -104,7 +115,9 @@ controller_server:
       ax_min: -1.5                             # 制动上限
       az_max: 1.0                              # 角加速度上限
       iteration_count: 1                       # 单轮精化（低速场景足够）
-      prune_distance: 1.5                      # 轨迹前向裁剪
+      prune_distance: 3.0                      # V0.0.98：1.5 → 3.0，与 4s 预测时域匹配
+                                               #   （旧值会把全局路径 1.5m 外的段剪掉，
+                                               #   绕障弧参照的路径点丢失→PathAlign 无参考）
       transform_tolerance: 0.2
       temperature: 0.3                         # 代价 softmax 温度
       gamma: 0.015                             # 控制平滑正则
@@ -120,7 +133,10 @@ controller_server:
         enabled: true
       CostCritic:
         enabled: true
-        cost_weight: 3.0                       # 近障避让主权重
+        cost_weight: 6.0                       # V0.0.98：3.0 → 6.0。近障避让主权重，与
+                                               #   PathAlignCritic 降权联动（"贴路径走"让位于
+                                               #   "贴障碍躲"）；配合 safety_guard 扫掠弧闸 ——
+                                               #   控制层选弧、安全层验弧，两层同向
         max_cost: 1000000
         consider_footprint: true               # 用车体矩形（含后悬）判碰撞，比圆形更准
         critical_cost: 300.0
@@ -136,8 +152,16 @@ controller_server:
         threshold_to_consider: 0.5
       PathAlignCritic:
         enabled: true
-        cost_weight: 14.0                      # 跟随全局路径主权重
-        max_path_occupancy_ratio: 0.05
+        cost_weight: 8.0                       # V0.0.98：14.0 → 8.0。旧权重相对 CostCritic(3.0)
+                                               #   高达 4.7:1，MPPI 被锁死在"严格贴合全局路径"
+                                               #   上——绕障横移 0.4~0.9m 的可行弧全被判高代价，
+                                               #   只剩"顶到障碍前才停"的贪心解（日志满舵死磕的
+                                               #   控制层根因）。8.0 仍为各 critic 最大（路径跟踪
+                                               #   仍是主目标），但允许局部绕障弧胜出
+        max_path_occupancy_ratio: 0.15         # V0.0.98：0.05 → 0.15。轨迹经过的栅格占代价格
+                                               #   比例阈值——绕障弧必然穿越膨胀区（inflation
+                                               #   cost>0 的"占据"），旧值 0.05 使任何离径绕行
+                                               #   直接被判不可行
         trajectory_point_dist: 0.3
         path_dist_weight: 3.0
         threshold_to_consider: 0.5
@@ -158,11 +182,10 @@ controller_server:
                                                #   宁可原地不动也不后退脱困
       PreferForwardCritic:
         enabled: true
-        cost_weight: 1.5                       # V0.0.97：5.0 → 1.5。原权重与 vx_min=0 组合
-                                               #   使"前进"压倒一切：放开倒车后若仍 5.0，
-                                               #   MPPI 仍被锁在前进解上（前方净空被 safety_guard
-                                               #   按停 → 无可行解 → 原地抖动）。1.5 保留
-                                               #   "能前进就前进"的偏好，同时允许倒车换绕行自由度
+        cost_weight: 1.0                       # V0.0.98：1.5 → 1.0。进一步降低"前进偏好"，
+                                               #   让"先倒 0.3~0.5m 换提前量再打舵绕过"的
+                                               #   多段机动在采样中真正可选中（1.5 实测仍偏向
+                                               #   前进贪心解）；保留小权重防无意义倒车
         threshold_to_consider: 0.5
 
     general_goal_checker:
@@ -225,16 +248,23 @@ global_costmap:
                                               # 车辆原地锁死不能自主（现场问题②直接成因）
           obstacle_range: 3.0
           raytrace_range: 4.0
-          expected_update_rate: 0.5             # 10Hz 数据，0.5s 无更新仅告警不断链
+          expected_update_rate: 0.25            # V0.0.98：0.5 → 0.25（断流容忍 2s→4s）。日志实测
+                                                #   CPU 饥饿时 obstacle_cloud 缓冲积压到 1.8~2.8s，
+                                                #   旧值 2s 超时→整帧丢弃→障碍层短暂全空（危险）
+                                                #   或反复"observation buffer has not been
+                                                #   updated"告警；放宽后仅拖慢新鲜度，不丢观测
         scan:
           topic: /scan
           data_type: "LaserScan"
           marking: true
-          clearing: true                        # 射线清障：障碍移除后痕迹自动消退
+          clearing: true                      # 射线清障：障碍移除后痕迹自动消退
           inf_is_valid: true                    # use_inf 投影的 inf 视为该方向无障碍
           obstacle_range: 3.0
           raytrace_range: 4.0
-          expected_update_rate: 0.5
+          expected_update_rate: 0.25            # V0.0.98：0.5 → 0.25，理由同上（/scan 10Hz，
+                                                #   4s ≈ 丢 40 帧内不判陈旧；碰撞兼有 safety_guard
+                                                #   直读 /scan + 自身 scan_timeout=0.5s 兜底，
+                                                #   costmap 层放宽不降安全）
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         inflation_radius: 0.40                 # V0.0.82：原 0.35，加大缓冲（≥内切半径 0.33+余量）
@@ -283,7 +313,7 @@ local_costmap:
                                               # 车辆原地锁死不能自主（现场问题②直接成因）
           obstacle_range: 3.0
           raytrace_range: 4.0
-          expected_update_rate: 0.5
+          expected_update_rate: 0.25            # V0.0.98：0.5→0.25，与 global_costmap 同理
         scan:
           topic: /scan
           data_type: "LaserScan"
@@ -292,10 +322,12 @@ local_costmap:
           inf_is_valid: true
           obstacle_range: 3.0
           raytrace_range: 4.0
-          expected_update_rate: 0.5
+          expected_update_rate: 0.25            # V0.0.98：0.5→0.25（断流容忍 4s，防观测洞）
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.40                 # V0.0.82：原 0.35，加大缓冲
+        inflation_radius: 0.45                 # V0.0.98：0.40 → 0.45，与 safety_guard 扫掠弧的
+                                               #   包络半宽（0.32+0.12=0.44m）对齐——控制层代价场
+                                               #   与安全层硬闸同一几何尺度，两层判据同向
         cost_scaling_factor: 3.0
 
 # ---- 行为树导航器（文档 2.3 nav2_bt_navigator） ----

@@ -251,6 +251,18 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             #   ⚠ 极细立柱/远距离薄结构可下调为 2；设为 1 即恢复旧行为（不抑制）。
             'min_obstacle_points': 3,
             'obstacle_cluster_span': 0.25,
+            # V0.0.98 轨迹扫掠弧碰撞闸（"精确计算转向角度/速度以绕障"的算法核心）：
+            #   行驶中碰撞闸不再用"直线矩形走廊"判净空，而是把实际指令 (v,w)
+            #   按阿克曼运动学积分成候选轨迹、扫包络盒判接触——旧直线判据与绕障
+            #   弧线互斥（绕障需横移 ≥1.33m，期间直线投影恒有障碍），把每条合法
+            #   绕障弧都误拦成 COLLISION_STOP（V0.0.97 现场满舵死磕的安全层根因）。
+            #   reaction_lag：前 0.4s 按直线积分（转向机构/底盘响应需时），"贴到
+            #     障碍跟前才打舵"的乐观解在直线段即判接触，骗不过本判据；
+            #   brake_decel：与 velocity_smoother.max_decel[0]=-1.5 同值；
+            #   vel_trust_eps：|v|≤此值时退回直线走廊（静止防抖）。
+            'reaction_lag': 0.4,
+            'brake_decel': 1.5,
+            'vel_trust_eps': 0.03,
             'enable_test_mode': False,  # 测试模式运行时经 /safety/test_mode 开关
             # V0.0.89 窄小测试场地低速档：测试模式限速抬到 0.3m/s（原 0.1 “基本不动”），
             # 碰撞阈值与正式模式同源（V0.0.97：0.90/1.40，见上方 stop_dist 注释），
@@ -283,12 +295,27 @@ def _nav2_params_with_bt(context, *args, **kwargs):
         remappings=[('cloud_in', '/lidar_points'), ('scan', '/scan')],
         parameters=[{
             'target_frame': 'base_link',        # 点云 rslidar → base_link（URDF TF）
-            'transform_tolerance': 0.1,
+            'transform_tolerance': 0.3,         # V0.0.98：0.1 → 0.3。日志频发
+                                            # "Message Filter dropping message: frame
+                                            #  'base_link' ... earlier than all the data
+                                            #  in the transform cache"——CPU 饥饿时
+                                            # TF 最新时刻落后于点云时标，旧值 0.1s 容差
+                                            # 直接丢帧→/scan 断流→costmap 观测空洞→
+                                            # BackUp 115ms 内双失败；0.3s 吸收投影延时
+                                            # 与 TF 广播抖动，仍远小于 safety_guard
+                                            # 的 scan_timeout(0.5s) 新鲜度底线
             'min_height': -0.2,                 # base_link 系高度切片：滤除地面反射
             'max_height': 0.8,                  # 拦腰高度（车顶雷达俯视场景）
             'angle_min': -3.14159,
             'angle_max': 3.14159,
-            'angle_increment': 0.008726646,     # 0.5°/束 → 720 束
+            'angle_increment': 0.017453293,     # V0.0.98：1.0°/束 → 360 束（原 0.5°/720 束）。
+                                            # 降算力：投影循环/ranges 数组/下游
+                                            # costmap 与 safety_guard 扫描量减半
+                                            # （日志 Control loop missed 20Hz 频发，Jetson
+                                            # 需降载）；1° 在 1.5m 碰撞尺度上横向分辨
+                                            # 力 ≈2.6cm，远细于走廊半宽/包络余量尺度，
+                                            # 不损失障碍判定精度；且 16 线点云在该
+                                            # 角域内本就有重叠束，0.5° 属过度采样
             'scan_time': 0.1,                   # /lidar_points 10Hz
             'range_min': 0.70,                  # ⚠ 与 safety_guard 的阈值强耦合（V0.0.97：0.8→0.70）：
                                             # 小于本值的回波在投影阶段就被丢弃，车前形成盲区；
