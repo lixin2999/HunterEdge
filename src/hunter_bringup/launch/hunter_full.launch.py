@@ -109,11 +109,17 @@ def generate_launch_description():
                                                  # 需求不一致引发的 stop/start 重配（该重配正是掉节点时刻）；
                                                  # ② 降到 640x480x30（与 sensor_params.yaml camera
                                                  # resolution 对齐），USB 带宽与曝光稳定裕度更好；
-                                                 # ③ initial_reset：设备残留/枚举异常（dmesg 见 USB 掉线、
-                                                 #    /dev/video* 消失）时置 'true' 强制复位后重枚举。
+                                                 # ③ initial_reset：V0.0.96 起默认 'true'——本车 D435 在
+                                                 #    "落参→停传感器→重开"环节稳定复现
+                                                 #    xioctl(VIDIOC_QBUF) failed: No such device（ENODEV，
+                                                 #    /dev/video* 节点消失）致深度/彩色双失败、相机全程 0Hz；
+                                                 #    开机先硬件复位可清掉设备残留/半初始化状态，
+                                                 #    代价仅启动多 2~4 秒（确认相机稳定后可改回 'false'）。
+                                                 #    若置 true 仍复现：属 USB 链路级故障（供电/带宽/接触），
+                                                 #    必须按 Deployment_Guide §7.3 排障（直连 USB3、勿经 HUB、
+                                                 #    dmesg 查掉线、关 USB 自动挂起）。
                                                  #    注：_isolated() 的 GroupAction(forwarding=False) 会清空
-                                                 #    父作用域，故此处只能用字面量（不能用 LaunchConfiguration）；
-                                                 #    需要临时复位时把 'false' 改 'true' 后重启本 launch。
+                                                 #    父作用域，故此处只能用字面量（不能用 LaunchConfiguration）。
                                                  'depth_module.depth_profile': '640,480,30',
                                                  'depth_module.infra_profile': '640,480,30',
                                                  'rgb_camera.color_profile':   '640,480,30',
@@ -123,7 +129,7 @@ def generate_launch_description():
                                                  'enable_infra1': 'false',
                                                  'enable_infra2': 'false',
                                                  'enable_sync':   'false',
-                                                 'initial_reset': 'false'})
+                                                 'initial_reset': 'true'})
     imu_driver     = _isolated(src('ch10x_driver',     'launch', 'ch10x_driver.launch.py'))
 
     # ---- 2. CAN 驱动（hunter_base，文档 11） ----

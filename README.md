@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V1.7（开发指南，对应软件基线 V0.0.95：在 V0.0.94“**开启自主巡航车辆原地抖动不前进**”故障链（航点[0] 与车辆起始位姿重合 0.19m → “目标=自身”退化 goal → 阿克曼无法原地转向 → `Failed to make progress` 循环；同时 `safety_guard` 走廊净空贴着急停阈值 ±6mm 抖动导致 56s 内 47 次 `SLOWDOWN↔COLLISION_STOP` 状态往返、速度被反复归零；BT 恢复池 V0.0.89 起只有“清图+Wait”非运动手段、无法脱困）基础上分层修复：**任务层新增航点“已到达”预检与受阻（stall）检测**、**安全层新增阈值释放滞环与幽灵点门控**、**行为层恢复受限倒车脱困（BackUp 0.45m，配套放开 `velocity_smoother` 倒车通道）**、**感知层修复 D435 启动 profile 致相机 0Hz**）
+> **文档版本**：V1.8（开发指南，对应软件基线 V0.0.96：在 V0.0.95 分层修复（航点“已到达”预检、阈值释放滞环、幽灵点门控、受限倒车脱困、D435 显式 profile）实车生效——车辆已能自主行驶约 5m、转向平滑、无抖振——之后，修复**残余死锁链**：**航点落在静态地图障碍的膨胀区内 → Nav2 起点格被判致命（`Starting point in lethal space!`）→ 从该点出发的全部规划失败 → 恢复池无运动行为 → 3 次 ABORT 后 `FAULT` 锁存**。新增：任务层**航点占据栅格 + 净空校验**（`waypoint_clearance_m` 0.50m）与**当前位姿净空告警**、受阻判据改**朝目标推进量**、**“ABORT 但已在到达半径内 ⇒ 判为完成”**；行为层**恢复池首位加受限倒车**（让规划失败也能物理脱困）；感知层相机 `initial_reset: true`）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -465,9 +465,15 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 >    时视为已完成并跳过——goal 与自身位姿重合时 Smac 路径≈0 且要求终止朝向，阿克曼无法
 >    原地转向，MPPI 会持续打满转向（日志 `set steering angle: ±0.386428 rad` 即曲率钳制上限
 >    对应的最大内轮转角）而纵向零进挪，ProgressChecker(0.1m/10s) 必判 `Failed to make progress`；
-> ② **受阻（stall）检测**：goal 在途且 `stall_detect_time`(25s) 内 map 系位移 < `stall_move_eps`(0.15m)
+> ② **受阻（stall）检测**：goal 在途且朝目标推进量 < `stall_move_eps`(0.15m) 持续 `stall_detect_time`(25s)
 >    → 明确判“前方障碍无法绕行/航点无可达路径”，立即取消本 goal 并换点（连续 3 次 → FAULT 锁存），
 >    日志给出可判读结论，避免“原地抖动 90s 后静默换点”。
+>
+> **V0.0.96 任务层第三条防线 + 到达语义修正**：
+> ③ **航点占据栅格 + 净空校验**（`waypoint_clearance_m` 0.50m）：发送前拒绝“落在静态地图障碍上/其
+>    膨胀区内”的航点（现场 (5.0,0.0) 即此类，车开到该点后 Smac 持续抛 `Starting point in lethal space!`）；
+> ④ **“ABORT 但已在到达半径内 ⇒ 判为完成”**：避免“车已到 0.07m 却因规划失败被整树 ABORT”被计成
+>    航点失败而快速累积到 FAULT。
 
 ### 10.4 安全约束参数（`autonomous_nav_params.yaml`）
 
@@ -485,8 +491,9 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 | `goal_timeout` | 45 s | 单点导航超时（**V0.0.95 90→45**：受阻由 `stall_detect_time` 25s 内提前定性，本超时只兜底“缓慢但可达”的航点） |
 | `obstacle_wait_timeout` | 30 s | 障碍物等待超时后触发 ESTOP |
 | `already_reached_dist` | 0.30 m | **V0.0.95 新增**：航点“已到达”判定半径。航点与当前 map 系位姿距离 ≤ 此值时视为已完成并**跳过不发 goal**（修“目标=自身”退化 goal 死锁）。须 > 阿克曼停车精度且 ≥ 2× Nav2 `xy_goal_tolerance`(0.10m)。全部航点均在此半径内 → FAULT 锁存 |
-| `stall_detect_time` | 25 s | **V0.0.95 新增**：受阻判定时长。goal 在途且窗口内位移 < `stall_move_eps` → 判“前方障碍无法绕行/航点无可达路径”，取消本 goal 并换点。须 > 一轮 Nav2 恢复周期（ProgressChecker 10s + 清图 + 受限倒车脱困） |
-| `stall_move_eps` | 0.15 m | **V0.0.95 新增**：受阻判定位移下限（>2× 定位抖动） |
+| `stall_detect_time` | 25 s | **V0.0.95 新增**：受阻判定时长。goal 在途且朝目标推进停滞 → 判“前方障碍无法绕行/航点无可达路径”，取消本 goal 并换点。须 > 一轮 Nav2 恢复周期（ProgressChecker 10s + 清图 + 受限倒车脱困） |
+| `stall_move_eps` | 0.15 m | **V0.0.95 新增**：受阻判定位移下限（>2× 定位抖动）。**V0.0.96 判据改“朝目标推进量”**（= 发 goal 时到航点距离 − 当前距离）——倒车脱困会增大到目标距离（推进量为负）仍判受阻，位移标量会被“后退”骗过 |
+| `waypoint_clearance_m` | 0.50 m | **V0.0.96 新增**：航点距最近**占据栅格**的最小净空。航点为占据栅格 / 净空不足 → 发送前拒绝并跳过（日志给实测值），全部被拒 → FAULT。必须 > Nav2 内切半径（footprint 半宽 0.32m）；必要性：滚动局部代价地图不含 static_layer，MPPI 不会避开仅存在于静态地图中的障碍，会把车开到该点，随后 Smac 持续报 `Starting point in lethal space!`（清图无效——`StaticLayer::reset()` 只置 `has_updated_data_` 并重新盖章） |
 
 ### 10.5 自动化工具节点
 
@@ -539,16 +546,21 @@ NAVIGATING ──[连续失败达 max_wp_failures]──→ FAULT（V0.0.91 锁�
 > （/map + /relocalization/pose 距离场，上表最后两行），行驶中越界零速兜底。建图模式
 > 无 /map 与重定位位姿，③ 自动不介入。
 >
-> **V0.0.95 绕障能力（四层协同，对应“遇到障碍物无法绕开障碍物自动驾驶”）**：
-> ① **规划层**：`global_costmap.obstacle_layer` 的 `lidar_cloud` + `scan` 双源均
-> `marking+clearing`，真实障碍被标记后 Smac（DUBIN、`allow_reversing=false`）会给出绕行路径；
-> ② **行为层**：`FollowPath` 失败 → 清局部代价地图 → **受限倒车 0.45m** → 1Hz 重规划
-> （倒车换来前向净空，绕行路径得以成立）；
-> ③ **安全层**：倒车时走廊判据自动切到车后（后净空 < 1.0m 即零速），
-> `stop_release_hysteresis`(0.25m) < `backup_dist`(0.45m) 保证“倒完必放行”，
-> 地图边界监护防止倒出图外；
-> ④ **任务层**：若 25s 内仍零位移 → 判“受阻/无可达路径”，换点；连续 3 次 → FAULT 锁存
-> 并在日志给出处置指引（不再无声原地抖动）。
+> **V0.0.96 绕障/脱困能力补强（第二轮，对应“行驶一小段路立即停下、不再漫游”）**：
+> ① **任务层三道预检**：已到达跳过 → 越界（边界/未建图）拒绝 → **V0.0.96 占据栅格 + 净空拒绝**
+> （`waypoint_clearance_m` 0.50m，修“把车开进静态地图障碍的膨胀区”）；
+> ② **行为层两条失败路径都可脱困**：`FollowPath` 失败序列（清局部图 + BackUp 0.45m + Wait）与
+> **外层恢复池首位 BackUp 0.45m**（V0.0.96 新增，专治“起点格致命”类规划失败——清图/等待都无效，
+> 唯一出路是物理驶离膨胀区）；
+> ③ **安全层兜底不变**：倒车按后方走廊判据（后净空 <1.0m 零速）+ 地图边界监护；
+> ④ **任务层不再误判**：ABORT 时若车已在 `already_reached_dist`(0.30m) 内 → 判为“已到达”，
+> 不计失败（现场：车已到距目标 0.07m，却因“必须先规划成功才跑 FollowPath”被整树 ABORT）；受阻判据
+> 改用“朝目标推进量”，倒车脱困不再被误判为“有进展”。
+>
+> ⚠ **架构已知限制（V0.0.96 记录）**：Nav2 局部代价地图为滚动窗口（odom 系）且插件仅
+> `obstacle_layer + inflation_layer`，**不含 static_layer** ⇒ MPPI 只能避开“实时感知到”的障碍，
+> 对“仅存在于静态 PGM 地图中”的障碍（建图期存在的物体/被遮挡结构/幽灵障碍）**不减速、不绕行**，
+> 全局规划（Smac + 静态层）才是绕障权威。因此**航点必须落在净空 ≥0.5m 的自由区**（任务层已强制校验）。
 
 分级预警：/safety/state（std_msgs/String）2Hz 心跳，格式 状态|原因；
 仅导航模式启动（mapping 模式 auto_mission cruise 直发 /cmd_vel，避免双发布者）。
@@ -767,6 +779,9 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | **自主巡航车辆原地抖动不前进**：`/safety/state` 在 `SLOWDOWN↔COLLISION_STOP` 间高频往返、`set steering angle` 恒为 ±0.386428、最终 `Failed to make progress`（V0.0.95 已修） | ① 航点与车辆当前位姿重合（"目标=自身"退化 goal，阿克曼无法原地转向）；② 走廊净空贴着急停阈值 ±6mm 抖振，速度被反复归零；③ BT 恢复池只有"清图+Wait"非运动手段，无法脱困 | V0.0.95 已分层修复（航点"已到达"预检 + 阈值释放滞环 + 受限倒车脱困 + 受阻检测）；现场仍复现时：① 确认车头前方 ≥2m 无障碍（`rviz2` 看 /scan 与 costmap，分清真实障碍/幽灵点）；② 看 `safety_guard` 启动日志确认 `释放滞环=+0.25/+0.20m`、`幽灵点门控=≥3 点` 已注入；③ 确认 `velocity_smoother min_velocity[0]=-0.20`（=0 会把倒车脱困钳成 0）；④ `waypoints` 首点不得与车位重合（见 `autonomous_nav_params.yaml` 航点布置约束） |
 | **自主巡航报 `[NAVIGATING] 航点[i] 受阻` 或 FAULT 锁存** | 前方真实障碍无法绕行 / 航点在障碍后无可达路径 / 全部航点与车位重合 | 先看 `/safety/state` 的走廊净空与 `幽灵点抑制` 告警区分真实障碍与噪点；移除障碍或人工把车移到空旷处；用 rviz2 重新标定航点；FAULT 需把模式开关离开 AUTO 再切回解除 |
 | **倒车脱困"报成功但车不倒"** | `velocity_smoother` 对全部速度源做绝对值钳制，`min_velocity[0]=0.0` 把负线速度钳成 0（V0.0.94 及以前默认） | `nav2_params.yaml` `velocity_smoother.min_velocity` 应为 `[-0.20, 0.0, -0.8]`（V0.0.95）；禁倒车由 MPPI `vx_min=0` + Smac `allow_reversing=false` 保证，不在平滑器上设 0 |
+| **行驶一小段后停下，`planner_server` 持续报 `Starting point in lethal space! Cannot create feasible plan..`，清图/等待均无效，3 次后 `FAULT`（V0.0.96 已修）** | 车辆停在**静态地图障碍的膨胀区**内（起点格代价 LETHAL 254 / INSCRIBED 253）→ Smac 的 `areInputsValid()` 判起点无效；清图无效（本 fork `StaticLayer::reset()` 只置 `has_updated_data_`，静态障碍会重新盖章）；**滚动局部代价地图不含 static_layer**，MPPI 不会避开静态地图障碍，因而会把车一路开到那里 | V0.0.96 三层修复：① 任务层航点净空校验（`waypoint_clearance_m` 0.50m，占据栅格 + 净空双判，发送前拒绝并打印实测净空）；② 行为树恢复池**首位 BackUp 0.45m**（规划失败也能物理驶离膨胀区，1~2s 内生效）；③ 任务层“ABORT 但已在到达半径内 ⇒ 判为已到达”。**现场恢复手段**：`ros2 run teleop_twist_keyboard` 人工把车倒出膨胀区，或 rviz2 确认航点位置后重标 `waypoints` |
+| **自主巡航报"距静态地图障碍仅 x.xxm < 净空要求 0.50m（处于 Nav2 膨胀/致命区内）"并跳过该航点** | 航点标定在障碍旁/障碍上（仓库示例航点 (0,0)/(5,0)/(5,3)/(0,3) 为占位值，实测 (5.0,0.0) 不满足净空） | 设计行为（防止把车开进死局）：在 rviz2 中确认目标点四周 ≥0.5m 无占据（黑色）栅格，按 `autonomous_nav_params.yaml` 的标定步骤重标；全部航点被拒会 FAULT 锁存（模式开关离开 AUTO 再切回解锁） |
+| **相机仍 0Hz（V0.0.96 已将 `initial_reset` 置 true 仍复现）** | 属 USB 链路级故障（供电/带宽/接触/枚举异常），非驱动参数问题 | 按 §13.8 相机条目硬件排查：D435 直连 USB3 口（勿经 HUB）、`dmesg \| grep -iE 'usb\|uvc'` 查掉线、关 USB 自动挂起、必要时更换线缆/接口。导航不受阻（`health=WARNING` 不拦 AUTO 门控），但视觉避障退化为单雷达源 |
 | **日志被 `set steering angle: x` 刷屏（20~50Hz）** | 底盘驱动（`hunter_ros2/hunter_base`，vendor 目录）在每个 `/cmd_vel` 回调 `std::cout` 打印转向角，未节流 | 分析时过滤：`grep -v 'set steering angle' /tmp/hunt7.log`；或 `scripts/hunter_log.sh` 导出后离线过滤。驱动属 vendor 代码（git-ignored），不建议直接改 |
 | 一次性 `[TensorRT] Using an engine plan file across different models of devices` | `.engine` 非本机/本设备型号生成（换机或文件被旧引擎覆盖） | 不阻塞运行（话题 15Hz 正常）；目标机重生成：`trtexec --onnx=<绝对路径>/yolov8s.onnx --saveEngine=/data/models/yolov8s.engine --fp16` 后重启视觉节点 |
 | Ctrl+C 后 `maps/` 只有 `.pcd`，`.pgm/.yaml` 未生成（V0.0.88 前必现） | FAST-LIO2 在 `main()` 于 `spin` 返回**后**才写 PCD（20.7M 点 ≈ 664MB 需数秒至数十秒），而 Ctrl+C 同时终止 `pcd_to_map`，运行期 `MAPPING→非MAPPING` 跳变不会发生 → 原自动转换从不启动 | V0.0.88 起 `pcd_to_map` 退出时派生独立会话后台转换进程兜底：`tail -f maps/pcd_to_map_final.log`（应见 `PCD 已写完整 → 转换成功`），数十秒内 `ls -lh maps/` 应齐 `.pcd/.pgm/.yaml`；仍缺时手动兜底 `python3 ~/HunterEdge/install/auto_mission/lib/auto_mission/pcd_to_map --finalize --pcd-file ~/HunterEdge/maps/hunter_map.pcd --force` |
@@ -782,12 +797,12 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | 《自动驾驶车辆系统详细设计文档 V2.0》 | 本项目的设计基准；本文档全部参数、话题、CAN 协议、坐标系均可追溯至其对应章节 |
 | AI 编码任务清单 | 分模块开发任务（任务 00 ~ 任务 17），指导按模块开发与验收 |
 | `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程） |
-| `Deployment_Guide.md` | 部署操作文档 V1.7（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.0.95） |
+| `Deployment_Guide.md` | 部署操作文档 V1.8（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.0.96） |
 | `release.md` | 版本历史（V0.0.1 ~ 当前），记录每版主要功能与修复 |
 
 > **追溯原则**：本 README 中所有硬件参数（§2）、软件版本（§3）、话题（§8）、控制模式（§9）、限制（§13）均源自《自动驾驶车辆系统详细设计文档 V2.0》，未虚构功能。自主导航模块（§10）为在设计文档框架内的扩展实现。
 
 ---
 
-*HunterEdge 开发指南 · 文档版本 V1.7 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.95 现场实测修正（V0.0.89：窄小测试场地低速档；V0.0.91：走廊净空碰撞闸、`FAULT` 锁存态；V0.0.92：起步清图同步重试、行为树重规划回退 1Hz；V0.0.93：方案A 定位架构重构——TF 单一所有权、hunter_relocalization(NDT) 替代 AMCL、RPP→MPPI；V0.0.94：“开启自主巡航车辆原地不动”残余故障链彻底修复；V0.0.95：“遇到障碍物无法绕开障碍物自动驾驶”分层修复——任务层航点“已到达”预检与受阻(stall)检测、安全层阈值释放滞环与幽灵点门控、行为层受限倒车脱困（`velocity_smoother` 放开倒车通道 min_velocity[0] 0.0→−0.20）、感知层 D435 显式 profile 修相机 0Hz）*
+*HunterEdge 开发指南 · 文档版本 V1.8 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.0.96 现场实测修正（V0.0.89：窄小测试场地低速档；V0.0.91：走廊净空碰撞闸、`FAULT` 锁存态；V0.0.92：起步清图同步重试、行为树重规划回退 1Hz；V0.0.93：方案A 定位架构重构——TF 单一所有权、hunter_relocalization(NDT) 替代 AMCL、RPP→MPPI；V0.0.94：“开启自主巡航车辆原地不动”残余故障链彻底修复；V0.0.95：“遇到障碍物无法绕开障碍物自动驾驶”分层修复（航点“已到达”预检、阈值释放滞环、幽灵点门控、受限倒车脱困、`velocity_smoother` 倒车通道、D435 显式 profile）；V0.0.96：“行驶一小段路立即停下、不再漫游”修复——航点占据栅格 + 净空校验（`waypoint_clearance_m`）、当前位姿净空告警、受阻判据改“朝目标推进量”、“ABORT 但已到达 ⇒ 判完成”、行为树恢复池首位受限倒车脱困（治“起点格致命”类规划失败）、相机 `initial_reset: true`）*
 

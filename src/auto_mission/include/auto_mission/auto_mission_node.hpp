@@ -101,8 +101,12 @@ private:
   void enterFault(const std::string & reason);  // 任务故障锁存（V0.0.91）：停止巡航并等待人工处置
   void clearCostmapsOnStart();                  // 任务（重）启动时异步清一次全局/局部代价地图（V0.0.91）
   bool tryReleaseSelfEstop();  // 自触发急停（障碍物类）解除：危险消除后发布 /estop=false
-  bool waypointInsideMap(const Waypoint & wp);  // 航点在已采集地图区域内（边界+边距+非未建图栅格，V0.0.82/0.0.87）
-  std::string waypointMapCheckDetail(const Waypoint & wp);  // 越界原因（空=通过）：矩形边界外 / 未建图(unknown)栅格
+  bool waypointInsideMap(const Waypoint & wp);  // 航点在已采集地图区域内（边界+边距+非未建图栅格+净空，V0.0.82/0.0.87/0.0.96）
+  std::string waypointMapCheckDetail(const Waypoint & wp);  // 拒绝原因（空=通过）：边界外 / 未建图 / 占据栅格 / 净空不足
+  // V0.0.96 map 系位姿 (x,y) 到最近【占据栅格】的欧氏距离（m）；
+  //   搜索半径 max_search_radius 内无占据栅格 → 返回 max_search_radius（表示"足够远"）；
+  //   地图未就绪或点在图外 → 返回 +inf（由边界校验负责拦截）。
+  double nearestObstacleClearance(double x, double y, double max_search_radius);
   // V0.0.95 航点“已到达”预检：车已在航点到达半径内（位置重合）时不得再发 goal——
   //   “目标=当前位姿”对阿克曼是退化目标（左/右满舵都到不了），MPPI 会持续打满转向而
   //   纵向零进挪，ProgressChecker(0.1m/10s) 必判 Failed to make progress，
@@ -213,8 +217,10 @@ private:
   std::string fault_reason_;       // FAULT 锁存原因（V0.0.91，仅日志用）
   // V0.0.95 受阻（无法绕行）计数：goal 在途而长时间无位移时递增，供日志与诊断
   int blocked_count_{0};
-  double goal_start_x_{0.0};       // 发送当前 goal 时的 map 系位姿（受阻判定基准）
-  double goal_start_y_{0.0};
+  // V0.0.96 受阻判定基准：发 goal 时车辆到该航点的距离（负值 = 位姿未知，本航点不做受阻判定）。
+  //   判据由"位移标量"改为"朝目标推进量"（= 起始距离 − 当前距离）：
+  //   行为树脱困倒车会增大到目标距离 → 推进量为负 → 仍判受阻，而位移标量会被"后退"骗过。
+  double goal_start_dist_{-1.0};
   // V0.0.95 主动取消标记：取消与换点已由取消方（受阻/超时/降级）完成，
   //   resultCallback 收到 CANCELED 时据此跳过重复的 fail_count++ 与换点，
   //   否则一次受阻会连跳两个航点并提前触发 FAULT。
@@ -228,6 +234,14 @@ private:
   double map_min_y_{0.0};
   double map_max_y_{0.0};
   double waypoint_map_margin_{0.5};  // 航点距地图边界的最小安全边距（m）
+  // V0.0.96 航点净空（膨胀）校验半径（m）：航点距最近【占据栅格】的欧氏距离必须 ≥ 此值。
+  //   必要性：SmacPlannerHybrid 的 areInputsValid() 用 GridCollisionChecker 判起点有效性，
+  //   起点格代价为 LETHAL(254)/INSCRIBED(253)/UNKNOWN-with-traverse_unknown=false(255) 时
+  //   直接抛 "Starting point in lethal space! Cannot create feasible plan."；
+  //   而 Nav2 局部代价地图为滚动窗口且【不含静态层】→ MPPI 不会避开仅存在于静态地图中的
+  //   障碍，会把车一路开到航点；一旦车停在静态障碍的膨胀/致命区内，此后所有规划全部失败。
+  //   默认 0.50 > Nav2 inscribed_radius(0.32) + 定位误差余量；改小会在障碍旁制造死局。
+  double waypoint_clearance_m_{0.50};
 
   // ---- 定位等待计时 ----
   rclcpp::Time localize_wait_start_;
@@ -264,6 +278,7 @@ private:
   double already_reached_dist_{0.30};  // 航点到达判定半径（m）：车与航点位置重合即跳过，不再发 goal
   double stall_detect_time_{25.0};     // 受阻判定时长（s）：goal 在途而位移停滞超此时长判“无法绕行”
   double stall_move_eps_{0.15};        // 受阻判定位移下限（m）：窗口内 map 系位移小于此值即停滞
+  // V0.0.96 航点净空校验半径（m）
   // 障碍物等待
   double obstacle_wait_timeout_{30.0}; // 障碍物等待超时（s）
   // 最大速度（仅日志/合规性检查；实际限速由 Nav2 params 控制）

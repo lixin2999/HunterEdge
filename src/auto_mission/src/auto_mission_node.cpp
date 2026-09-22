@@ -165,6 +165,8 @@ void AutoMissionNode::declareParameters()
   declare_parameter("already_reached_dist", 0.30);
   declare_parameter("stall_detect_time", 25.0);
   declare_parameter("stall_move_eps", 0.15);
+  // V0.0.96 航点净空校验（修“开到静态障碍膨胀区后所有规划全失败”）
+  declare_parameter("waypoint_clearance_m", 0.50);
 
   // Nav2 就绪门控
   declare_parameter("nav_active_wait_timeout", 60.0);
@@ -224,6 +226,16 @@ void AutoMissionNode::declareParameters()
   }
   if (stall_move_eps_ < 0.0) {
     stall_move_eps_ = 0.0;
+  }
+  // V0.0.96 航点净空校验半径：必须 > Nav2 内切半径（默认 footprint 半宽 0.32m），
+  // 否则航点仍会落在膨胀/致命栅格内 → Smac 抛 "Starting point in lethal space"
+  waypoint_clearance_m_ = get_parameter("waypoint_clearance_m").as_double();
+  if (waypoint_clearance_m_ < 0.35) {
+    RCLCPP_WARN(get_logger(),
+      "waypoint_clearance_m=%.2f 过小（≤ Nav2 内切半径 0.32m + 余量），已按 0.50m 处理"
+      "（过小会让航点落在静态障碍膨胀区内，规划必报 Starting point in lethal space）",
+      waypoint_clearance_m_);
+    waypoint_clearance_m_ = 0.50;
   }
   max_velocity_           = get_parameter("max_velocity").as_double();
   params_file_            = get_parameter("params_file").as_string();
@@ -902,26 +914,31 @@ void AutoMissionNode::mainLoop()
       if (goal_in_flight_) {
         const double elapsed = (this->now() - goal_send_time_).seconds();
 
-        // V0.0.95 受阻检测（stall）：goal 在途但窗口内位移停滞 → 判“前方障碍
-        // 无法绕行 / 无可达路径”。背景（V0.0.94 现场日志）：前方约 1.0m 处障碍
-        // 使 safety_guard 走廊净空贴着急停阈值抖动，MPPI 打满转向而纵向零进挪，
-        // Nav2 ProgressChecker 判 Failed to make progress；BT 恢复池（V0.0.89 起
-        // 仅非运动：清图+Wait）无法脱困，只能等到 goal_timeout=90s 才换点，其间
-        // 车辆原地不动且日志无明确结论。此处按“位移停滞”提前定性为受阻并换点/
-        // 锁存，配合 V0.0.95 行为树的受限倒车脱困（BackUp）形成完整绕障链。
-        if (std::isfinite(goal_start_x_)) {
+        // V0.0.95 受阻检测（stall）：goal 在途但朝目标推进停滞 → 判“前方障碍
+        // 无法绕行 / 无可达路径”。V0.0.96 判据由“位移标量”改为“朝目标推进量”：
+        //   推进量 = 发 goal 时到航点距离 − 当前到航点距离；行为树脱困倒车会增大
+        //   到航点距离（推进量为负）→ 仍判受阻，而位移标量会被“后退”骗过。
+        // 现场依据（V0.0.95 实车日志）：车开到航点 A 附近后全局规划持续报
+        //   "Starting point in lethal space!"（车停在静态障碍膨胀区内），
+        //   行为树清图/等待均无效 → 需换点/锁存并给出可判读结论。
+        if (goal_start_dist_ >= 0.0) {
           double px = 0.0, py = 0.0;
-          const double moved = currentMapPose(px, py)
-            ? std::hypot(px - goal_start_x_, py - goal_start_y_) : 0.0;
-          if (elapsed > stall_detect_time_ && moved < stall_move_eps_) {
+          double progress = 0.0;
+          if (currentMapPose(px, py)) {
+            progress = goal_start_dist_ - std::hypot(
+              waypoints_[current_wp_idx_].x - px, waypoints_[current_wp_idx_].y - py);
+          }
+          if (elapsed > stall_detect_time_ && progress < stall_move_eps_) {
             ++blocked_count_;
             RCLCPP_ERROR(get_logger(),
-              "[NAVIGATING] 航点[%zu]%s 受阻：%.0fs 内位移仅 %.2fm（< %.2fm）"
-              "——前方障碍无法绕行或航点无可达路径，取消本 goal 并按失败处理"
-              "（第 %d 次受阻；请核对 /safety/state 的走廊净空与 /scan 是否真实障碍，"
-              "或重新标定该航点）",
+              "[NAVIGATING] 航点[%zu]%s 受阻：%.0fs 内向目标仅推进 %.2fm（< %.2fm，"
+              "起始距离 %.2fm / 当前 %.2fm）——前方障碍无法绕行、航点无可达路径，"
+              "或车已停在（静态地图）障碍膨胀区内致规划全失败；取消本 goal 并按失败处理"
+              "（第 %d 次受阻；请核对 /safety/state 净空、rviz2 中 global_costmap 的"
+              "膨胀区与 rviz2 报错 Starting point in lethal space）",
               current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
-              elapsed, moved, stall_move_eps_, blocked_count_);
+              elapsed, progress, stall_move_eps_, goal_start_dist_,
+              goal_start_dist_ - progress, blocked_count_);
             cancelCurrentGoal();
             wp_fail_count_++;
             if (wp_fail_count_ >= max_wp_failures_) {
@@ -1261,9 +1278,20 @@ bool AutoMissionNode::waypointInsideMap(const Waypoint & wp)
 }
 
 // 航点地图校验明细：空串=通过；否则为拒绝原因（供日志区分处置方式）
+// V0.0.96 新增两级校验：
+//   ③ 目标格为【占据栅格】——旧版只查未建图(-1)，占据(100)竟被放行（本次 V0.0.95 实车
+//      "开到静态障碍里再卡死"的直接缺口）；
+//   ④ 目标点【净空】不足——距最近占据栅格 < waypoint_clearance_m(0.50m) 时，
+//      该点落在 Nav2 inflation_layer（radius 0.40）与内切半径(0.32)的致命/膨胀区内：
+//      • SmacPlannerHybrid 的 areInputsValid() 用 GridCollisionChecker 判起点有效性，
+//        代价为 LETHAL(254)/INSCRIBED(253)/UNKNOWN(255，allow_unknown=false) 即抛
+//        "Starting point in lethal space! Cannot create feasible plan."；
+//      • 局部代价地图为滚动窗口且不含静态层 → MPPI 不会避开仅在静态地图中的障碍，
+//        会把车一路开到该点；此后从该点出发的所有规划全部失败，行为树清图也救不回来
+//        （StaticLayer::reset() 只置 has_updated_data_ 并由静态地图重新盖章）。
 std::string AutoMissionNode::waypointMapCheckDetail(const Waypoint & wp)
 {
-  std::lock_guard<std::mutex> lk(data_mutex_);
+  std::unique_lock<std::mutex> lk(data_mutex_);
   if (!latest_map_) {
     return "";
   }
@@ -1286,10 +1314,84 @@ std::string AutoMissionNode::waypointMapCheckDetail(const Waypoint & wp)
     return "静态地图矩形边界外";
   }
   const size_t cell = static_cast<size_t>(cy) * latest_map_->info.width + cx;
-  if (latest_map_->data[cell] == -1) {
+  const int8_t occ = latest_map_->data[cell];
+  if (occ == -1) {
     return "目标点落在未建图(unknown)栅格上";
   }
+  // V0.0.96 ③ 占据栅格（阈值 50 与 map_server occupied_thresh 语义对齐，trinary 下为 100）
+  if (occ >= 50) {
+    return "目标点落在占据栅格上（静态地图障碍）";
+  }
+  // V0.0.96 ④ 净空校验（nearestObstacleClearance 内部需再加锁，故先解锁；
+  //   std::unique_lock 可在作用域末尾安全二次析构，不可用显式析构的 lock_guard）
+  lk.unlock();
+  const double clearance =
+    nearestObstacleClearance(wp.x, wp.y, waypoint_clearance_m_ + 0.5);
+  if (clearance < waypoint_clearance_m_) {
+    return "距静态地图障碍仅 " + std::to_string(clearance).substr(0, 5) +
+           "m < 净空要求 " + std::to_string(waypoint_clearance_m_).substr(0, 4) +
+           "m（处于 Nav2 膨胀/致命区内）";
+  }
   return "";
+}
+
+// ==========================================================================
+// V0.0.96 点到最近【占据栅格】的欧氏距离（m）
+//   • 搜索半径内无占据栅格 → 返回 max_search_radius
+//   • 地图未就绪 / 点在图外 → 返回 +inf（越界由 waypointMapCheckDetail 前置拦截）
+//   用途：① 航点净空校验（避免航点落在静态障碍的膨胀/致命区内，见
+//   waypointMapCheckDetail 的长注释）；② 当前位姿净空诊断日志——车辆一旦停在
+//   膨胀区内，Smac 会持续抛 "Starting point in lethal space"，此日志可直接判读。
+// ==========================================================================
+double AutoMissionNode::nearestObstacleClearance(double x, double y, double max_search_radius)
+{
+  std::lock_guard<std::mutex> lk(data_mutex_);
+  if (!latest_map_ || max_search_radius <= 0.0) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const double res = latest_map_->info.resolution;
+  const double ox = latest_map_->info.origin.position.x;
+  const double oy = latest_map_->info.origin.position.y;
+  const int w = static_cast<int>(latest_map_->info.width);
+  const int h = static_cast<int>(latest_map_->info.height);
+
+  const double cx_f = (x - ox) / res;
+  const double cy_f = (y - oy) / res;
+  if (cx_f < 0.0 || cy_f < 0.0 || cx_f >= w || cy_f >= h) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const int cx = static_cast<int>(std::floor(cx_f));
+  const int cy = static_cast<int>(std::floor(cy_f));
+
+  const int span = static_cast<int>(std::ceil(max_search_radius / res));
+  double best = max_search_radius;         // 搜索范围内无占据栅格 → 视为"足够远"
+  const double span_sq = max_search_radius * max_search_radius;
+  for (int dy = -span; dy <= span; ++dy) {
+    const int yy = cy + dy;
+    if (yy < 0 || yy >= h) {
+      continue;
+    }
+    for (int dx = -span; dx <= span; ++dx) {
+      const int xx = cx + dx;
+      if (xx < 0 || xx >= w) {
+        continue;
+      }
+      // 占据判据与 waypointMapCheckDetail 一致（trinary 地图为 100，阈值 50 留余量）
+      if (latest_map_->data[static_cast<size_t>(yy) * w + xx] < 50) {
+        continue;
+      }
+      const double ddx = (static_cast<double>(xx) + 0.5) * res + ox - x;
+      const double ddy = (static_cast<double>(yy) + 0.5) * res + oy - y;
+      const double d2 = ddx * ddx + ddy * ddy;
+      if (d2 <= span_sq) {
+        const double d = std::sqrt(d2);
+        if (d < best) {
+          best = d;
+        }
+      }
+    }
+  }
+  return best;
 }
 
 // ==========================================================================
@@ -1452,15 +1554,25 @@ void AutoMissionNode::sendNextWaypoint()
   nav_action_client_->async_send_goal(goal_msg, send_opts);
   goal_send_time_ = this->now();
   goal_in_flight_ = true;
-  // V0.0.95 受阻检测基准：记录发 goal 时的 map 系位姿（无位姿 → NaN，本航点不做受阻判定）
+  // V0.0.96 受阻检测基准：记录发 goal 时【车辆到该航点的距离】，
+  //   后续以"朝目标推进量 = 起始距离 − 当前距离"判受阻（倒车会使推进量为负，仍判受阻）
   {
     double px = 0.0, py = 0.0;
     if (currentMapPose(px, py)) {
-      goal_start_x_ = px;
-      goal_start_y_ = py;
+      goal_start_dist_ = std::hypot(wp.x - px, wp.y - py);
+      // V0.0.96 当前位姿净空诊断：车一旦停在静态障碍的膨胀/致命区内，
+      //   Smac 会持续抛 "Starting point in lethal space!"（清图无效——静态层会重新盖章），
+      //   此处提前给出可判读告警（行为树恢复池已含受限倒车脱困，会尝试倒车驶离）
+      const double here_clearance = nearestObstacleClearance(px, py, waypoint_clearance_m_);
+      if (here_clearance < waypoint_clearance_m_) {
+        RCLCPP_WARN(get_logger(),
+          "[sendNextWaypoint] ⚠ 当前位姿地图净空仅 %.2fm（< %.2fm，处于 Nav2 膨胀/致命区内）："
+          "全局规划可能报 Starting point in lethal space!，行为树将尝试受限倒车脱困；"
+          "若反复失败请人工移车或重标航点",
+          here_clearance, waypoint_clearance_m_);
+      }
     } else {
-      goal_start_x_ = std::numeric_limits<double>::quiet_NaN();
-      goal_start_y_ = std::numeric_limits<double>::quiet_NaN();
+      goal_start_dist_ = -1.0;
     }
     blocked_count_ = 0;
     goal_cancel_by_mission_ = false;   // 新 goal 已发出，清除上一轮的主动取消标记
@@ -1662,6 +1774,48 @@ void AutoMissionNode::resultCallback(
       "[Nav2] 航点[%zu] 的 goal 已按本节点指令取消，失败计数与换点由取消方处理",
       current_wp_idx_);
     return;
+  }
+
+  // V0.0.96：ABORT 但车辆【其实已经到达】该航点 → 判为完成，不计失败。
+  //   现场场景（V0.0.95 实车日志）：车已行驶到航点 A 附近（距目标 0.07m，
+  //   已在 xy_goal_tolerance 0.10m 内），但 Nav2 行为树要求先
+  //   ComputePathToPose 成功才会执行 FollowPath；车此刻恰好停在静态地图
+  //   障碍的膨胀区内 → Smac 持续抛 "Starting point in lethal space!" →
+  //   规划失败 → 整树 ABORT（车辆实际已到位）。旧逻辑会把这种"已到达"
+  //   计成一次失败，导致 fail_count 迅速达 3 而 FAULT 锁存、任务静默终止。
+  //   判据与航点"已到达"预检同源（already_reached_dist_），语义一致。
+  if (result.code != rclcpp_action::ResultCode::SUCCEEDED &&
+    !waypoints_.empty() && current_wp_idx_ < waypoints_.size())
+  {
+    double px = 0.0, py = 0.0;
+    if (currentMapPose(px, py)) {
+      const double d = std::hypot(
+        waypoints_[current_wp_idx_].x - px, waypoints_[current_wp_idx_].y - py);
+      if (d <= already_reached_dist_) {
+        RCLCPP_WARN(get_logger(),
+          "[Nav2] 航点[%zu]%s 规划/跟踪失败（%s），但车辆已在其到达半径内"
+          "（距目标 %.2fm ≤ %.2fm），判为【已到达】并推进下一航点（不计失败）",
+          current_wp_idx_, waypoints_[current_wp_idx_].label.c_str(),
+          (result.code == rclcpp_action::ResultCode::ABORTED) ? "ABORTED" : "CANCELED",
+          d, already_reached_dist_);
+        wp_fail_count_ = 0;
+        const size_t next_idx = current_wp_idx_ + 1;
+        if (next_idx < waypoints_.size()) {
+          current_wp_idx_ = next_idx;
+        } else if (loop_waypoints_) {
+          RCLCPP_INFO(get_logger(), "[Nav2] 所有航点完成，循环重新开始");
+          current_wp_idx_ = 0;
+        } else {
+          RCLCPP_INFO(get_logger(), "[Nav2] 所有航点完成，停止巡航（loop_waypoints=false）");
+          state_ = MissionState::IDLE;
+          return;
+        }
+        if (state_ == MissionState::NAVIGATING) {
+          sendNextWaypoint();
+        }
+        return;
+      }
+    }
   }
 
   if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {

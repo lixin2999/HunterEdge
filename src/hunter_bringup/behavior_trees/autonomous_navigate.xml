@@ -152,14 +152,28 @@
 
         <!--
           恢复行为回退池（轮询）
-          V0.0.89 测试场地：移除 Spin（阿克曼不能原地旋转）与 BackUp（倒车恶化
-          定位/与向前巡航相悖），恢复退化为"清图 + 等待障碍让行"的非运动组合，
-          多次清图仍规划失败则由外层 RecoveryNode 达上限后 ABORT 交 auto_mission 换点
+          V0.0.89 测试场地：移除 Spin（阿克曼不能原地旋转）。
+          V0.0.95 恢复受限倒车（BackUp）于 FollowPath 失败恢复序列。
+          V0.0.96 关键修正——把 BackUp 提到回退池【首位】：
+            现场日志（V0.0.95 实车）显示真正的卡死来自【规划失败】而非跟踪失败——
+            车开到航点附近后停在静态地图障碍的膨胀区内，SmacPlannerHybrid 的
+            areInputsValid() 判起点无效，持续抛
+            "Starting point in lethal space! Cannot create feasible plan."，
+            此时恢复池若只有“清图 + Wait”则永远无法脱困：
+              • 清图无效——StaticLayer::reset() 只置 has_updated_data_ 并由静态地图
+                重新盖章（动态障碍标记会被清掉，静态障碍不会）；
+              • 等待无效——起点有效性不随时间变化；
+              • 唯一出路是【物理驶离膨胀区】→ 倒车 0.45m 后 1Hz 重规划即可成功。
+            安全兜底同 FollowPath 恢复：safety_guard 倒车时按【后方走廊】判据
+            （后净空 < stop_dist 即零速）+ 地图边界监护；BackUp 受限（0.45m/0.10m/s，
+            time_allowance 6s），失败也只损失约 1 个恢复周期。
         -->
         <ReactiveFallback name="RecoveryFallback">
           <!-- 外部目标点实时更新：立即重新规划 -->
           <GoalUpdated/>
           <RoundRobin name="RecoveryActions">
+            <!-- V0.0.96：首位——让"停在膨胀/致命区内"的规划失败能物理脱困 -->
+            <BackUp backup_dist="0.45" backup_speed="0.10" time_allowance="6.0"/>
             <ClearEntireCostmap
               name="ClearGlobalCostmap-Subtree"
               service_name="global_costmap/clear_entirely_global_costmap"/>
@@ -167,7 +181,7 @@
               name="ClearLocalCostmap-Subtree"
               service_name="local_costmap/clear_entirely_local_costmap"/>
             <!-- 等待：障碍物可能短暂通过，或等待人工把车移离致命栅格 -->
-            <Wait wait_duration="3"/>
+            <Wait wait_duration="2"/>
           </RoundRobin>
         </ReactiveFallback>
 

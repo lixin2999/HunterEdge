@@ -203,6 +203,14 @@ local_costmap:
       height: 10
       footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
       plugins: ["obstacle_layer", "inflation_layer"]
+      # ⚠ V0.0.96 现场教训：局部代价地图为滚动窗口（odom 系）且**不含 static_layer**，
+      #   即 MPPI 只能避开"实时感知到"的障碍，不会避开**仅存在于静态 PGM 地图中**的
+      #   障碍（如建图时存在、现已移走的物体，或被车体/低矮结构遮挡的地图障碍）。
+      #   现场表现：车被一路开到静态障碍的膨胀区内 → 之后 Smac 持续抛
+      #   "Starting point in lethal space!"（起点格代价 LETHAL/INSCRIBED）→ 全线规划失败。
+      #   本次不把 static_layer 加进滚动局部代价地图（StaticLayer 需 map 系非滚动窗口，
+      #   改动风险大），改为三层防护：① 任务层航点净空校验（waypoint_clearance_m 0.50m）；
+      #   ② 全局规划（Smac + 静态层）绕行；③ 行为树恢复池首位受限倒车脱困（V0.0.96）。
       # V0.0.82 双障碍源冗余（与 global_costmap 一致）：单一聚类点云源为
       # 单点故障；/scan 直采源带清障（clearing），感知链任一环异常时另一源兜底
       obstacle_layer:
