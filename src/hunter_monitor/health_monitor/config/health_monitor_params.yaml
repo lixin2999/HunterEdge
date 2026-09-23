@@ -22,7 +22,9 @@ health_monitor:
     # 传感器频率异常阈值（文档 15.3）
     lidar_min_rate: 8.0         # LiDAR < 8Hz 持续 2s
     lidar_duration: 2.0
-    camera_min_rate: 10.0       # Camera < 10Hz 持续 2s
+    camera_min_rate: 5.0        # Camera < 5Hz 持续 2s（原 10Hz 过于激进：Realsense 标称帧率
+                               # 在系统过载时于 12~15Hz 抖动并偶发跌破 10Hz，被频率看门狗
+                               # 逐次误判为“崩溃/重启”，5Hz 才对应真实断流下限）
     camera_duration: 2.0
     imu_min_rate: 50.0          # IMU < 50Hz 持续 1s
     imu_duration: 1.0

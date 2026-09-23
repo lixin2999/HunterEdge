@@ -80,7 +80,15 @@ public:
     // ---- 参数 ----
     declare_parameter<double>("wheelbase", 0.46);          // HUNTER-SE 轴距（m）
     declare_parameter<double>("min_turn_radius", 1.9);     // 与 Smac 规划一致（m）
-    declare_parameter<double>("max_linear_vel", 0.8);      // 纵向硬限（m/s）
+    declare_parameter<double>("max_linear_vel", 0.5);       // 纵向硬限（m/s）
+                                                           // V0.1.02：《方案》§8.3 对齐——默认值
+                                                           //   由 0.8 改 0.5，与 nav2_params.yaml
+                                                           //   desired_linear_vel/vx_max/velocity_smoother
+                                                           //   max_velocity[0] 同源。本参数是"速度硬限"
+                                                           //   （第二重限速，防参数被误调回 2.0），
+                                                           //   默认值若大于生产值，一旦 launch 忘记传参
+                                                           //   就会静默放行 0.8m/s（=1.6 倍巡航速度，
+                                                           //   制动距离 4 倍）→ 默认值必须等于生产值
     declare_parameter<double>("stop_dist", 0.90);           // 碰撞急停距离（m）
     declare_parameter<double>("slow_dist", 1.40);           // 减速预警距离（m）
     // V0.0.97 与 hunter_autonomous_nav.launch.py 同步重标定（原 0.6/1.2 为上游默认值，

@@ -203,7 +203,14 @@ controller_server:
 global_costmap:
   global_costmap:
     ros__parameters:
-      update_frequency: 2.0                    # V0.0.82：原 1.0，配合 BT 2Hz 重规划
+      update_frequency: 1.0                    # V0.1.02：《低速避障方案》§4.4 对齐 2.0→1.0。
+                                               #   依据：行为树重规划已是 1.0Hz（V0.0.92 由 2Hz
+                                               #   回退，见 autonomous_navigate.xml RateController
+                                               #   hz=1.0），全局图 2Hz 更新纯属算力浪费——
+                                               #   本图是 100m×100m@0.1m = 100 万格，StaticLayer
+                                               #   每次刷新都全量拷静态图。降为 1Hz 与重规划同频，
+                                               #   省下的算力留给 MPPI(20Hz) 与感知链（Jetson
+                                               #   日志长期报 Control loop missed 20Hz）
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
@@ -267,21 +274,43 @@ global_costmap:
                                                 #   costmap 层放宽不降安全）
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.40                 # V0.0.82：原 0.35，加大缓冲（≥内切半径 0.33+余量）
+        inflation_radius: 0.55                 # V0.1.02：《方案》§4.4 对齐 0.40→0.55。
+                                               #   全局图是 Smac 的规划依据，膨胀半径直接决定
+                                               #   全局路径与静态障碍的横向留白：0.55 = 车体
+                                               #   半宽 0.32 + 0.23m 余量，使路径"天然取中"、
+                                               #   少贴墙贴门框 → 低速巡航少触发安全层
+                                               #   SLOWDOWN/STOP、少"擦边后卡住"。
+                                               #   可通行性不受损：仅 ≥ 内切半径(0.32m) 的格是
+                                               #   致命格，0.32~0.55m 只是高代价仍可通行；
+                                               #   2.5m 宽通道扣两侧膨胀后仍余 1.4m 净宽
+                                               #   > 车宽 0.64m ✔（窄通道由局部图 0.45 与
+                                               #   safety_guard 扫掠弧兜底，见 §5.5.1）
         cost_scaling_factor: 3.0
 
 # ---- 局部代价地图（文档 8.3） ----
 local_costmap:
   local_costmap:
     ros__parameters:
-      update_frequency: 10.0                   # V0.0.82：原 5.0，高速/贴近障碍场景更快反应
-      publish_frequency: 5.0                   # 原 2.0
+      update_frequency: 5.0                    # V0.1.02：《方案》§4.4 对齐 10.0→5.0（配合下方
+                                               #   窗口 10m→6m，两项合计把局部图刷新算力降到
+                                               #   约 1/5.6：200²格@10Hz → 120²格@5Hz）。依据：
+                                               #   本车巡航 ≤0.5m/s，5Hz×0.5m/s = 10cm/拍，
+                                               #   而膨胀半径 0.45m、MPPI 自身 20Hz 重优化；
+                                               #   真正决定"贴脸急停有多快"的是 safety_guard
+                                               #   直读 /scan 的 20Hz 轨迹扫掠弧，不依赖本图。
+                                               #   收益是把算力让给 MPPI/感知（现场长期报
+                                               #   "Control loop missed 20Hz"、观测缓冲积压）。
+                                               #   ⚠ 若现场出现"障碍顶到近处才减速"，或
+                                               #   auto_mission 假障碍诊断频繁报"数据过期"，
+                                               #   把本项回 10.0（其余不动）
+      publish_frequency: 5.0                   # 与 update_frequency 同步（发布不能快于更新）
       # V0.1.00 新增：auto_mission 的"车身四周/脚底假障碍占位"诊断（需求②）订阅
       # /local_costmap/costmap（nav_msgs/OccupancyGrid 整图）。Costmap2DPublisher
       # 默认只在"窗口几何变化"时发整图、平时只发 *_updates（见
       # nav2_costmap_2d/src/costmap_2d_publisher.cpp 的 publishCostmap()），而车辆
       # 停驻待诊断时恰恰是"几何不变、只有代价变化"的场景 → 不开本项则诊断永远收到
-      # 过期图，假障碍判据失效。开销：200×200 格 @5Hz ≈ 0.2 MB/s（本机 DDS，可忽略）。
+      # 过期图，假障碍判据失效。开销：V0.1.02 起 120×120 格 @5Hz ≈ 0.07 MB/s
+      # （原 200×200 格 @10Hz；本机 DDS 下均可忽略）。
       # ⚠ 关闭此项时 self_check_enable 的诊断结论会自动降级为"数据过期·不可判定"，
       #   不会误判，但也不会再自动清图。
       always_send_full_costmap: true
@@ -289,8 +318,13 @@ local_costmap:
       robot_base_frame: base_link
       rolling_window: true
       resolution: 0.05                         # 文档 8.3：分辨率 0.05m
-      width: 10                                # 文档 8.3：10m × 10m（Nav2 Humble 要求 integer）
-      height: 10
+      width: 6                                 # V0.1.02：《方案》§4.4 对齐 10m→6m 滚动窗口
+      height: 6                                #   （车居中，前后各 3.0m）。校核：MPPI 4.0s
+                                               #   时域在 0.5m/s 下前瞻 2.0m + 车体前缘 0.45m
+                                               #   + 膨胀 0.45m ≈ 2.9m < 3.0m ✔ 刚好覆盖；
+                                               #   MPPI prune_distance 2.0→3.0 也以 3m 为界。
+                                               #   再放大只是让不会被用到的远场白占算力
+                                               #   （NAV2 Humble 要求 integer，单位 m）
       footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.37, -0.32], [-0.37, 0.32] ]"   # 文档 9.3
       plugins: ["obstacle_layer", "inflation_layer"]
       # ⚠ V0.0.96 现场教训：局部代价地图为滚动窗口（odom 系）且**不含 static_layer**，

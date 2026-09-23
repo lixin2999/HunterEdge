@@ -33,12 +33,17 @@ LidarPerception::LidarPerception(const rclcpp::NodeOptions & options)
   declare_parameter("roi_horizontal_fov", 120.0);
   declare_parameter("ground_height_threshold", 0.15);
   declare_parameter("ground_ray_resolution", 0.1);
-  declare_parameter("cluster_tolerance", 0.5);
+  // V0.1.02：《方案》§4.1 第 6 步——射线坡度法地面分割的坡度阈值（°），
+  //   原为 RayGroundFilter 构造默认 8.0°（不可配），现提为参数，生产值 5.0°。
+  //   平坦地面 dz≈0 → 坡度≈0，5° 与 8° 判定一致；收紧只让坡道/台阶边缘更早
+  //   判为障碍（偏保守，杜绝"缓坡被当地面 → 撞上台阶"）。
+  declare_parameter("ground_max_slope", 5.0);
+  declare_parameter("cluster_tolerance", 0.15);   // V0.1.02：0.5 → 0.15（《方案》§4.1 第 7 步；取舍见 yaml 注释）
   declare_parameter("cluster_min_points", 10);
   declare_parameter("cluster_max_points", 5000);
   declare_parameter("association_distance", 1.0);
   declare_parameter("timeout", 0.3);
-  declare_parameter("outlier_mean_k", 10);
+  declare_parameter("outlier_mean_k", 50);        // V0.1.02：10 → 50（《方案》§4.1 第 5 步 SOR k 邻域）
   declare_parameter("outlier_std_dev", 1.0);
   // 修正：将硬编码参数提取为可配置参数
   declare_parameter("scan_period", 0.1);        // 扫描周期，默认 0.1s (10Hz)
@@ -57,6 +62,7 @@ LidarPerception::on_configure(const rclcpp_lifecycle::State &)
   roi_hfov_deg_ = get_parameter("roi_horizontal_fov").as_double();
   ground_height_threshold_ = get_parameter("ground_height_threshold").as_double();
   ground_ray_resolution_deg_ = get_parameter("ground_ray_resolution").as_double();
+  ground_max_slope_deg_ = get_parameter("ground_max_slope").as_double();   // V0.1.02 新增
   cluster_tolerance_ = get_parameter("cluster_tolerance").as_double();
   cluster_min_points_ = static_cast<int>(get_parameter("cluster_min_points").as_int());
   cluster_max_points_ = static_cast<int>(get_parameter("cluster_max_points").as_int());
@@ -69,7 +75,8 @@ LidarPerception::on_configure(const rclcpp_lifecycle::State &)
   marker_lifetime_ = get_parameter("marker_lifetime").as_double();
   marker_alpha_ = get_parameter("marker_alpha").as_double();
 
-  ground_filter_ = RayGroundFilter(ground_height_threshold_, ground_ray_resolution_deg_);
+  ground_filter_ = RayGroundFilter(
+    ground_height_threshold_, ground_ray_resolution_deg_, ground_max_slope_deg_);
   tracker_ = MultiObjectTracker(association_distance_);
 
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());

@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V2.2（开发指南，对应软件基线 **V0.1.00**：实车日志「`[FAULT] 任务已锁存（单航点导航超时连续达上限）……处置后将模式开关离开 AUTO 再切回以重启任务`」的彻底修复——`auto_mission` 任务层「**自愈四件套**」：① **逐航点失败隔离 + 自动轮转**（失败计数由「跨航点总量」下沉为「单个航点」，超时/受阻 → 放弃该点 + 清两张代价地图（重新规划）+ 改发下一个可用航点，隔离冷却 120s 后自动重试；任务级 `max_consec_failures`(12) 才兜底进 FAULT）；② **车身四周/脚底「假障碍占位」自动诊断**（`/local_costmap/costmap` × `/perception/lidar_objects` × `/perception/fused_objects`（含仅相机确认的目标）三路交叉：代价地图在车身框±35cm 内占位而两路传感器均无实体 ⇒ 判【假障碍】并自动清图，不再需要人拿 rviz2 看图）；③ **航点可达性按地图范围判定**（5/7 chamfer 净空场 + 8 邻域可通行连通域 BFS，与车位不在同一连通域 ⇒ 永久隔离该点并继续跑其他航点，按冷却周期自动复判）；④ **FAULT 由「永久锁存等人工解锁」改为自愈态**（静置 20s → 诊断 + 清图 + 全航点复判 + 三重门控 → 自动回 IDLE 重启；**遥控接管后切回 AUTO 即自动复驶**）。历史：V0.0.99（阿克曼几何参数一致性修正）、V0.0.98（safety_guard 轨迹扫掠弧碰撞闸 + MPPI 4.0s 时域 + 取消静置门控）、V0.0.97（绕障几何 + goal 世代号）、V0.0.96（航点净空校验、恢复池倒车）修复均已实车验证生效）
+> **文档版本**：V2.4（开发指南，对应软件基线 **V0.1.02**：**《HUNTER SE 低速自动驾驶避障解决方案》逐条对表落地**——对表审计确认方案的避障主链（扫掠弧闸/REEDS_SHEPP/MPPI 4.0s/自愈四件套/BT/五级预检）**已全部在位**，本轮只补齐 5 处量化参数：① 代价地图尺度（全局 `inflation_radius 0.40→0.55`、全局 `update_frequency 2.0→1.0`、局部 `update_frequency 10.0→5.0` + 窗口 `10m→6m`，局部图算力降至 ≈1/5.6）；② 感知（`lidar_perception` 新增可配 `ground_max_slope 5.0°`、`outlier_mean_k 10→50`、`cluster_tolerance 0.5→0.15`；`sensor_fusion.vision_conf_min 0.45→0.50`）；③ `safety_guard.max_linear_vel` 默认值 `0.8→0.5`；并把 6 项**有意保留的偏差**写明理由（对照全表见 Deployment_Guide §5.5.2、避障 10 项验收见 §5.7、本节 §10.10）。上一版 V0.1.01：**health_monitor「相机崩溃/重启风暴」误报修复**——频率看门狗把 15Hz 标称帧率在系统过载下的正常抖动误判为进程崩溃（`checkNodes` 不 respawn 任何进程，仅按相机话题频率做异常-恢复边沿计数）：`camera_min_rate` 10→5Hz + 措辞去误导（“疑似崩溃/重启”→“频率异常/恢复”，逻辑与对外语义不变），重编 `hunter_monitor`，详见 release.md V0.1.01。上一版 V0.1.00：实车日志「`[FAULT] 任务已锁存（单航点导航超时连续达上限）……处置后将模式开关离开 AUTO 再切回以重启任务`」的彻底修复——`auto_mission` 任务层「**自愈四件套**」：① **逐航点失败隔离 + 自动轮转**（失败计数由「跨航点总量」下沉为「单个航点」，超时/受阻 → 放弃该点 + 清两张代价地图（重新规划）+ 改发下一个可用航点，隔离冷却 120s 后自动重试；任务级 `max_consec_failures`(12) 才兜底进 FAULT）；② **车身四周/脚底「假障碍占位」自动诊断**（`/local_costmap/costmap` × `/perception/lidar_objects` × `/perception/fused_objects`（含仅相机确认的目标）三路交叉：代价地图在车身框±35cm 内占位而两路传感器均无实体 ⇒ 判【假障碍】并自动清图，不再需要人拿 rviz2 看图）；③ **航点可达性按地图范围判定**（5/7 chamfer 净空场 + 8 邻域可通行连通域 BFS，与车位不在同一连通域 ⇒ 永久隔离该点并继续跑其他航点，按冷却周期自动复判）；④ **FAULT 由「永久锁存等人工解锁」改为自愈态**（静置 20s → 诊断 + 清图 + 全航点复判 + 三重门控 → 自动回 IDLE 重启；**遥控接管后切回 AUTO 即自动复驶**）。历史：V0.0.99（阿克曼几何参数一致性修正）、V0.0.98（safety_guard 轨迹扫掠弧碰撞闸 + MPPI 4.0s 时域 + 取消静置门控）、V0.0.97（绕障几何 + goal 世代号）、V0.0.96（航点净空校验、恢复池倒车）修复均已实车验证生效）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -657,6 +657,26 @@ src/
         └── hunter_autonomous_nav.launch.py     ← 新增一体化 launch
 ```
 
+### 10.10 V0.1.02 避障参数（《HUNTER SE 低速自动驾驶避障解决方案》对表）
+
+对表审计的完整方法见 Deployment_Guide **§5.5.2**（"方案章节 → 实现锚点"表 + "有意保留偏差"表）。本节只列**本轮被改动的值**，便于代码审查与回归定位：
+
+| 文件 | 参数 | 改动 | 依据 / 关键理由 |
+|---|---|---|---|
+| `hunter_bringup/config/nav2_params.yaml` | `global_costmap.inflation_radius` | 0.40 → **0.55** | 方案 §4.4。全局图是 **Smac** 的规划依据：留白 = 半宽 0.32 + 0.23m，路径"天然取中"→ 少贴墙贴门框 → 少触发安全层 SLOWDOWN/STOP（低速更平顺）。仅 ≥0.32m（内切半径）才是致命格，可通行性不受损 |
+| 同上 | `global_costmap.update_frequency` | 2.0 → **1.0** | 方案 §4.4。BT 重规划 V0.0.92 起已回退 1Hz；2Hz 反复刷 100 万格纯属浪费 |
+| 同上 | `local_costmap.update_frequency` | 10.0 → **5.0** | 方案 §4.4。@0.5m/s 每拍 10cm；膨胀 0.45m + MPPI 20Hz 重优化足够；近身快闸是 safety_guard 直读 /scan 的 20Hz 扫掠弧 |
+| 同上 | `local_costmap.width` / `height` | 10 → **6** | 方案 §4.4。校核：4.0s 时域 @0.5m/s 前瞻 2.0m + 前缘 0.45 + 膨胀 0.45 ≈ **2.9m < 3.0m** ✔；两项合计局部图算力降至 ≈1/5.6（200²@10Hz → 120²@5Hz） |
+| `hunter_perception/lidar_perception/config/lidar_perception_params.yaml` + `src/lidar_perception.cpp` + `include/lidar_perception/lidar_perception.hpp` | `ground_max_slope` | **新增（默认 5.0°）** | 方案 §4.1 第 6 步。原为 `RayGroundFilter` 构造默认 8.0°，硬编码不可配；平坦地面 dz≈0 两者判定一致，收紧只让坡道/台阶更早判为障碍 |
+| 同上 | `outlier_mean_k` | 10 → **50** | 方案 §4.1 第 5 步。SOR 是全链唯一噪点滤除环节，k 越大越能区分孤立噪点与真实稀疏回波 → 减少 costmap/safety_guard 幽灵点误判 |
+| 同上 | `cluster_tolerance` | 0.5 → **0.15** | 方案 §4.1 第 7 步。⚠ 16 线垂直 2°/线 ⇒ 线间距 1m→3.5cm、3m→10.5cm、4.3m→15cm：**近身聚类恒完整，4.3m 外逐环线断开**。只影响 `/perception/lidar_objects` 粒度与跟踪，**不影响避障**（代价地图障碍源是未聚类原始点云与 `/scan`） |
+| `hunter_perception/sensor_fusion/config/sensor_fusion_params.yaml` | `vision_conf_min` | 0.45 → **0.50** | 方案 §4.3。低置信度误检不再参与融合，"激光 × 融合"交叉验证（假障碍诊断 B 路）更干净 |
+| `hunter_safety/src/safety_guard.cpp` | `max_linear_vel` **默认值** | 0.8 → **0.5** | 方案 §8.3。本参数是第二重速度硬限，默认值必须等于生产值——否则 launch 漏传参时静默放行 1.6× 巡航速度 |
+
+**有意保留的偏差（6 项，理由见 Deployment_Guide §5.5.2(3)，改前必读）**：点云裁剪下界 `0.5m`（方案 0.2，防自反射幽灵目标）、融合对齐窗 `0.20s`（方案 ±50ms，保任务层 ESTOP 可用）、欧式聚类实现（方案称 DBSCAN，本仓为 PCL `EuclideanClusterExtraction`）、相机 `15fps`（方案 §4.2 写 30，§9.3 验收允许 15-30）、`YOLOv8s`（方案写 n，engine 须目标机生成）、局部图无 `static_layer`（方案亦列为"已知限制"）。
+
+**重编清单**：`rm -rf build/{hunter_safety,hunter_bringup,lidar_perception} install/{hunter_safety,hunter_bringup,lidar_perception}` → `colcon build --packages-select hunter_safety hunter_bringup lidar_perception`（若同时应用融合参数再加 `sensor_fusion`），随后 **Ctrl+C 重启 bring-up**。
+
 ---
 
 ## 11. 开发指引
@@ -842,13 +862,13 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 |------|------|
 | 《自动驾驶车辆系统详细设计文档 V2.0》 | 本项目的设计基准；本文档全部参数、话题、CAN 协议、坐标系均可追溯至其对应章节 |
 | AI 编码任务清单 | 分模块开发任务（任务 00 ~ 任务 17），指导按模块开发与验收 |
-| `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程，**V2.2** 对应软件基线 V0.1.00） |
-| `Deployment_Guide.md` | 部署操作文档 **V2.2**（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.1.00） |
+| `User_Manual.md` | 面向现场运维人员的用户手册（独立文档，含详细部署/联调/故障排查/自主导航操作流程，**V2.3** 对应软件基线 V0.1.01） |
+| `Deployment_Guide.md` | 部署操作文档 **V2.3**（环境要求/环境配置/环境安装/源码部署/功能操作步骤/异常处理全流程，对应软件基线 V0.1.01） |
 | `release.md` | 版本历史（V0.0.1 ~ 当前），记录每版主要功能与修复 |
 
 > **追溯原则**：本 README 中所有硬件参数（§2）、软件版本（§3）、话题（§8）、控制模式（§9）、限制（§13）均源自《自动驾驶车辆系统详细设计文档 V2.0》，未虚构功能。自主导航模块（§10）为在设计文档框架内的扩展实现。
 
 ---
 
-*HunterEdge 开发指南 · 文档版本 V2.2 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.1.00 现场实测修正（V0.0.93：方案A 定位架构重构；V0.0.94：“原地不动”残余故障链修复；V0.0.95：“无法绕开障碍物”分层修复；V0.0.96：“行驶一小段立即停下”修复；V0.0.97：阿克曼绕障几何死锁 + 过期 goal 修复；V0.0.98：safety_guard 轨迹扫掠弧碰撞闸、MPPI 4.0s 预测时域与 critic 重标定、auto_mission 取消静置门控、/scan 链降载；V0.0.99：阿克曼几何参数一致性修正（轴距 0.65→0.46、调试 launch 与生产同步）；**V0.1.00：`auto_mission` 任务层「自愈四件套」——逐航点失败隔离与自动轮转（单点超时不再锁存整条任务）、车身四周/脚底假障碍自动诊断（局部代价地图 × 激光 × 相机）、航点可达性按静态地图可通行连通域判定、FAULT 由永久锁存改自愈态（接管后切回 AUTO 即自动复驶）；新增 23 个参数，`nav2_params.yaml` `local_costmap.always_send_full_costmap: true`；不新增任何话题/消息/服务；重编 `auto_mission hunter_bringup`）*
+*HunterEdge 开发指南 · 文档版本 V2.4 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.1.02 现场实测修正（V0.0.93：方案A 定位架构重构；V0.0.94：“原地不动”残余故障链修复；V0.0.95：“无法绕开障碍物”分层修复；V0.0.96：“行驶一小段立即停下”修复；V0.0.97：阿克曼绕障几何死锁 + 过期 goal 修复；V0.0.98：safety_guard 轨迹扫掠弧碰撞闸、MPPI 4.0s 预测时域与 critic 重标定、auto_mission 取消静置门控、/scan 链降载；V0.0.99：阿克曼几何参数一致性修正（轴距 0.65→0.46、调试 launch 与生产同步）；**V0.1.00：`auto_mission` 任务层「自愈四件套」——逐航点失败隔离与自动轮转（单点超时不再锁存整条任务）、车身四周/脚底假障碍自动诊断（局部代价地图 × 激光 × 相机）、航点可达性按静态地图可通行连通域判定、FAULT 由永久锁存改自愈态（接管后切回 AUTO 即自动复驶）；新增 23 个参数，`nav2_params.yaml` `local_costmap.always_send_full_costmap: true`；不新增任何话题/消息/服务；重编 `auto_mission hunter_bringup`）；**V0.1.01：health_monitor「相机崩溃/重启风暴」误报修复——频率看门狗将 15Hz 标称帧率在系统过载下的正常抖动误判为进程崩溃（`checkNodes` 不 respawn），`camera_min_rate` 10→5Hz + `checkNodes` 措辞去误导（“疑似崩溃/重启”→“频率异常/恢复”，逻辑与对外语义不变），仅重编 `hunter_monitor`）；**V0.1.02：按《HUNTER SE 低速自动驾驶避障解决方案》逐条对表落地——审计确认避障主链（扫掠弧闸/REEDS_SHEPP/MPPI 4.0s/自愈四件套/BT/五级预检）已全部在位，本轮只补 5 处量化参数：全局 `inflation_radius 0.55` + 全局 `update_frequency 1.0` + 局部 `6m×6m @5Hz`（局部图算力 ≈1/5.6）、`lidar_perception` 新增可配 `ground_max_slope 5.0°` 与 `outlier_mean_k 50`、`cluster_tolerance 0.15`、`sensor_fusion.vision_conf_min 0.50`、`safety_guard.max_linear_vel` 默认 `0.5`；6 项有意保留偏差写明理由（§10.10 与 Deployment_Guide §5.5.2）、避障 10 项验收见 Deployment_Guide §5.7；重编 `hunter_safety hunter_bringup lidar_perception`）*
 

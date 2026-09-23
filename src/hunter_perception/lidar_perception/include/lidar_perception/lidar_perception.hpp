@@ -78,6 +78,7 @@ private:
   std::string cloud_topic_, imu_topic_, target_frame_;
   double roi_max_range_, roi_min_range_, roi_hfov_deg_;
   double ground_height_threshold_, ground_ray_resolution_deg_;
+  double ground_max_slope_deg_{5.0};   // V0.1.02：射线坡度法坡度阈值（°），《方案》§4.1 第 6 步
   double cluster_tolerance_;
   int cluster_min_points_, cluster_max_points_;
   double association_distance_;

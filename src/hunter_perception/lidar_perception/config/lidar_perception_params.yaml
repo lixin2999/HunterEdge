@@ -1,26 +1,47 @@
-# lidar_perception_params.yaml — 激光感知参数（文档 5.1.2）
+# lidar_perception_params.yaml — 激光感知参数（文档 5.1.2 /《低速避障方案》§4.1）
 lidar_perception:
   ros__parameters:
     cloud_topic: "/lidar_points"
     imu_topic: "/imu/data"
     target_frame: "base_link"
     # ROI 裁剪（文档 5.1.1：车前 120°、50m）
+    # ⚠ roi_min_range=0.5 与《方案》§4.1「0.2~50m 裁剪」的偏差属【有意保留】：
+    #   雷达装于 x=0.23/z=0.35，车体自身结构（车顶/货箱前壁）在 0.3~0.5m 有回波，
+    #   降到 0.2m 会把自反射灌进聚类链 → "贴脸幽灵目标"。近场盲区由 safety_guard
+    #   的 footprint 包络盒（0.45+0.12=0.57m）与 /scan range_min 0.70 统一兜住。
     roi_max_range: 50.0
     roi_min_range: 0.5
     roi_horizontal_fov: 120.0
     # 地面分割（文档 5.1.2：高度阈值 0.15m，射线分辨率 0.1°）
     ground_height_threshold: 0.15
     ground_ray_resolution: 0.1
-    # 欧式聚类（文档 5.1.2：距离 0.5m，最小 10 点，最大 5000 点）
-    cluster_tolerance: 0.5
+    # V0.1.02：《方案》§4.1 第 6 步对齐——射线坡度法「同射线相邻点坡度 > 5° 判为障碍起点」。
+    #   原本为 C++ 构造默认值 8.0°（不可配），现提为参数并取生产值 5.0°。
+    #   平坦地面所有地面点 dz≈0 → 坡度≈0，5° 与 8° 结果一致；收紧只让坡道/台阶边缘
+    #   更早判为障碍（偏保守，不会"漏掉障碍"）。
+    ground_max_slope: 5.0
+    # 欧式聚类（V0.1.02：《方案》§4.1 第 7 步 → 簇容差 0.15m、最小 10 点、最大 5000 点）
+    #   ⚠ 取舍说明（必读）：RS-Helios-16P 垂直 2°/线，簇容差决定相邻线能否连成一体：
+    #     车距 1m 线间距 3.5cm ✔；3m → 10.5cm ✔；4.3m 以外 → >15cm ✗（逐线断开）。
+    #   ⇒ 近身（安全关键区，含 auto_mission 假障碍诊断的车身框 ±35cm）聚类恒完整；
+    #     4m 以外目标会"过分割"成每环线一个簇，只影响 /perception/lidar_objects 的
+    #     目标粒度与跟踪质量，**不影响避障**——代价地图的障碍源是
+    #     /perception/lidar/obstacle_cloud（未聚类的非地面原始点）与 /scan 直投，
+    #     两条路都不经过聚类。
+    #   现场判据：若 rviz2 中 4m 外同一障碍被标成十几条独立目标 / 目标数暴涨，
+    #     把本项回 0.5（点数区间 10/5000 保持不变）。
+    cluster_tolerance: 0.15
     cluster_min_points: 10
     cluster_max_points: 5000
     # 跟踪（文档 5.1.2：关联距离 1.0m）
     association_distance: 1.0
     # 异常降级
     timeout: 0.3            # 点云超时阈值（秒，对应 10Hz）
-    # 离群点去除（StatisticalOutlierRemoval）
-    outlier_mean_k: 10
+    # 离群点去除（StatisticalOutlierRemoval；V0.1.02：《方案》§4.1 第 5 步 k=50、std=1.0）
+    #   k 邻域 10 → 50：这是全链唯一"单束噪声/玻璃反光/拖影"滤除环节，k 越大越能区分
+    #   "孤立噪点"与"真实稀疏回波"，直接减少 costmap 与 safety_guard 的幽灵点误判
+    #   （幽灵点会触发假急停 / 把车脚底标成致命格）。算力代价可接受（Orin 上 10Hz 点云）。
+    outlier_mean_k: 50
     outlier_std_dev: 1.0
     # 修正：新增参数，替代硬编码值
     scan_period: 0.1        # 扫描周期（秒，对应 10Hz）

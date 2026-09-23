@@ -289,22 +289,24 @@ void HealthMonitor::checkNodes()
 
     if (!alive && was_alive) {
       if (ever_alive) {
-        RCLCPP_WARN(get_logger(), "%s 节点/话题异常（疑似崩溃）", name.c_str());
+        RCLCPP_WARN(get_logger(), "%s 话题频率持续低于阈值（疑似数据饥饿/过载，非进程崩溃）", name.c_str());
       } else {
         RCLCPP_WARN(
           get_logger(), "%s 启动宽限期结束后仍未检测到话题（疑似未启动）", name.c_str());
       }
     } else if (alive && !was_alive) {
       if (ever_alive) {
-        // 曾真实在线 → 掉线后恢复，视为一次重启
+        // 曾真实在线 → 频率跌破阈值后恢复，计一次“频率异常-恢复边沿”。
+        // 注意：health_monitor 不 respawn 任何进程，仅统计异常-恢复次数；旧版“重启第 N 次”
+        // 措辞会把系统过载下的正常帧率抖动误报为“崩溃/重启风暴”。
         restart_count_[name]++;
         RCLCPP_WARN(
-          get_logger(), "%s 节点重启（第 %d 次，阈值 %d 次）",
+          get_logger(), "%s 话题频率恢复（异常-恢复第 %d 次，阈值 %d 次）",
           name.c_str(), restart_count_[name], restart_limit_);
         if (restart_count_[name] > restart_limit_) {
-          // 文档 15.2：5 分钟内重启超过 3 次 → 标记故障，不再重启，上报
+          // 文档 15.2：5 分钟内频率异常-恢复超过 3 次 → 标记故障，上报
           RCLCPP_ERROR(
-            get_logger(), "%s 节点在 %.0fs 内重启超过 %d 次，标记为故障",
+            get_logger(), "%s 话题在 %.0fs 内频率异常-恢复超过 %d 次，标记为故障",
             name.c_str(), restart_window_, restart_limit_);
         }
       } else {
