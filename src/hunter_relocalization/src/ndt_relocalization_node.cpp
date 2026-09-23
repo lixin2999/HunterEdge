@@ -5,8 +5,10 @@
 // 设计要点：
 //  - map→odom 是本节点唯一广播的 TF 边；odom→base_link 归 FAST-LIO2；底盘/EKF 均 publish_tf=false。
 //  - 初值 T_map_odom 默认单位阵（假设上电≈建图起点），可用 /initialpose 重设。
-//  - 收敛判据：NDT hasConverged() 且 fitness<=fitness_max，且单周跳变在闸门内；否则维持旧值
-//    并发布大协方差（auto_mission 门控据此判断“定位未收敛”）。
+//  - 跟踪/置信度彻底解耦（V0.1.03）：是否刷新 map→odom 位姿只由跳变闸门 step_ok 决定，
+//    绝不用 fitness 冻结位姿（否则车一动 fit 越过阈值即冻结→越走越偏→永不回弹的死亡螺旋）；
+//    fitness 只调节对外协方差（fit<=fitness_max 收敛；其间去抖；fit>ceiling 严重失准跳过去抖
+//    直接宣告未收敛），三种情形都照常刷新位姿。仅跳变(step_ok=false)才维持旧位姿不发新值。
 //  - 大数据安全：全局 .pcd 体素降采样为 NDT target；滚动时间窗累积局部子图并降采样为 source。
 #include <chrono>
 #include <deque>
@@ -61,20 +63,20 @@ public:
     ndt_step_size_      = declare_parameter<double>("ndt_step_size", 0.1);
     ndt_epsilon_        = declare_parameter<double>("ndt_epsilon", 0.01);
     ndt_max_iters_      = declare_parameter<int>("ndt_max_iterations", 30);
-    // 收敛/跳变闸门
-    // fitness_max 适度放宽：车辆运动时滚动时间窗拼接的点云存在畸变，NDT fitness 会抬升
-    // （实测起步时 ~1.03），静止收敛态仅 0.02~0.4。过紧（1.0）会让起步即判“未收敛”→
-    // auto_mission 秒退 IDLE，形成“进 NAVIGATING→立即取消”抖振。
-    fitness_max_        = declare_parameter<double>("fitness_max", 2.5);
+    // 收敛/跳变闸门（V0.1.03：位姿跟踪只由 step_ok 决定，以下 fitness 阈值仅调节对外置信度）
+    // fitness_max：对外置信度“可否巡航”的门限。车辆运动时 2s 滚动窗拼接点云存在畸变，NDT fitness
+    // 会抬升（本例稀疏地图 ~1600 点、1m NDT，实测静止 ~1.65、行驶中 2~3）。取 3.5 容纳行驶期 fit 基线，
+    // 避免正常行驶被误判“未收敛”而 auto_mission 秒退 IDLE。
+    fitness_max_        = declare_parameter<double>("fitness_max", 3.5);
     max_step_trans_     = declare_parameter<double>("max_step_translation", 0.5);  // m / 周期
     max_step_rot_       = declare_parameter<double>("max_step_rotation", 0.35);    // rad / 周期
     converged_cov_      = declare_parameter<double>("converged_covariance", 0.01); // 收敛时发布的小协方差
-    // 连续失败去抖：允许连续 N 个周期超闸门仍对外保持“收敛”小协方差（仅不更新位姿），
+    // 连续失败去抖：允许连续 N 个周期 fit>fitness_max 仍对外保持“收敛”小协方差（位姿始终照常刷新），
     // 只有连续超限达 N 帧才真正发布大协方差告知门控未收敛，抑制单帧抖动导致的状态机反复启停。
     diverge_tolerance_cycles_ = declare_parameter<int>("diverge_tolerance_cycles", 5);
-    // 硬失效 ceiling：fit 超过此值属“严重失准”（如地图/初始位姿不一致，fit≳4），
-    // 不走去抖，立即对外宣告未收敛，绝不在错误位姿上让上层误判收敛而行驶。
-    fitness_hard_ceiling_ = declare_parameter<double>("fitness_hard_ceiling", 3.0);
+    // 硬失效 ceiling：fit 超过此值属“严重失准”（如地图/初始位姿不一致），跳过去抖立即对外宣告
+    // 未收敛。⚠ 仅影响置信度，不再冻结位姿（V0.1.03 起）——位姿仍刷新以便 NDT 自动回弹重收敛。
+    fitness_hard_ceiling_ = declare_parameter<double>("fitness_hard_ceiling", 5.0);
 
     // ---- 加载全局地图 ----
     if (!loadGlobalMap()) {
@@ -284,14 +286,17 @@ private:
     }
 
     rclcpp::Time stamp2(now());
-    // 解耦“跟踪”与“置信度”（V0.0.94）：
-    //  - 跟踪（是否刷新 map→odom 以跟随运动）：只要不是跳变(step_ok) 且非严重失准(fit<=ceiling) 就接受本帧，
-    //    避免旧版“fit 一超阈值就冻结位姿”→车动云偏→fit 更高→永不回弹的死亡螺旋。
-    //  - 置信度（对外协方差，供 auto_mission 门控）：fit<=fitness_max 视为收敛；否则去抖计数，
-    //    连续超阈值达 N 帧才对外宣告未收敛（大协方差）。
-    const bool tracking = step_ok && (fitness <= fitness_hard_ceiling_);
+    // 彻底解耦“跟踪”与“置信度”（V0.1.03）：
+    //  - 跟踪（是否刷新 map→odom 以跟随运动）：只由跳变闸门 step_ok 决定，绝不用 fitness 冻结位姿。
+    //    旧版把 fit<=fitness_hard_ceiling 也写进跟踪条件：本例静止 fit≈1.65、车一动 fit 冲到 3.006
+    //    越过 ceiling=3.0 即冻结位姿→局部云相对冻结的 map 系越走越偏→fit 更高(5.7)→永不回弹，
+    //    正是“fitness 阈值冻结位姿致运动发散锁死”的死亡螺旋。位姿更新只能由“跳变合理性”门控。
+    //  - 置信度（对外协方差，供 auto_mission 门控）：fit<=fitness_max 收敛；fitness_max<fit<=ceiling
+    //    运动畸变去抖；fit>ceiling 严重失准跳过去抖直接宣告未收敛。三者都照常刷新位姿以便回弹。
+    //  - 仅当发生跳变（step_ok=false，疑似瞬移/跟错）才拒绝刷新、维持旧位姿。
+    const bool tracking = step_ok;
     if (tracking) {
-      // 接受位姿更新以持续跟踪（含 fit 略高的运动畸变帧）
+      // 无条件接受位姿更新以持续跟踪（含 fit 偏高的运动畸变/轻度失准帧，令 NDT 能自动回弹重收敛）
       // 写共享状态时短暂持锁，且务必在调用 publishPose（内部会再加 t_mtx_）之前释放，避免自死锁。
       {
         std::lock_guard<std::mutex> lk(t_mtx_);
@@ -305,6 +310,13 @@ private:
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 4000,
           "[relocalization] ✓ 收敛 fit=%.3f 位置(%.2f,%.2f,%.2f)",
           fitness, result(0,3), result(1,3), result(2,3));
+      } else if (fitness > fitness_hard_ceiling_) {
+        // 严重失准（fit>ceiling）：跳过去抖、立即对外宣告未收敛，但位姿仍刷新以便回弹
+        miss_streak_ = diverge_tolerance_cycles_;
+        publishPose(fitness, 100.0, stamp2);
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+          "[relocalization] ✗ 严重失准 fit=%.3f>%.2f（TF 仍跟踪刷新位姿，对外宣告未收敛）",
+          fitness, fitness_hard_ceiling_);
       } else {
         // 在跟踪但置信度不足（多为运动畸变）：去抖，未达阈值前仍报收敛、持续刷新位姿
         ++miss_streak_;
@@ -321,15 +333,15 @@ private:
         }
       }
     } else {
-      // 跳变或严重失准：拒绝刷新位姿（防瞬移/防跟错），维持旧 TF，直接宣告不可信
+      // 跳变（单周平移/旋转超闸门，疑似瞬移/跟错）：拒绝刷新位姿，维持旧 TF，直接宣告不可信
       Eigen::Matrix4f keep;
       { std::lock_guard<std::mutex> lk(t_mtx_); keep = T_map_odom_; }
       sendTf(keep, stamp2);
       ++miss_streak_;
       publishPose(fitness, 100.0, stamp2);
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-        "[relocalization] ✗ 位姿拒绝刷新(step_ok=%d fit=%.3f ceiling=%.2f)，维持旧位姿并宣告失效",
-        static_cast<int>(step_ok), fitness, fitness_hard_ceiling_);
+        "[relocalization] ✗ 跳变拒绝刷新(step_ok=0，单周位移/转角超闸门 fit=%.3f)，维持旧位姿",
+        fitness);
     }
   }
 

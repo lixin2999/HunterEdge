@@ -22,17 +22,20 @@ hunter_relocalization:
     ndt_epsilon:      0.01    # 收敛阈值（变换增量）
     ndt_max_iterations: 30
 
-    # ---- 收敛 / 跳变闸门 ----
-    # fitness_max：NDT 适应度（越小越好）超过则对外置信度判“未收敛”（仅影响协方差，不再冻结位姿）。
-    # 运动时 2s 滚动窗口拼接点云畸变会抬高 fit（实测起步~1.03、行驶中稳定~2.1），静止收敛仅 0.02~0.4。
-    # 取 2.5 容纳运动期 fit；TF 跟踪与位姿刷新由 max_step/ceiling 决定，故此值仅管“可否巡航”的置信度。
-    fitness_max:          2.5   # 由 1.0→1.5→2.5，容纳行驶期 fit 抬升（TF 仍会自适应跟踪）
-    max_step_translation: 0.5   # m/周期：单周期平移跳变上限（防瞬移）
+    # ---- 收敛 / 跳变闸门（V0.1.03：跟踪与置信度彻底解耦）----
+    # 是否刷新 map→odom 位姿只由 max_step_translation/max_step_rotation（跳变闸门 step_ok）决定，
+    # 绝不用 fitness 冻结位姿——否则车一动 fit 越过阈值即冻结→局部云相对冻结位姿越走越偏→fit 更高→
+    # 永不回弹的死亡螺旋（本例静止 fit≈1.65、起步即冲到 3.006 越过旧 ceiling=3.0 而锁死、fit 发散到 5.7）。
+    # fitness_max：仅影响对外置信度（协方差，供 auto_mission 判“可否巡航”），不再冻结位姿。
+    # 运动时 2s 滚动窗口拼接点云畸变会抬高 fit（本例稀疏地图 ~1600 点、1m NDT：静止~1.65、行驶中 2~3），
+    # 静止收敛仅 0.02~0.4。取 3.5 容纳行驶期 fit 基线，避免正常行驶被误判未收敛而秒退 IDLE。
+    fitness_max:          3.5   # 2.5→3.5：容纳稀疏地图行驶期 fit 基线（位姿仍无条件自适应跟踪）
+    max_step_translation: 0.5   # m/周期：单周期平移跳变上限（防瞬移）——这才是唯一能拒绝位姿刷新的闸门
     max_step_rotation:    0.35  # rad/周期：单周期旋转跳变上限
     converged_covariance: 0.01  # 收敛时 /relocalization/pose 协方差（auto_mission 门控 <0.10 判收敛）
-    # 连续失败去抖：连续 N 个周期超闸门才对外宣告“未收敛”（大协方差），其间仍保持收敛态
-    # 仅不刷新位姿。2Hz 下 5 帧≈2.5s，抑制单帧抖动导致 auto_mission 秒退 IDLE。
+    # 连续失败去抖：连续 N 个周期 fit>fitness_max 才对外宣告“未收敛”（大协方差），其间仍保持收敛态；
+    # 无论是否宣告未收敛，位姿都照常刷新（仅跳变 step_ok=false 才维持旧位姿）。2Hz 下 5 帧≈2.5s。
     diverge_tolerance_cycles: 5
-    # 硬失效 ceiling：fit 超过此值视为严重失准（地图/初始位姿不一致，fit≳4），立即判失效、
-    # 不去抖，绝不在错误位姿上让上层误判收敛而行驶。应 > fitness_max。
-    fitness_hard_ceiling: 3.0
+    # 硬失效 ceiling：fit 超过此值视为严重失准（地图/初始位姿不一致），跳过去抖立即对外宣告未收敛。
+    # ⚠ V0.1.03 起此值仅影响置信度，不再参与位姿跟踪门控（位姿仍刷新以便 NDT 自动回弹）。应 > fitness_max。
+    fitness_hard_ceiling: 5.0   # 3.0→5.0：仅作严重失准的置信度门限，不再冻结位姿
