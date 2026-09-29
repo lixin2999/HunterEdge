@@ -5,3 +5,10 @@ ota_agent:
     max_download_size: 1000000000  # bytes
     upgrade_server_url: "https://upgrade.platform.example.com"
     upgrade_timeout: 300  # seconds
+    kafka_brokers: "120.202.73.105:9093"
+    # Kafka SASL_SSL 认证
+    security_protocol: "SASL_SSL"
+    sasl_mechanism: "SCRAM-SHA-512"
+    sasl_username: "hunter_vehicle"
+    sasl_password: "CHANGE_ME"
+    ssl_ca_location: "/etc/ssl/certs/ca-certificates.crt"

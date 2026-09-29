@@ -127,8 +127,19 @@ class RemoteAgent:
         if not HAS_KAFKA:
             logger.warning("confluent_kafka 不可用，状态上报降级")
             return
-        self.kafka_producer = Producer(
-            {"bootstrap.servers": self.config["kafka_brokers"]})
+        conf = {"bootstrap.servers": self.config["kafka_brokers"]}
+        # SASL_SSL 认证配置
+        if self.config.get("security_protocol"):
+            conf["security.protocol"] = self.config["security_protocol"]
+        if self.config.get("sasl_mechanism"):
+            conf["sasl.mechanism"] = self.config["sasl_mechanism"]
+        if self.config.get("sasl_username"):
+            conf["sasl.username"] = self.config["sasl_username"]
+        if self.config.get("sasl_password"):
+            conf["sasl.password"] = self.config["sasl_password"]
+        if self.config.get("ssl_ca_location"):
+            conf["ssl.ca.location"] = self.config["ssl_ca_location"]
+        self.kafka_producer = Producer(conf)
 
     def report_status(self, payload):
         if self.kafka_producer and HAS_KAFKA:
@@ -223,7 +234,12 @@ DEFAULT_CONFIG = {
     "srs_rtp_port": 8000,
     "ws_url": "wss://platform.example.com/ws/remote",  # 文档 17.2
     "cmd_topic": "/remote/command",           # 文档 13.4
-    "kafka_brokers": "platform.example.com:9093",
+    "kafka_brokers": "120.202.73.105:9093",
+    "security_protocol": "SASL_SSL",
+    "sasl_mechanism": "SCRAM-SHA-512",
+    "sasl_username": "hunter_vehicle",
+    "sasl_password": "CHANGE_ME",
+    "ssl_ca_location": "/etc/ssl/certs/ca-certificates.crt",
     "max_velocity": 2.0,                      # 文档 13.4：远程限速 2.0 m/s
     "max_steering": 0.4,                      # 文档 4.3：转向 ±0.4 rad
     "cmd_timeout": 0.5,                       # 文档 13.4：超时 500ms 停车

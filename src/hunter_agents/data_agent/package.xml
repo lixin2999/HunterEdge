@@ -16,6 +16,12 @@
   <depend>nav_msgs</depend>
   <depend>hunter_msgs</depend>
 
+  <!-- Kafka SASL_SSL 系统依赖：librdkafka 编译时需链接 libsasl2 + openssl -->
+  <build_depend>libsasl2-dev</build_depend>
+  <build_depend>libssl-dev</build_depend>
+  <exec_depend>libsasl2-modules</exec_depend>
+  <exec_depend>libsasl2-modules-gssapi-mit</exec_depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

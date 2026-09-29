@@ -68,13 +68,26 @@ class OtaAgent:
             logger.warning("confluent_kafka 不可用，Kafka 功能降级")
             return False
         brokers = self.config["kafka_brokers"]
+        # 构建 SASL_SSL 认证配置
+        base_conf = {"bootstrap.servers": brokers}
+        if self.config.get("security_protocol"):
+            base_conf["security.protocol"] = self.config["security_protocol"]
+        if self.config.get("sasl_mechanism"):
+            base_conf["sasl.mechanism"] = self.config["sasl_mechanism"]
+        if self.config.get("sasl_username"):
+            base_conf["sasl.username"] = self.config["sasl_username"]
+        if self.config.get("sasl_password"):
+            base_conf["sasl.password"] = self.config["sasl_password"]
+        if self.config.get("ssl_ca_location"):
+            base_conf["ssl.ca.location"] = self.config["ssl_ca_location"]
+
         self.consumer = Consumer({
-            "bootstrap.servers": brokers,
+            **base_conf,
             "group.id": f"ota-{self.config['vehicle_id']}",
             "auto.offset.reset": "latest",
         })
         self.consumer.subscribe([self.notify_topic])
-        self.producer = Producer({"bootstrap.servers": brokers})
+        self.producer = Producer(base_conf)
         return True
 
     def receive_notify(self, timeout=1.0):
@@ -426,7 +439,12 @@ class OtaAgent:
 
 DEFAULT_CONFIG = {
     "vehicle_id": "hunter_001",
-    "kafka_brokers": "platform.example.com:9093",
+    "kafka_brokers": "120.202.73.105:9093",
+    "security_protocol": "SASL_SSL",
+    "sasl_mechanism": "SCRAM-SHA-512",
+    "sasl_username": "hunter_vehicle",
+    "sasl_password": "CHANGE_ME",
+    "ssl_ca_location": "/etc/ssl/certs/ca-certificates.crt",
     "download_dir": "/data/ota/download",
     "extract_dir": "/data/ota/extract",
     "backup_dir": "/data/ota/backup",

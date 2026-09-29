@@ -33,7 +33,7 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
 {
   // 参数（文档 14.2/14.3/14.6）
   declare_parameter("vehicle_id", "hunter_001");
-  declare_parameter("kafka_brokers", "localhost:9092");
+  declare_parameter("kafka_brokers", "120.202.73.105:9093");
   declare_parameter("db_path", "/data/data_agent/telemetry.db");
   declare_parameter("publish_rate", 10.0);
   declare_parameter("max_velocity", 2.0);
@@ -44,6 +44,12 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   declare_parameter("cache_max_hours", 24.0);
   declare_parameter("kafka_queue_limit", 50);         // 本地队列积压上限（条），超过转 SQLite 缓存
   declare_parameter("kafka_flush_timeout_ms", 5000);  // 退出时等待投递的超时（毫秒）
+  // Kafka SASL_SSL 认证参数
+  declare_parameter("security_protocol", "SASL_SSL");
+  declare_parameter("sasl_mechanism", "SCRAM-SHA-512");
+  declare_parameter("sasl_username", "");
+  declare_parameter("sasl_password", "");
+  declare_parameter("ssl_ca_location", "/etc/ssl/certs/ca-certificates.crt");
 
   vehicle_id_ = get_parameter("vehicle_id").as_string();
   kafka_brokers_ = get_parameter("kafka_brokers").as_string();
@@ -57,6 +63,11 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   cache_max_hours_ = get_parameter("cache_max_hours").as_double();
   kafka_queue_limit_ = static_cast<int>(get_parameter("kafka_queue_limit").as_int());
   kafka_flush_timeout_ms_ = static_cast<int>(get_parameter("kafka_flush_timeout_ms").as_int());
+  security_protocol_ = get_parameter("security_protocol").as_string();
+  sasl_mechanism_ = get_parameter("sasl_mechanism").as_string();
+  sasl_username_ = get_parameter("sasl_username").as_string();
+  sasl_password_ = get_parameter("sasl_password").as_string();
+  ssl_ca_location_ = get_parameter("ssl_ca_location").as_string();
 
   // Kafka topic（文档 14.2.2：hunter.{vehicle_id}.telemetry / .event）
   telemetry_topic_ = "hunter." + vehicle_id_ + ".telemetry";
@@ -352,6 +363,41 @@ bool DataAgent::kafkaInit()
     delete conf;
     return false;
   }
+
+  // ─── SASL_SSL 安全认证配置 ───
+  if (!security_protocol_.empty()) {
+    if (conf->set("security.protocol", security_protocol_, errstr) != RdKafka::Conf::CONF_OK) {
+      RCLCPP_ERROR(get_logger(), "Kafka security.protocol 配置失败: %s", errstr.c_str());
+      delete conf;
+      return false;
+    }
+  }
+  if (!sasl_mechanism_.empty()) {
+    if (conf->set("sasl.mechanism", sasl_mechanism_, errstr) != RdKafka::Conf::CONF_OK) {
+      RCLCPP_ERROR(get_logger(), "Kafka sasl.mechanism 配置失败: %s", errstr.c_str());
+      delete conf;
+      return false;
+    }
+  }
+  if (!sasl_username_.empty() && !sasl_password_.empty()) {
+    // SASL 用户名/密码组合成 sasl.username/password 配置项
+    if (conf->set("sasl.username", sasl_username_, errstr) != RdKafka::Conf::CONF_OK ||
+      conf->set("sasl.password", sasl_password_, errstr) != RdKafka::Conf::CONF_OK)
+    {
+      RCLCPP_ERROR(get_logger(), "Kafka SASL 凭据配置失败: %s", errstr.c_str());
+      delete conf;
+      return false;
+    }
+  }
+  if (!ssl_ca_location_.empty()) {
+    if (conf->set("ssl.ca.location", ssl_ca_location_, errstr) != RdKafka::Conf::CONF_OK) {
+      RCLCPP_WARN(get_logger(), "Kafka ssl.ca.location 配置失败: %s", errstr.c_str());
+      // 不阻断启动，某些环境使用系统默认 CA 即可
+    }
+  }
+  RCLCPP_INFO(get_logger(), "Kafka 安全协议: %s, SASL 机制: %s",
+    security_protocol_.c_str(), sasl_mechanism_.c_str());
+
   // 投递报告回调：只有它能证实消息是否真正送达 broker
   if (conf->set("dr_cb", this, errstr) != RdKafka::Conf::CONF_OK) {
     RCLCPP_ERROR(get_logger(), "Kafka dr_cb 配置失败: %s", errstr.c_str());

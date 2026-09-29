@@ -78,6 +78,13 @@ private:
   double comm_loss_duration_;  // 文档 14.3：10s
   double cache_max_hours_;     // 文档 14.6：24 小时
 
+  // Kafka SASL_SSL 认证参数
+  std::string security_protocol_;   // "SASL_SSL"
+  std::string sasl_mechanism_;      // "SCRAM-SHA-512"
+  std::string sasl_username_;
+  std::string sasl_password_;
+  std::string ssl_ca_location_;     // CA 证书绝对路径
+
   // Kafka / SQLite
   RdKafka::Producer * producer_;
   std::atomic<bool> kafka_connected_;  // 由投递报告回调异步更新（跨线程）

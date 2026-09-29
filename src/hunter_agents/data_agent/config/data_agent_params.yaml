@@ -2,10 +2,15 @@
 data_agent:
   ros__parameters:
     vehicle_id: "hunter_001"                    # 车辆唯一标识
-    # ⚠️ 部署时必须改为真实 broker 地址。当前为占位域名，无法 DNS 解析，
-    #    日志表现为：Failed to resolve 'platform.example.com:9093'
-    kafka_brokers: "platform.example.com:9093"  # Kafka 地址（SASL_SSL）
+    kafka_brokers: "120.202.73.105:9093"        # 车端 Kafka Broker（SASL_SSL）
     db_path: "/data/data_agent/telemetry.db"    # SQLite 缓存路径
+
+    # ─── Kafka 安全认证（SASL_SSL + SCRAM-SHA-512） ───
+    security_protocol: "SASL_SSL"               # 安全协议
+    sasl_mechanism: "SCRAM-SHA-512"             # SASL 机制
+    sasl_username: "hunter_vehicle"             # SASL 用户名（部署时按实际凭据填写）
+    sasl_password: "CHANGE_ME"                  # SASL 密码（部署时按实际凭据填写）
+    ssl_ca_location: "/etc/ssl/certs/ca-certificates.crt"  # CA 证书路径
 
     publish_rate: 10.0        # 文档 14.2.2：遥测打包 10Hz
 
