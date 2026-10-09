@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # hunter_core_setup.sh — HunterCore 车端接入一键部署（文档 §5.6 / §5.7）
 #
-# 做六件事（幂等，可重复执行；步骤号与运行日志一致）：
+# 做七件事（幂等，可重复执行；步骤号与运行日志一致）：
 #   ⓪ 前置校参：运行用户与其主组存在、接入包四件套齐、工作空间存在（失败文本带下一步动作）
 #   ① 依赖安装：librdkafka(C++/Python)、SCRAM-SHA-512 机制插件、sqlite3
 #   ② 接入包落盘：把 HUNTER-001 bundle 装到 /etc/hunter/kafka/，私钥 0600；已写入口令的 properties 不覆盖
 #   ③ 运行期配置：Agent 参数文件落到 /etc/hunter/，生成 agent_env.sh 与 README_agent_env
 #   ④ 编译：以运行用户身份 colcon build 相关包
-#   ⑤ 自检：hunter-kafka-check（接入链路 6 层自检，退出码非 0 不自启服务）
+#   ⑤ 自检：hunter-kafka-check（接入链路七层自检，退出码非 0 不自启服务）
 #   ⑥ systemd：安装并启用 ota-agent / remote-agent（data/command agent 由 bring-up 拉起）
 #
 # 凭据红线：kafka.properties 只落盘 /etc/hunter/kafka/，不进工作空间、不进版本库、不进日志。
@@ -110,6 +110,7 @@ done
 [ -f "$BUNDLE_DIR/kafka-client.p12" ] || warn "包内无 kafka-client.p12（用 PEM 证书链即可，不影响）"
 
 AGENT_PKGS=(command_agent data_agent ota_agent remote_agent)
+BUILD_PKGS=(hunter_msgs hunter_kafka "${AGENT_PKGS[@]}" hunter_bringup)   # 含 hunter_bringup：launch 里的 use_command_agent 必须装到 install/ 才生效
 [ -d "$WS_DIR" ] || die "工作空间目录不存在: $WS_DIR（--ws 应指向车上的 HunterEdge 根；默认 $USER_HOME/HunterEdge）"
 WS_DIR="$(cd "$WS_DIR" && pwd)"      # 相对路径归一，避免后续 install/ 拼错
 SRC_ROOT="$WS_DIR/src"
@@ -128,14 +129,24 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
   # libsasl2-modules-gssapi-mit 里（Launchpad #1988730，名字与 MIT/GSSAPI 无关），
   # 光装 libsasl2-modules 依旧报 No worthy mechs found。因此这里**按插件文件判定**，
   # 不赌包名（跨 Ubuntu 版本/架构都不会被包名变化骗到）。
-  scram_plugin() { ls /usr/lib/*/sasl2/libscram.so /usr/lib/sasl2/libscram.so >/dev/null 2>&1; }
+  # 【重要】判定必须逐个候选测存在：`ls 路径A 路径B` 只要任一路径不存在就返回非 0，
+  # 而 /usr/lib/sasl2 在 Ubuntu 上通常不存在 → 插件在位也会被误判为缺（假阴性）。
+  # 另：Ubuntu 里名为 `scram` 的包是 Probabilistic Risk Analysis Tool，与 SASL 无关，千万别装。
+  scram_plugin() {
+    local p
+    for p in /usr/lib/*/sasl2/libscram.so /usr/lib/sasl2/libscram.so /usr/lib64/sasl2/libscram.so; do
+      [ -e "$p" ] && { echo "$p"; return 0; }
+    done
+    return 1
+  }
   need_pkgs=()
   dpkg -s librdkafka++1  >/dev/null 2>&1 || need_pkgs+=(librdkafka++1)     # data_agent C++ 运行时
   dpkg -s librdkafka-dev >/dev/null 2>&1 || need_pkgs+=(librdkafka-dev)     # ④ 编译期头文件
   dpkg -s libsqlite3-dev >/dev/null 2>&1 || need_pkgs+=(libsqlite3-dev)     # 断网缓存
   dpkg -s libsasl2-modules >/dev/null 2>&1 || need_pkgs+=(libsasl2-modules)
   dpkg -s ca-certificates >/dev/null 2>&1 || need_pkgs+=(ca-certificates)
-  scram_plugin || need_pkgs+=(libsasl2-modules-gssapi-mit)                   # ← SCRAM 插件真正来源
+  SCRAM_SO="$(scram_plugin || true)"
+  [ -n "$SCRAM_SO" ] || need_pkgs+=(libsasl2-modules-gssapi-mit)            # ← SCRAM 插件真正来源
   if [ "${#need_pkgs[@]}" -gt 0 ]; then
     log "  待装：${need_pkgs[*]}"
     # update 失败不阻断：包已在本地而源不可达（4G/内网/仓库过期）时照样能装；
@@ -151,7 +162,15 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
   else
     log "  apt 依赖已齐（按本地文件判定，无需联网）"
   fi
-  scram_plugin || warn "  仍未找到 SCRAM 插件（/usr/lib/*/sasl2/libscram.so）：认证会报 No worthy mechs found（Ubuntu 上由 libsasl2-modules-gssapi-mit 提供）"
+  if SCRAM_SO="$(scram_plugin)"; then
+    log "  SCRAM 插件在位：$SCRAM_SO"
+  else
+    warn "  仍缺 SCRAM 插件（libscram.so）：认证必报 No worthy mechs found。用这两行定性：
+       dpkg -L libsasl2-modules-gssapi-mit | grep -F 'sasl2/libscram'
+         └ 清单里有但文件不在 → 包内容被破坏：sudo apt install --reinstall libsasl2-modules-gssapi-mit
+         └ 清单里没有 → 该机所在的 libsasl2 版本确实不含 SCRAM，需自编 cyrus-sasl2（--enable-scram）
+       确认完再把结果告知开发（不要靠猜换包名，也不要装 `scram` 包）"
+  fi
   if python3 -c "import confluent_kafka" 2>/dev/null; then
     log "  confluent-kafka 已安装：$(python3 -c 'import confluent_kafka as c; print(c.version()[0])')"
   else
@@ -250,15 +269,15 @@ chmod 0644 "$ETC_DIR/README_agent_env"
 
 # ---- ④ 编译 ----
 if [ "$SKIP_BUILD" -eq 0 ]; then
-  log "④ colcon 编译（hunter_kafka + 四个 Agent）"
+  log "④ colcon 编译（hunter_kafka + 四个 Agent + hunter_bringup）"
   [ -f /opt/ros/humble/setup.bash ] || die "未找到 /opt/ros/humble/setup.bash（先装 ROS2 Humble）"
   # 编译必须用普通用户身份：root 编译会在 build/install 留下 root 属主文件，
   # 下次用户自己 colcon build 就报 Permission denied（现场高频坑）
+  BUILD_CMD="source /opt/ros/humble/setup.bash; cd '$WS_DIR'; colcon build --symlink-install --packages-select ${BUILD_PKGS[*]}"
   if [ "$RUN_USER" = "root" ]; then
-    BUILD_CMD="source /opt/ros/humble/setup.bash; cd '$WS_DIR'; colcon build --symlink-install --packages-select hunter_msgs hunter_kafka ${AGENT_PKGS[*]}"
     bash -c "$BUILD_CMD" || die "colcon 编译失败（先修编译错误，再谈接入联调）"
   else
-    sudo -u "$RUN_USER" bash -c "source /opt/ros/humble/setup.bash; cd '$WS_DIR'; colcon build --symlink-install --packages-select hunter_msgs hunter_kafka ${AGENT_PKGS[*]}" \
+    sudo -u "$RUN_USER" bash -c "$BUILD_CMD" \
       || die "colcon 编译失败（先修编译错误，再谈接入联调）"
   fi
 else
@@ -268,18 +287,35 @@ fi
 # ---- ⑤ 自检 ----
 # 能离线判定的失败原因（口令占位、证书 CN 与 vehicle_id 不符、时间漂移、
 # 私钥权限、broker 不可达、Topic 缺失）一次跑完，不依赖 ROS 环境
-CHECK_BIN="$WS_DIR/install/hunter_kafka/bin/hunter-kafka-check"
+CHECK_BIN=""
+for _cand in "$WS_DIR/install/hunter_kafka/bin/hunter-kafka-check" \
+             "$WS_DIR/install/hunter_kafka/lib/hunter_kafka/hunter-kafka-check"; do
+  [ -x "$_cand" ] && { CHECK_BIN="$_cand"; break; }
+done
+# ament_python 的 console_script 落在 bin/ 还是 lib/<pkg>/ 取决于安装布局，别赌路径：
+# 激活工作空间后用 command -v 兜底（这也是现场手写命令时最稳的入口）
+if [ -z "$CHECK_BIN" ] && [ -f "$WS_DIR/install/setup.bash" ]; then
+  CHECK_BIN="$(bash -c "source '$WS_DIR/install/setup.bash' >/dev/null 2>&1; command -v hunter-kafka-check" || true)"
+fi
+# 还找不到就扫盘：--symlink-install 下 easy_install 可能把入口放到**运行用户**的 ~/.local/bin，
+# 而本脚本正以 root 跑，root 的 PATH 里没有它（旧写法只盯 bin/，会退化成源码跑）
+if [ -z "$CHECK_BIN" ]; then
+  CHECK_BIN="$(find "$WS_DIR/install" "$USER_HOME/.local/bin" -maxdepth 4 -type f -name hunter-kafka-check -perm -u+x 2>/dev/null | sort | head -n1 || true)"
+fi
 CHECK_ARGS=(--properties "$PROPS" --bundle-dir "$KAFKA_DIR")
 if [ "$OFFLINE" -eq 1 ]; then
   CHECK_ARGS+=(--offline)
 fi
 SELFTEST=0
-if [ -x "$CHECK_BIN" ]; then
-  log "⑤ 自检：hunter-kafka-check（配置/证书/网络/认证/Topic/投递 六层）"
+if [ -n "$CHECK_BIN" ]; then
+  log "⑤ 自检：$CHECK_BIN（配置/证书/机制/网络/认证/Topic/投递）"
   "$CHECK_BIN" "${CHECK_ARGS[@]}" || SELFTEST=$?
 elif python3 -c "import confluent_kafka" 2>/dev/null; then
-  # 未编译（--skip-build）时退回源码模式，仍可做本地配置/证书核查
-  log "⑤ 自检：以源码方式运行 hunter-kafka-check（未找到编译产物）"
+  # 未编译（--skip-build）或入口不在工作空间里时退回源码模式，仍可做本地配置/证书核查
+  # （坑：--symlink-install 下 ament_python 可能把 console_script 装进用户 Python 环境，
+  #   而不是 install/<pkg>/bin，root 的 PATH 里找不到它）
+  log "⑤ 自检：以源码方式运行 hunter-kafka-check（install/ 与 ~/.local/bin 均未扫到入口）"
+  warn "  查它到底装到哪：find $WS_DIR/install $USER_HOME/.local/bin -name hunter-kafka-check 2>/dev/null"
   PYTHONPATH="$SRC_ROOT/hunter_common/hunter_kafka" python3 -m hunter_kafka.diagnose "${CHECK_ARGS[@]}" \
     || SELFTEST=$?
 else

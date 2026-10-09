@@ -206,7 +206,10 @@ def check_sasl_mechanism(chk: Check, conf: dict) -> None:
         chk.fail(EXIT_AUTH, "SASL 机制插件",
                  f"未找到 libscram.so，{mech} 必报 No worthy mechs found；"
                  "Ubuntu/Debian 装：sudo apt install -y libsasl2-modules "
-                 "libsasl2-modules-gssapi-mit（无 cyrus-sasl-scram 包，那是 RHEL 系的名字）")
+                 "libsasl2-modules-gssapi-mit（无 cyrus-sasl-scram 包，那是 RHEL 系的名字）；"
+                 "若该包已装仍无此文件：dpkg -L libsasl2-modules-gssapi-mit | grep sasl2/libscram "
+                 "——清单里有但文件不在则 --reinstall，清单里没有则需自编 cyrus-sasl2（--enable-scram）；"
+                 "千万别装名为 scram 的包（那是概率风险分析工具，与 SASL 无关）")
 
 
 def check_tcp(chk: Check, bootstrap: str, timeout: float) -> None:
@@ -289,7 +292,7 @@ def check_delivery(chk: Check, conf: dict, vehicle_id: str, timeout: float) -> N
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="hunter-kafka-check",
-        description="HunterCore 车端 Kafka 接入自检（配置/证书/网络/认证/Topic/投递）")
+        description="HunterCore 车端 Kafka 接入自检（配置/证书/机制/网络/认证/Topic/投递）")
     parser.add_argument("--vehicle-id", default=None,
                         help="车辆 ID（默认取 kafka.properties 的 SASL 用户名，与证书 CN 相同）")
     parser.add_argument("--properties", default=os.environ.get(

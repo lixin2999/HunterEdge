@@ -199,7 +199,7 @@ pip3 install confluent-kafka            # Python Agent（ota_agent / remote_agen
 ```
 
 > ⚠️ **【SCRAM 机制必装（V0.1.05）】** 接入口要求的 `SCRAM-SHA-512` 由 Cyrus SASL 插件 `libscram.so` 提供，**缺它必报 `No worthy mechs found`**，表象极像口令错或网络不通，是现场最易误判的一条（详见 §7.7、Deployment_Guide §5.6.3）。
-> **包名坑（jammy 实测）**：Ubuntu/Debian **没有** `cyrus-sasl-scram` 这个包（那是 RHEL/openSUSE 的名字，照它装会直接 `Unable to locate package`）；`libscram.so` 被“错放”在 **`libsasl2-modules-gssapi-mit`** 里（Launchpad #1988730，名字与 MIT/GSSAPI 无关），**光装 `libsasl2-modules` 依旧不够**。判定以文件为准：`ls /usr/lib/*/sasl2/libscram.so`。上述依赖与证书落盘可由 `scripts/hunter_core_setup.sh` 一次性完成（它按插件文件在不在来决定装什么，不赌包名）。
+> **包名坑（jammy 实测）**：Ubuntu/Debian **没有** `cyrus-sasl-scram` 这个包（那是 RHEL/openSUSE 的名字，照它装会直接 `Unable to locate package`）；`libscram.so` 被“错放”在 **`libsasl2-modules-gssapi-mit`** 里（Launchpad #1988730，名字与 MIT/GSSAPI 无关），**光装 `libsasl2-modules` 依旧不够**。判定以文件为准：`ls /usr/lib/*/sasl2/libscram.so`（**单模式查**：写成 `ls A B` 时任一操作数不存在就返回非 0，会把“已装”误判为“缺失”）。**同名陷阱**：Ubuntu 里有个叫 `scram` 的包，它是概率风险分析工具，与 SASL 无关，别拿它当替代方案。上述依赖与证书落盘可由 `scripts/hunter_core_setup.sh` 一次性完成（它按插件文件在不在来决定装什么，不赌包名）。
 
 以下包需源码编译（vendor 源码）：
 
@@ -380,9 +380,13 @@ sudo bash src/hunter_bringup/scripts/hunter_core_setup.sh \
 
 ```bash
 source ~/HunterEdge/install/setup.bash
-hunter-kafka-check                # 全量六层自检（含端到端投递证实）
-hunter-kafka-check --offline      # 仅本地配置/证书层
+hunter-kafka-check                # 全量七层自检（含 SASL 机制插件层与端到端投递证实）
+hunter-kafka-check --offline      # 仅本地配置/证书/机制层
 ./src/hunter_bringup/scripts/hunter_status.sh   # 第 8 段输出「HunterCore 接入」状态
+
+# 若 `hunter-kafka-check` 不在 PATH（--symlink-install 下入口可能被装进用户 Python 环境）：
+find ~/HunterEdge/install ~/.local/bin -name hunter-kafka-check 2>/dev/null
+PYTHONPATH=src/hunter_common/hunter_kafka python3 -m hunter_kafka.diagnose --offline   # 等价的源码跑法
 ```
 
 **退出码与处置**（逐层递进，前一层失败即短路）：
@@ -850,7 +854,7 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 # 首次接入 / 换车 / 接入包重新下发（需 sudo，可重复执行；接入包需先拷到车上）
 sudo bash ./hunter_core_setup.sh --bundle ~/HUNTER-001-bundle/HUNTER-001
 
-# 接入链路自检（退出码含义见 §7.7）
+# 接入链路自检（退出码含义见 §7.7；不在 PATH 时改用 python3 -m hunter_kafka.diagnose）
 source ~/HunterEdge/install/setup.bash && hunter-kafka-check
 
 # 一键确认“接入到底通不通”（含凭据落盘/服务态/health 数据）
