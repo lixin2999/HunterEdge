@@ -103,7 +103,11 @@ OPERSTATE="$(cat "/sys/class/net/$CAN_IF/operstate" 2>/dev/null || echo unknown)
 if [ "$OPERSTATE" != "up" ]; then
   warn "接口 $CAN_IF 状态为 $OPERSTATE（预期 up）"
 fi
-log "$CAN_IF 已启用：$( $SUDO ip -details link show "$CAN_IF" 2>/dev/null | grep -o 'bitrate [0-9]* can state [A-Z]*' | head -1 )"
+# 状态回显：bitrate 与 can state 在 `ip -details` 里**分属两行**，必须分开抓
+# （旧写法用单条正则 'bitrate N can state X' 跨行匹配，永远抓不到 → 现场看到一行空白）
+BITRATE_NOW="$( $SUDO ip -details link show "$CAN_IF" 2>/dev/null | grep -o 'bitrate [0-9]*' | head -1 )"
+BUS_STATE="$( $SUDO ip -details link show "$CAN_IF" 2>/dev/null | grep -o 'can state [A-Z-]*' | head -1 )"
+log "$CAN_IF 已启用：operstate=${OPERSTATE} ${BITRATE_NOW:-bitrate 未知} ${BUS_STATE:-can state 未知}"
 
 # ---- ③ 抓帧验证：只有收到底盘反馈帧才说明底盘通信真的建立 ----
 if ! command -v candump >/dev/null 2>&1; then

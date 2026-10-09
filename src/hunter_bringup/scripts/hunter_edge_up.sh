@@ -26,6 +26,10 @@
 #   HUNTER_EDGE_MAP_YAML       静态地图 .yaml（默认 ~/HunterEdge/maps/hunter_map.yaml）
 #   HUNTER_EDGE_MAP_FILE       先验点云 .pcd（默认 ~/HunterEdge/maps/hunter_map.pcd）
 #   HUNTER_EDGE_EXTRA_ARGS     追加给 ros2 launch 的参数串（现场应急）
+#   HUNTER_RMW_IMPLEMENTATION  可选：DDS 实现（如 rmw_cyclonedds_cpp）。
+#                              留空 = 用 ROS 默认；systemd 读不到 ~/.bashrc，
+#                              现场若用 CycloneDDS 必须在此继承，否则登录终端
+#                              里的 ros2 CLI / rviz2 看不到开机自启的节点
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -86,6 +90,15 @@ fi
 # ---- ③ 进入自动驾驶准备状态 ----
 [ -f "$ROS_SETUP" ] || die "未找到 $ROS_SETUP（先装 ROS2 Humble，或用 HUNTER_ROS_SETUP 指定）"
 [ -f "$WS_PREFIX/setup.bash" ] || die "未找到 $WS_PREFIX/setup.bash（先 colcon build，或用 HUNTER_WS_PREFIX 指定）"
+
+# DDS 实现继承（可选）：systemd 读不到登录 shell 的 ~/.bashrc，若现场用 CycloneDDS
+# 而这里不继承，开机自启的节点会落到另一套 DDS → 登录终端里的 ros2 CLI / rviz2 看不见它们。
+if [ -n "${HUNTER_RMW_IMPLEMENTATION:-}" ]; then
+  export RMW_IMPLEMENTATION="$HUNTER_RMW_IMPLEMENTATION"
+  log "DDS 实现：RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION（来自 agent_env.sh）"
+else
+  log "DDS 实现：未指定，使用 ROS 默认（如需与现场一致，把 RMW_IMPLEMENTATION 写进 /etc/hunter/agent_env.sh 的 HUNTER_RMW_IMPLEMENTATION）"
+fi
 
 AUTONOMOUS="${HUNTER_EDGE_AUTONOMOUS_NAV:-true}"
 NAV_MODE="${HUNTER_EDGE_NAV_MODE:-nav}"

@@ -72,9 +72,10 @@ echo ""
 echo "--- 上电自启链路 ---"
 CAN_IF="${CAN_IF:-can2}"
 if ip link show "$CAN_IF" >/dev/null 2>&1; then
-  printf "  [OK]   CAN %s：%s（%s）\n" "$CAN_IF" \
+  printf "  [OK]   CAN %s：operstate=%s（%s；%s）\n" "$CAN_IF" \
     "$(cat "/sys/class/net/$CAN_IF/operstate" 2>/dev/null || echo unknown)" \
-    "$(ip -details link show "$CAN_IF" 2>/dev/null | grep -o 'bitrate [0-9]*' | head -1)"
+    "$(ip -details link show "$CAN_IF" 2>/dev/null | grep -o 'bitrate [0-9]*' | head -1)" \
+    "$(ip -details link show "$CAN_IF" 2>/dev/null | grep -o 'can state [A-Z-]*' | head -1)"
   if command -v candump >/dev/null 2>&1; then
     # 底盘反馈帧（附录 A：0x211/0x221）——只有它能证明“底盘通信真的建立”
     if timeout 3 candump "$CAN_IF" 2>/dev/null | grep -qE '211|221'; then

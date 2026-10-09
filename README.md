@@ -1114,6 +1114,15 @@ hunter-kafka-check; echo "exit=$?"
 #    且 /auto_mission/status 进入巡航态；重复发同一 command_id → message 含 [DUPLICATE]（不重复执行）
 ```
 
+**五、实机避坑清单（V0.1.06 首轮实机反馈，改前必读）**
+
+| 坑 | 现象 | 结论/处置 |
+|---|---|---|
+| `hunter_core_setup.sh` **不带 `--bundle` 重跑必挂**（V0.1.05 起就存在） | `× 接入包目录不存在:` 且 `$BUNDLE_DIR` 为空白 → 步骤③④⑤⑥全没跑（服务全 `inactive`、`hunter-kafka-check` 127） | **V0.1.06 已修**（校验块收进 `REUSE_BUNDLE=0`）；同步到车后重跑即可。根因：复用分支 `BUNDLE_DIR=""`，而 `[ ! -d "" ]` 恒真 |
+| `agent_env.sh` **不能写行内注释** | 值变成 `nav   # nav=…` → `hunter-edge` 起来但**静默没进自动驾驶准备状态**（launch 参数非法） | **V0.1.06 已修**；该文件是 systemd `EnvironmentFile`，注释只能**独占一行** |
+| `RMW_IMPLEMENTATION` 在 unit 里硬编码 | 开机自启的节点与登录终端里的 `ros2 node list`/`rviz2` **互相看不见**（两套 DDS） | **V0.1.06 已修**：单元不硬编码，改由 `agent_env.sh` 的 `HUNTER_RMW_IMPLEMENTATION` 继承（③ 自动探测运行用户登录 shell 的值；探测不到＝ROS 默认） |
+| `ip -details link show` 的状态回显 | `can2 已启用：` 后面空白 | **V0.1.06 已修**：`bitrate` 与 `can state` 在输出里**分属两行**，必须分开 grep（`hunter_status.sh` 同步补 `can state`，bus-off 一眼可见） |
+
 ---
 
 ## 14. 文档索引

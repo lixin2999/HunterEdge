@@ -337,21 +337,53 @@ for pkg in "${AGENT_PKGS[@]}"; do
   fi
 done
 
+# DDS 实现继承（可选但重要）：systemd 不会读登录 shell 的 ~/.bashrc，
+# 若现场在 .bashrc 里设了 RMW_IMPLEMENTATION（本车典型为 rmw_cyclonedds_cpp），
+# 开机自启的节点就会落到另一套 DDS → 登录终端里的 ros2 CLI / rviz2 “看不见”它们。
+# 这里以运行用户身份探测并写入 agent_env.sh；探测不到就留空＝交给 ROS 默认值，
+# 绝不在单元里硬编码某个实现（否则会把现场悄悄换成另一套 DDS）。
+#
+# ⚠ 探测细节：Ubuntu 默认 ~/.bashrc 开头有“非交互直接 return”的卫兵，
+#   所以先用 `bash -lic`（交互）试，失败再退回 `bash -lc`（登录）；
+#   并且用 __RMW__ 标记行 + 白名单正则取值，避免 .bashrc 里的其它输出混进变量。
+RMW_DETECTED=""
+if command -v sudo >/dev/null 2>&1 && [ "$RUN_USER" != "root" ]; then
+  extract_rmw() { sed -n 's/^__RMW__\(rmw_[a-z0-9_]*\)$/\1/p' | tail -n1; }
+  RMW_DETECTED="$(sudo -u "$RUN_USER" bash -lic 'printf "__RMW__%s\n" "${RMW_IMPLEMENTATION:-}"' 2>/dev/null | extract_rmw || true)"
+  if [ -z "$RMW_DETECTED" ]; then
+    RMW_DETECTED="$(sudo -u "$RUN_USER" bash -lc 'printf "__RMW__%s\n" "${RMW_IMPLEMENTATION:-}"' 2>/dev/null | extract_rmw || true)"
+  fi
+fi
+if [ -n "$RMW_DETECTED" ]; then
+  log "  检测到现场 DDS 实现：$RMW_DETECTED（写入 agent_env.sh，供 systemd 下的整栈继承）"
+else
+  warn "  未检测到 RMW_IMPLEMENTATION：整栈将用 ROS 默认 DDS。若现场确实在 ~/.bashrc 里设过，请手工把同一值写进 $ETC_DIR/agent_env.sh 的 HUNTER_RMW_IMPLEMENTATION（否则 systemd 下的节点与登录终端的 ros2 CLI/rviz2 会分属两套 DDS）"
+fi
+
 # systemd 单元 source 此文件取工作空间路径（单元里写死路径会挡住换机/换目录）
+#
+# ⚠ 本文件是 systemd EnvironmentFile：**不支持行内注释**（`#` 之后的整段都会被算进
+#   变量值），所以注释必须独占一行写在这种位置，不能跟在值后面。
 cat > "$ETC_DIR/agent_env.sh" <<EOF
 # 由 hunter_core_setup.sh 生成于 $(date '+%F %T')；改工作空间位置后重跑脚本即可
+# 修改任一开关后：sudo systemctl restart hunter-edge
 HUNTER_WS_PREFIX=$WS_DIR/install
 HUNTER_ROS_SETUP=/opt/ros/humble/setup.bash
 HUNTER_OTA_CONFIG=$ETC_DIR/ota_agent_params.yaml
 HUNTER_REMOTE_CONFIG=$ETC_DIR/remote_agent_params.yaml
 # ── 开机自启链路（需求①②，见 hunter-can.service / hunter-edge.service）──
-HUNTER_SRC_DIR=$WS_DIR                                # 源码树（脚本/systemd 单元的兜底定位）
+# 源码树位置（脚本/systemd 单元的兜底定位）
+HUNTER_SRC_DIR=$WS_DIR
 HUNTER_CAN_UP_SCRIPT=$SRC_ROOT/hunter_bringup/scripts/hunter_can_up.sh
 HUNTER_EDGE_UP_SCRIPT=$SRC_ROOT/hunter_bringup/scripts/hunter_edge_up.sh
-HUNTER_EDGE_AUTONOMOUS_NAV=true                       # true = 上电即进入自动驾驶准备状态
-HUNTER_EDGE_NAV_MODE=nav                              # nav（导航巡航）| mapping（建图）
+# 上电即进入自动驾驶准备状态；设为 false 则只跑链路（不含 Nav2/auto_mission，联调用）
+HUNTER_EDGE_AUTONOMOUS_NAV=true
+# nav = 导航巡航；mapping = 建图模式
+HUNTER_EDGE_NAV_MODE=nav
 HUNTER_EDGE_MAP_YAML=$WS_DIR/maps/hunter_map.yaml
 HUNTER_EDGE_MAP_FILE=$WS_DIR/maps/hunter_map.pcd
+# DDS 实现：留空 = 用 ROS 默认；须与现场 ~/.bashrc 的 RMW_IMPLEMENTATION 保持一致
+HUNTER_RMW_IMPLEMENTATION=$RMW_DETECTED
 EOF
 chmod 0644 "$ETC_DIR/agent_env.sh"
 log "  写入 $ETC_DIR/agent_env.sh（HUNTER_WS_PREFIX=$WS_DIR/install）"

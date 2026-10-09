@@ -22,7 +22,7 @@ Environment=HUNTER_EDGE_NAV_MODE=nav
 EnvironmentFile=-/etc/hunter/agent_env.sh
 # ExecStartPre：CAN 幂等复查（接口真掉了直接失败 → Restart=on-failure 重新走一遍完整时序）
 ExecStartPre=/bin/bash -c 'S="${HUNTER_CAN_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_can_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_can_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; exec /bin/bash "$S" --quick'
-ExecStart=/bin/bash -c 'S="${HUNTER_EDGE_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_edge_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_edge_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; [ -f "$S" ] || { echo "[hunter-edge] 未找到 hunter_edge_up.sh（用 HUNTER_EDGE_UP_SCRIPT 指定绝对路径）" >&2; exit 1; }; export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"; exec /bin/bash "$S"'
+ExecStart=/bin/bash -c 'S="${HUNTER_EDGE_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_edge_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_edge_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; [ -f "$S" ] || { echo "[hunter-edge] 未找到 hunter_edge_up.sh（用 HUNTER_EDGE_UP_SCRIPT 指定绝对路径）" >&2; exit 1; }; exec /bin/bash "$S"'
 # 整栈启动含相机硬件复位（initial_reset）与 Nav2 lifecycle，给足启动时间
 TimeoutStartSec=180
 Restart=on-failure
