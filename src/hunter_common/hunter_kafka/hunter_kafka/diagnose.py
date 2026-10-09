@@ -10,9 +10,10 @@
   1. 接入包文件齐备 + 私钥权限 0600（README「安全注意」硬要求）
   2. kafka.properties 解析（含 SCRAM 口令是否仍为占位符）
   3. 证书有效期与 CN 是否等于 vehicle_id（时间漂移会直接导致 TLS 失败）
-  4. Broker TCP 连通（网络/防火墙层）
-  5. SASL_SSL + mTLS 握手 + Topic 清单核对（AdminClient）
-  6. 端到端投递证实（发一条 telemetry 测试消息，等 on_delivery）
+  4. SASL 机制插件在位（本地可定，避开“看着像口令错”的 No worthy mechs found）
+  5. Broker TCP 连通（网络/防火墙层）
+  6. SASL_SSL + mTLS 握手 + Topic 清单核对（AdminClient）
+  7. 端到端投递证实（发一条 telemetry 测试消息，等 on_delivery）
 
 退出码：0=全部通过；10=参数/文件问题；20=TLS/证书问题；30=认证失败；
 40=网络不可达；50=Topic/权限问题；60=投递失败。
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import glob
 import os
 import socket
 import stat
@@ -179,6 +181,34 @@ def check_certificate(chk: Check, conf: dict, vehicle_id: str) -> None:
         chk.ok("证书 CN", cn_value or "(未取到)")
 
 
+def check_sasl_mechanism(chk: Check, conf: dict) -> None:
+    """本地判定 SCRAM 机制插件是否在位。
+
+    【包名坑】Ubuntu/Debian **没有** cyrus-sasl-scram 这个包（那是 RHEL/openSUSE 的名字，
+    照它装会直接 Unable to locate package）；libscram.so 被“错放”在
+    libsasl2-modules-gssapi-mit 里（Launchpad #1988730，名字与 MIT/GSSAPI 无关），
+    光装 libsasl2-modules 依旧报 No worthy mechs found。
+    因此判据用**插件文件**而不是包名，跨发行版/架构都不会因包名变化失真。
+    """
+    mech = str(conf.get("sasl.mechanism") or "").upper()
+    if mech and not mech.startswith("SCRAM"):
+        chk.ok("SASL 机制插件", f"{mech}（非 SCRAM，不需 scram 插件）")
+        return
+    if not mech:
+        mech = "SCRAM（properties 未显式指定，按接入包默认）"
+    hits: list[str] = []
+    for pattern in ("/usr/lib/sasl2/libscram.so", "/usr/lib64/sasl2/libscram.so",
+                    "/usr/lib/*/sasl2/libscram.so"):
+        hits.extend(glob.glob(pattern))
+    if hits:
+        chk.ok("SASL 机制插件", f"{mech} → {hits[0]}")
+    else:
+        chk.fail(EXIT_AUTH, "SASL 机制插件",
+                 f"未找到 libscram.so，{mech} 必报 No worthy mechs found；"
+                 "Ubuntu/Debian 装：sudo apt install -y libsasl2-modules "
+                 "libsasl2-modules-gssapi-mit（无 cyrus-sasl-scram 包，那是 RHEL 系的名字）")
+
+
 def check_tcp(chk: Check, bootstrap: str, timeout: float) -> None:
     host, _, port = bootstrap.partition(":")
     try:
@@ -205,8 +235,9 @@ def check_broker(chk: Check, conf: dict, vehicle_id: str, timeout: float) -> Opt
     try:
         names = admin.list_topics(timeout=timeout).topics
     except SaslAuthenticationException as exc:
-        chk.fail(EXIT_AUTH, "SASL 认证", f"{exc}（核对 SCRAM 口令/用户名；"
-                                         "确认已安装 SCRAM 插件：apt install cyrus-sasl-scram）")
+        chk.fail(EXIT_AUTH, "SASL 认证", f"{exc}（核对 SCRAM 口令/用户名与平台侧账号是否已开通；"
+                                         "若原文含 No worthy mechs found 则缺 SCRAM 插件，"
+                                         "Ubuntu 上装 libsasl2-modules-gssapi-mit）")
         return None
     except KafkaException as exc:
         code = exc.args[0].code() if exc.args else None
@@ -290,6 +321,10 @@ def main(argv: Optional[list] = None) -> int:
     chk.ok("vehicle_id", vehicle_id)
 
     check_certificate(chk, conf, vehicle_id)
+    if chk.failures:
+        return _summary(chk)
+
+    check_sasl_mechanism(chk, conf)   # 本地就能定的认证前置条件，先于握手报
     if chk.failures:
         return _summary(chk)
 

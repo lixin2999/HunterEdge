@@ -1,35 +1,42 @@
 #!/usr/bin/env bash
 # hunter_core_setup.sh — HunterCore 车端接入一键部署（文档 §5.6 / §5.7）
 #
-# 做五件事（幂等，可重复执行）：
-#   ① 依赖安装：librdkafka(C++/Python)、cyrus-sasl-scram(SCRAM-SHA-512 机制)、sqlite3
-#   ② 接入包落盘：把 HUNTER-001 bundle 整目录装到 /etc/hunter/kafka/，私钥 0600
-#   ③ 运行期配置：Agent 参数文件落到 /etc/hunter/，生成 /etc/hunter/agent_env.sh
-#   ④ 编译 + 自检：colcon build 相关包，然后跑 hunter-kafka-check（接入链路 6 层自检）
-#   ⑤ systemd：安装并启用 ota-agent / remote-agent（data/command agent 由 bring-up 拉起）
+# 做六件事（幂等，可重复执行；步骤号与运行日志一致）：
+#   ⓪ 前置校参：运行用户与其主组存在、接入包四件套齐、工作空间存在（失败文本带下一步动作）
+#   ① 依赖安装：librdkafka(C++/Python)、SCRAM-SHA-512 机制插件、sqlite3
+#   ② 接入包落盘：把 HUNTER-001 bundle 装到 /etc/hunter/kafka/，私钥 0600；已写入口令的 properties 不覆盖
+#   ③ 运行期配置：Agent 参数文件落到 /etc/hunter/，生成 agent_env.sh 与 README_agent_env
+#   ④ 编译：以运行用户身份 colcon build 相关包
+#   ⑤ 自检：hunter-kafka-check（接入链路 6 层自检，退出码非 0 不自启服务）
+#   ⑥ systemd：安装并启用 ota-agent / remote-agent（data/command agent 由 bring-up 拉起）
 #
 # 凭据红线：kafka.properties 只落盘 /etc/hunter/kafka/，不进工作空间、不进版本库、不进日志。
 #
 # 用法:
-#   sudo bash hunter_core_setup.sh --bundle ~/下载/HUNTER-001-bundle/HUNTER-001 \
-#        [--ws ~/HunterEdge] [--user hunter] [--skip-deps] [--skip-build]
+#   sudo bash hunter_core_setup.sh --bundle ~/HUNTER-001-bundle/HUNTER-001 \
+#        [--ws <工作空间>] [--user <登录用户>] [--skip-deps] [--skip-build]
 #        [--offline] [--no-systemd] [--force-config] [--force-key]
+#   # --ws / --user 通常省写：默认取 sudo 调用者的家目录 + ~/HunterEdge
 #
 # 参数:
 #   --bundle       接入包目录（含 kafka.properties / ca-cert.pem / client-cert.pem /
 #                  client-key.pem，可选 kafka-client.p12）。**必填**
-#   --ws           HunterEdge 工作空间根（默认 $HOME/HunterEdge）
-#   --user         运行 Agent 的用户（默认 SUDO_USER，其次当前用户）
+#                  注意：接入包不在仓库内，需先从开发机拷到车上（scp / U 盘）；
+#                  传错层级（如传到 HUNTER-001-bundle 而非内层 HUNTER-001）会自动下钻。
+#   --ws           HunterEdge 工作空间根（默认取**运行用户**家目录下的 HunterEdge，
+#                  即 sudo 时不会变成 /root/HunterEdge）
+#   --user         运行 Agent 的用户（默认 SUDO_USER，其次当前用户；可省略）
 #   --skip-deps    跳过 apt/pip 安装（离线源或已装齐时用）
 #   --skip-build   跳过 colcon 编译
 #   --offline      自检只查本地配置/证书，不连 broker（现场无云端网络时用）
 #   --no-systemd   不安装/启用 systemd 服务
-#   --force-config 用仓内参数文件覆盖 /etc/hunter/ 下已有配置（默认保留现场修改）
+#   --force-config 用仓内参数文件/接入包覆盖 /etc/hunter/ 下已有内容（默认保留现场修改，
+#                  含已人工写入口令的 kafka.properties——重跑脚本不会把口令抹回占位符）
 #   --force-key    允许 client-key.pem 权限非 0600 时继续（默认直接失败）
 set -euo pipefail
 
 BUNDLE_DIR=""
-WS_DIR="${HOME}/HunterEdge"
+WS_DIR=""                             # 未指定时按运行用户的家目录推导（见下方“前置检查”）
 RUN_USER="${SUDO_USER:-$(id -un)}"
 SKIP_DEPS=0 SKIP_BUILD=0 OFFLINE=0 NO_SYSTEMD=0 FORCE_CONFIG=0 FORCE_KEY=0
 
@@ -48,48 +55,107 @@ while [ $# -gt 0 ]; do
     --no-systemd)   NO_SYSTEMD=1; shift ;;
     --force-config) FORCE_CONFIG=1; shift ;;
     --force-key)    FORCE_KEY=1; shift ;;
-    -h|--help)      sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '/^set -euo pipefail/q; p' "$0"; exit 0 ;;   # 打印文头注释（自动随注释行数变化，不需手工维护行号）
     *) die "未知参数: $1（--help 看用法）" ;;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限：sudo bash $0 --bundle <接入包目录>"
 
-# ---- 0. 前置检查 ----
-[ -n "$BUNDLE_DIR" ] || die "必须指定 --bundle <接入包目录>"
-BUNDLE_DIR="$(cd "$BUNDLE_DIR" && pwd)" || die "接入包目录不存在: $BUNDLE_DIR"
+# ---- ⓪ 前置校参 ----
+# 运行用户必须真实存在：编译产物属主、/etc/hunter 的组授权、systemd Agent 运行身份都挂在它身上
+# （现场常见误传：车上登录的是 agilex 却写 --user hunter，后续 chown root:hunter 必失败）
+id "$RUN_USER" >/dev/null 2>&1 || die "运行用户不存在：$RUN_USER（车上登录用户可用 id -un 查；一般直接省略 --user，脚本会取 sudo 的调用者 $SUDO_USER）"
+USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
+[ -n "$USER_HOME" ] || die "查不到用户 $RUN_USER 的家目录（/etc/passwd 条目异常）"
+# 用户传 ~/xxx 写法时（被引号包住不会预处理展开）手动映射到运行用户家目录
+expand_tilde() { case "$1" in "~"|"~/"*) echo "${USER_HOME}${1#\~}" ;; *) echo "$1" ;; esac; }
+BUNDLE_DIR="$(expand_tilde "$BUNDLE_DIR")"
+WS_DIR="$(expand_tilde "$WS_DIR")"
+[ -n "$WS_DIR" ] || WS_DIR="${USER_HOME}/HunterEdge"   # 不用 $HOME：sudo 下 $HOME 可能是 /root
+
+[ -n "$BUNDLE_DIR" ] || die "必须指定 --bundle <接入包目录>（先拷到车上：scp -r <开发机>:HUNTER-001-bundle $USER_HOME/）"
+if [ ! -f "$BUNDLE_DIR/kafka.properties" ] && [ -d "$BUNDLE_DIR" ]; then
+  # 只传了外层包目录时自动下钻一层（平台下发的目录形如 HUNTER-001-bundle/HUNTER-001）
+  CANDIDATES=()
+  while IFS= read -r d; do CANDIDATES+=("$d"); done \
+    < <(find "$BUNDLE_DIR" -mindepth 1 -maxdepth 2 -name kafka.properties -type f 2>/dev/null | sort)
+  if [ "${#CANDIDATES[@]}" -eq 1 ]; then
+    warn "--bundle 指向的目录里没有 kafka.properties，自动下钻：$BUNDLE_DIR → $(dirname "${CANDIDATES[0]}")"
+    BUNDLE_DIR="$(dirname "${CANDIDATES[0]}")"
+  elif [ "${#CANDIDATES[@]}" -gt 1 ]; then
+    die "$BUNDLE_DIR 下找到多个 kafka.properties，请明确指定其中一个目录：
+$(printf '     %s\n' "${CANDIDATES[@]}")"
+  fi
+fi
+if [ ! -d "$BUNDLE_DIR" ]; then
+  die "接入包目录不存在: $BUNDLE_DIR
+     ↳ 接入包不在仓库内，需先从开发机拷到车上（scp / U 盘），例：
+         scp -r <开发机用户>@<开发机IP>:~/HUNTER-001-bundle $USER_HOME/
+     ↳ 已在车上但不知道在哪：sudo find / -name kafka.properties 2>/dev/null
+     ↳ 拷过来先自检目录内容：ls -l $BUNDLE_DIR   （应见 kafka.properties + 三个 .pem）"
+fi
+BUNDLE_DIR="$(cd "$BUNDLE_DIR" && pwd)"
 
 KAFKA_DIR="/etc/hunter/kafka"
 ETC_DIR="/etc/hunter"
 PROPS="$KAFKA_DIR/kafka.properties"
 RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"   # 用户主组（Ubuntu 默认为同名私有组）
+getent group "$RUN_GROUP" >/dev/null || die "运行用户的主组不存在：$RUN_GROUP（用户属组异常，先修 /etc/passwd 与 /etc/group）"
 REQUIRED_FILES=(kafka.properties ca-cert.pem client-cert.pem client-key.pem)
 for f in "${REQUIRED_FILES[@]}"; do
-  [ -f "$BUNDLE_DIR/$f" ] || die "接入包缺少 $f（应在 $BUNDLE_DIR 下）"
+  [ -f "$BUNDLE_DIR/$f" ] || die "接入包缺少 $f（应在 $BUNDLE_DIR 下）；该目录实际内容如下：
+$(ls -l "$BUNDLE_DIR" 2>&1 | sed 's/^/     /')"
 done
 [ -f "$BUNDLE_DIR/kafka-client.p12" ] || warn "包内无 kafka-client.p12（用 PEM 证书链即可，不影响）"
 
 AGENT_PKGS=(command_agent data_agent ota_agent remote_agent)
+[ -d "$WS_DIR" ] || die "工作空间目录不存在: $WS_DIR（--ws 应指向车上的 HunterEdge 根；默认 $USER_HOME/HunterEdge）"
+WS_DIR="$(cd "$WS_DIR" && pwd)"      # 相对路径归一，避免后续 install/ 拼错
 SRC_ROOT="$WS_DIR/src"
 [ -d "$SRC_ROOT/hunter_agents" ] || die "工作空间不对，未找到 $SRC_ROOT/hunter_agents: $WS_DIR"
-[ -d "$SRC_ROOT/hunter_common/hunter_kafka" ] || die "缺少公共包 src/hunter_common/hunter_kafka"
+[ -d "$SRC_ROOT/hunter_common/hunter_kafka" ] || die "缺少公共包 src/hunter_common/hunter_kafka（本版本新增，先 git pull 或检查仓同步状态）"
 
 log "接入包: $BUNDLE_DIR"
 log "工作空间: $WS_DIR   运行用户: $RUN_USER"
 
 # ---- ① 依赖 ----
 if [ "$SKIP_DEPS" -eq 0 ]; then
-  log "① 安装依赖（apt + pip）"
+  log "① 依赖检查与安装（apt + pip）"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  # cyrus-sasl-scram：librdkafka 的 SCRAM-SHA-512 机制由 Cyrus SASL 插件提供，
-  # 缺失时表现为 sasl init failed / No worthy mechs found（与口令错误表象不同，别混）
-  apt-get install -y -qq librdkafka++1 librdkafka-dev libsqlite3-dev \
-                cyrus-sasl-scram libsasl2-modules ca-certificates
+  # 【包名坑（jammy 实测）】SCRAM-SHA-512 机制在 Ubuntu 上**不叫** cyrus-sasl-scram（那是
+  # RHEL/openSUSE 的包名，这里装会直接 Unable to locate package）；libscram.so 被错放在
+  # libsasl2-modules-gssapi-mit 里（Launchpad #1988730，名字与 MIT/GSSAPI 无关），
+  # 光装 libsasl2-modules 依旧报 No worthy mechs found。因此这里**按插件文件判定**，
+  # 不赌包名（跨 Ubuntu 版本/架构都不会被包名变化骗到）。
+  scram_plugin() { ls /usr/lib/*/sasl2/libscram.so /usr/lib/sasl2/libscram.so >/dev/null 2>&1; }
+  need_pkgs=()
+  dpkg -s librdkafka++1  >/dev/null 2>&1 || need_pkgs+=(librdkafka++1)     # data_agent C++ 运行时
+  dpkg -s librdkafka-dev >/dev/null 2>&1 || need_pkgs+=(librdkafka-dev)     # ④ 编译期头文件
+  dpkg -s libsqlite3-dev >/dev/null 2>&1 || need_pkgs+=(libsqlite3-dev)     # 断网缓存
+  dpkg -s libsasl2-modules >/dev/null 2>&1 || need_pkgs+=(libsasl2-modules)
+  dpkg -s ca-certificates >/dev/null 2>&1 || need_pkgs+=(ca-certificates)
+  scram_plugin || need_pkgs+=(libsasl2-modules-gssapi-mit)                   # ← SCRAM 插件真正来源
+  if [ "${#need_pkgs[@]}" -gt 0 ]; then
+    log "  待装：${need_pkgs[*]}"
+    # update 失败不阻断：包已在本地而源不可达（4G/内网/仓库过期）时照样能装；
+    # 旧写法在 set -e 下直接静默退出，现场只看到一行 W: 就停了，像“脚本挂了”
+    apt-get update -qq || warn "  apt-get update 未全成功（源不可达/仓库过期），继续尝试安装"
+    apt-get install -y "${need_pkgs[@]}" || die "  依赖安装失败：${need_pkgs[*]}
+     ↳ 上面 apt 的 E: 行才是真原因：
+         Unable to locate package → 源里没有该包或未启用 universe：
+           sudo add-apt-repository universe && sudo apt-get update
+         404 / Failed to fetch → 源不可达或索引过期，先修源（或接本地镜像）
+     ↳ 完全离线：在有网机器上 apt download 同一型号 deb 后 dpkg -i，或用 --skip-deps 只跑后续步骤
+     ↳ 已手工装齐：重跑本脚本加 --skip-deps（本步会按文件/插件存在性自动判定，不需猜）"
+  else
+    log "  apt 依赖已齐（按本地文件判定，无需联网）"
+  fi
+  scram_plugin || warn "  仍未找到 SCRAM 插件（/usr/lib/*/sasl2/libscram.so）：认证会报 No worthy mechs found（Ubuntu 上由 libsasl2-modules-gssapi-mit 提供）"
   if python3 -c "import confluent_kafka" 2>/dev/null; then
     log "  confluent-kafka 已安装：$(python3 -c 'import confluent_kafka as c; print(c.version()[0])')"
   else
-    pip3 install --quiet confluent-kafka || die "pip3 安装 confluent-kafka 失败（离线环境请预先准备 wheel）"
+    pip3 install --quiet confluent-kafka || die "pip3 安装 confluent-kafka 失败（离线环境请预先准备 wheel；缺它只影响 ota/remote/command 三个 Python Agent，data_agent 仍可上报）"
   fi
 else
   log "① 跳过依赖安装（--skip-deps）"
@@ -98,7 +164,20 @@ fi
 # ---- ② 接入包落盘 ----
 log "② 安装接入包到 $KAFKA_DIR"
 install -d -m 0750 -o root -g "$RUN_GROUP" "$KAFKA_DIR"
-cp -f "$BUNDLE_DIR"/kafka.properties "$BUNDLE_DIR"/ca-cert.pem "$BUNDLE_DIR"/client-cert.pem "$BUNDLE_DIR"/client-key.pem "$KAFKA_DIR/"
+# properties 默认**不覆盖现场**：运营已手改写入 SCRAM 口令、而包内仍是占位符时，
+# 重跑脚本（如 --skip-build）不得把口令抹回 <SCRAM_PASSWORD>；确需覆盖用 --force-config。
+# 只看包内容是否含占位串（grep -q，不输出任何行），避免口令进终端/日志。
+PRESERVE_PROPS=0
+if [ -f "$KAFKA_DIR/kafka.properties" ] && [ "$FORCE_CONFIG" -eq 0 ] \
+   && grep -q '<SCRAM_PASSWORD>' "$BUNDLE_DIR/kafka.properties" \
+   && ! grep -q '<SCRAM_PASSWORD>' "$KAFKA_DIR/kafka.properties"; then
+  PRESERVE_PROPS=1
+  warn "  保留现场 $KAFKA_DIR/kafka.properties（已含接入凭据，包内仍是占位符）；要强制用包内容覆盖请加 --force-config"
+fi
+cp -f "$BUNDLE_DIR"/ca-cert.pem "$BUNDLE_DIR"/client-cert.pem "$BUNDLE_DIR"/client-key.pem "$KAFKA_DIR/"
+if [ "$PRESERVE_PROPS" -eq 0 ]; then
+  cp -f "$BUNDLE_DIR/kafka.properties" "$KAFKA_DIR/"
+fi
 if [ -f "$BUNDLE_DIR/kafka-client.p12" ]; then
   # p12 仅作备用（PEM 链已可用：librdkafka 无需 keystore 即可建 mTLS）
   cp -f "$BUNDLE_DIR/kafka-client.p12" "$KAFKA_DIR/kafka-client.p12"
@@ -169,7 +248,7 @@ Agent 运行环境说明（由 hunter_core_setup.sh 生成于 $(date '+%F %T')�
 EOF
 chmod 0644 "$ETC_DIR/README_agent_env"
 
-# ---- ④ 编译 + 自检 ----
+# ---- ④ 编译 ----
 if [ "$SKIP_BUILD" -eq 0 ]; then
   log "④ colcon 编译（hunter_kafka + 四个 Agent）"
   [ -f /opt/ros/humble/setup.bash ] || die "未找到 /opt/ros/humble/setup.bash（先装 ROS2 Humble）"
@@ -186,7 +265,8 @@ else
   log "④ 跳过编译（--skip-build）"
 fi
 
-# 自检：能离线判定的失败原因（口令占位、证书 CN 与 vehicle_id 不符、时间漂移、
+# ---- ⑤ 自检 ----
+# 能离线判定的失败原因（口令占位、证书 CN 与 vehicle_id 不符、时间漂移、
 # 私钥权限、broker 不可达、Topic 缺失）一次跑完，不依赖 ROS 环境
 CHECK_BIN="$WS_DIR/install/hunter_kafka/bin/hunter-kafka-check"
 CHECK_ARGS=(--properties "$PROPS" --bundle-dir "$KAFKA_DIR")
@@ -195,23 +275,23 @@ if [ "$OFFLINE" -eq 1 ]; then
 fi
 SELFTEST=0
 if [ -x "$CHECK_BIN" ]; then
-  log "自检：hunter-kafka-check（配置/证书/网络/认证/Topic/投递 六层）"
+  log "⑤ 自检：hunter-kafka-check（配置/证书/网络/认证/Topic/投递 六层）"
   "$CHECK_BIN" "${CHECK_ARGS[@]}" || SELFTEST=$?
 elif python3 -c "import confluent_kafka" 2>/dev/null; then
   # 未编译（--skip-build）时退回源码模式，仍可做本地配置/证书核查
-  log "自检：以源码方式运行 hunter-kafka-check（未找到编译产物）"
+  log "⑤ 自检：以源码方式运行 hunter-kafka-check（未找到编译产物）"
   PYTHONPATH="$SRC_ROOT/hunter_common/hunter_kafka" python3 -m hunter_kafka.diagnose "${CHECK_ARGS[@]}" \
     || SELFTEST=$?
 else
-  warn "未编译且无 confluent_kafka，跳过自检（编好后手动补跑 hunter-kafka-check）"
+  warn "⑤ 未编译且无 confluent_kafka，跳过自检（编好后手动补跑 hunter-kafka-check）"
 fi
 if [ "$SELFTEST" -ne 0 ]; then
   warn "自检未全通过（退出码 $SELFTEST）：按上面每一条的处置提示修，修完重跑 hunter-kafka-check"
 fi
 
-# ---- ⑤ systemd ----
+# ---- ⑥ systemd ----
 if [ "$NO_SYSTEMD" -eq 0 ]; then
-  log "⑤ 安装 systemd 服务（ota-agent / remote-agent）"
+  log "⑥ 安装 systemd 服务（ota-agent / remote-agent）"
   for pkg in ota_agent remote_agent; do
     unit="${pkg/_agent/-agent}.service"
     unit_src="$SRC_ROOT/hunter_agents/$pkg/scripts/$unit"
@@ -231,10 +311,14 @@ if [ "$NO_SYSTEMD" -eq 0 ]; then
     warn "  自检未通过，已 enable 但**不**自动启动（避免坏配置反复重启刷日志）"
   fi
 else
-  log "⑤ 跳过 systemd（--no-systemd）"
+  log "⑥ 跳过 systemd（--no-systemd）"
 fi
 
 echo
+if grep -q '<SCRAM_PASSWORD>' "$PROPS" 2>/dev/null; then
+  warn "接入尚未生效：$PROPS 的口令仍是占位符 → sudo vi $PROPS 写入 SCRAM 口令后重跑本脚本"
+  warn "（重跑不会把你已写入的口令抹回占位符；编译/依赖都齐时可加 --skip-deps --skip-build 只跑⑤⑥）"
+fi
 log "完成。后续步骤："
 log "  1) 启动整栈：ros2 launch hunter_bringup hunter_full.launch.py（含 data_agent + command_agent）"
 log "  2) 现场改参：vi $ETC_DIR/<agent>_params.yaml，再按 params_file 指向它启动"

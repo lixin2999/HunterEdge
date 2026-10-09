@@ -194,11 +194,12 @@ git clone -b humble https://github.com/agilexrobotics/hunter_ros2.git
 sudo apt install -y ros-humble-navigation2 ros-humble-nav2-bringup
 sudo apt install -y ros-humble-robot-localization
 sudo apt install -y ros-humble-realsense2-camera
-sudo apt install -y librdkafka-dev librdkafka++1 libsqlite3-dev libsasl2-dev libssl-dev libsasl2-modules cyrus-sasl-scram   # data_agent/command_agent（Kafka SASL_SSL + mTLS + SQLite 缓存）
+sudo apt install -y librdkafka-dev librdkafka++1 libsqlite3-dev libsasl2-dev libssl-dev libsasl2-modules libsasl2-modules-gssapi-mit   # data_agent/command_agent（Kafka SASL_SSL + mTLS + SQLite 缓存）
 pip3 install confluent-kafka            # Python Agent（ota_agent / remote_agent / command_agent / hunter_kafka）
 ```
 
-> ⚠️ **【HunterCore 接入必装（V0.1.05）】** `cyrus-sasl-scram` 提供 SCRAM-SHA-512 机制，**缺它必报 `No worthy mechs found`**，表象极像口令错或网络不通，是现场最易误判的一条（详见 §7.7、Deployment_Guide §5.6.3）。上述依赖与证书落盘可由 `scripts/hunter_core_setup.sh` 一次性完成。
+> ⚠️ **【SCRAM 机制必装（V0.1.05）】** 接入口要求的 `SCRAM-SHA-512` 由 Cyrus SASL 插件 `libscram.so` 提供，**缺它必报 `No worthy mechs found`**，表象极像口令错或网络不通，是现场最易误判的一条（详见 §7.7、Deployment_Guide §5.6.3）。
+> **包名坑（jammy 实测）**：Ubuntu/Debian **没有** `cyrus-sasl-scram` 这个包（那是 RHEL/openSUSE 的名字，照它装会直接 `Unable to locate package`）；`libscram.so` 被“错放”在 **`libsasl2-modules-gssapi-mit`** 里（Launchpad #1988730，名字与 MIT/GSSAPI 无关），**光装 `libsasl2-modules` 依旧不够**。判定以文件为准：`ls /usr/lib/*/sasl2/libscram.so`。上述依赖与证书落盘可由 `scripts/hunter_core_setup.sh` 一次性完成（它按插件文件在不在来决定装什么，不赌包名）。
 
 以下包需源码编译（vendor 源码）：
 
@@ -358,19 +359,22 @@ ros2 launch hunter_bringup hunter_full.launch.py \
 
 ### 7.7 HunterCore 车端接入部署与自检（V0.1.05）
 
-车端与 HunterCore 平台的**全部**数据交互以平台按车下发的**接入包**为唯一可信源（`kafka.properties` + `ca-cert.pem` + `client-cert.pem` + `client-key.pem`），**仓内 YAML 不得出现任何凭据**。接入前提：§5.2 依赖已装齐（尤其 `cyrus-sasl-scram`）、车-平台网络可达、系统**已校时**（时间漂移会让 TLS 必失败）。
+车端与 HunterCore 平台的**全部**数据交互以平台按车下发的**接入包**为唯一可信源（`kafka.properties` + `ca-cert.pem` + `client-cert.pem` + `client-key.pem`），**仓内 YAML 不得出现任何凭据**。接入前提：§5.2 依赖已装齐（尤其 SCRAM 插件 `libscram.so`，Ubuntu 上由 `libsasl2-modules-gssapi-mit` 提供）、车-平台网络可达、系统**已校时**（时间漂移会让 TLS 必失败）。
 
 ```bash
+# 前置：接入包不在仓库内，需先从开发机拷到车上（scp / U 盘），否则第一步就报“接入包目录不存在”
+ls -l ~/HUNTER-001-bundle/HUNTER-001      # 应见 kafka.properties + 三个 .pem
+
 # 一键部署：依赖 → 接入包落盘(/etc/hunter/kafka) → 参数落盘(/etc/hunter) → 编译 → 自检 → systemd
 cd ~/HunterEdge
 sudo bash src/hunter_bringup/scripts/hunter_core_setup.sh \
-  --bundle ~/下载/HUNTER-001-bundle/HUNTER-001 --ws ~/HunterEdge --user hunter
-
+  --bundle ~/HUNTER-001-bundle/HUNTER-001
+# --user / --ws 一般不写：默认取 sudo 调用者与其家目录下的 HunterEdge（显式写则必须是车上真实存在的用户）
 # 云端不可达时先只查本地配置/证书：追加 --offline
 # 常用开关：--skip-deps / --skip-build / --no-systemd / --force-config / --force-key
 ```
 
-> ⚠️ **【口令写入是人工动作】** 接入包模板里 `sasl.jaas.config` 的 `password="<SCRAM_PASSWORD>"` 需由运营/现场负责人**手工**换为平台分配的真实口令；脚本与日志均不经手该值。未替换时 `hunter-kafka-check` 会直接失败（退出码 10），**不要当网络问题排**。
+> ⚠️ **【口令写入是人工动作】** 接入包模板里 `sasl.jaas.config` 的 `password="<SCRAM_PASSWORD>"` 需由运营/现场负责人**手工**换为平台分配的真实口令；脚本与日志均不经手该值。未替换时 `hunter-kafka-check` 会直接失败（退出码 10），**不要当网络问题排**。**写入口令后可放心重跑部署脚本**：包内仍是占位符时，步骤② 保留现场已写入真值的 `kafka.properties`（仅用 `grep -q` 判占位串，不输出内容），要强制用包内容覆盖才加 `--force-config`。
 
 部署完成后，`ros2 launch hunter_bringup hunter_full.launch.py` 会随栈拉起 `data_agent` + `command_agent`；`ota-agent` / `remote-agent` 为 systemd 服务（由脚本步骤⑥ 安装并 `enable`）。日常核验：
 
@@ -386,9 +390,9 @@ hunter-kafka-check --offline      # 仅本地配置/证书层
 | 退出码 | 含义 | 首要处置 |
 |---|---|---|
 | `0` | 全部通过 | 看平台侧该车 `last_online_time` 是否刷新（**联调唯一判据**） |
-| `10` | 参数/文件 | 四件套是否齐全、SCRAM 口令是否仍为占位符、`vehicle_id` 能否推出 |
+| `10` | 参数/文件 | 四件套是否齐全、SCRAM 口令是否仍为占位符、`vehicle_id` 能否推出；**接入包未拷到车上/路径层级传错**也归本类 |
 | `20` | TLS/证书 | 先 `timedatectl` 校时；再查证书有效期、CN 是否等于 `vehicle_id`、私钥是否 0600 |
-| `30` | 认证 | SASL 用户名/口令、账号是否已在平台开通、是否缺 `cyrus-sasl-scram` |
+| `30` | 认证 | SASL 用户名/口令、账号是否已在平台开通、是否缺 SCRAM 插件（`ls /usr/lib/*/sasl2/libscram.so`；Ubuntu 装 `libsasl2-modules-gssapi-mit`） |
 | `40` | 网络 | `bootstrap.servers` 的 IP:端口需与 broker `advertised.listeners` 一致 |
 | `50` | Topic/ACL | 平台未按该车建满 8 个 Topic，或账号无 describe/write 权限 |
 | `60` | 投递 | broker 可达但 leader 异常；看 `data_agent` 是否已转 SQLite 缓存 |
@@ -843,8 +847,8 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 ### 12.5 HunterCore 接入部署与状态查看（V0.1.05）
 
 ```bash
-# 首次接入 / 换车 / 接入包重新下发（需 sudo，可重复执行）
-sudo bash ./hunter_core_setup.sh --bundle <接入包目录> --ws ~/HunterEdge --user hunter
+# 首次接入 / 换车 / 接入包重新下发（需 sudo，可重复执行；接入包需先拷到车上）
+sudo bash ./hunter_core_setup.sh --bundle ~/HUNTER-001-bundle/HUNTER-001
 
 # 接入链路自检（退出码含义见 §7.7）
 source ~/HunterEdge/install/setup.bash && hunter-kafka-check
@@ -934,7 +938,7 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 | 定位漂移大 | IMU 标定 / 轮速 / 外参 | 检查 IMU 数据、外参文件、EKF 参数 |
 | 控制抖动 | 控制参数 / 延迟 | 调整 MPPI 参数（critics 权重/时间步）、检查控制频率 |
 | 系统卡顿 | GPU / CPU / 温度 | `tegrastats` 查看资源、降温、降频 |
-| 无法连平台 | 网络 / 证书 / Kafka SASL 配置 | **先跑 `hunter-kafka-check` 拿退出码定位到哪一层**（§7.7）：10=配置/口令未填、20=证书/未校时、30=认证或缺 `cyrus-sasl-scram`、40=网络、50=Topic/ACL；不再靠翻 `kafka_brokers`/`sasl_password` YAML（V0.1.05 起凭据不在 YAML 里） |
+| 无法连平台 | 网络 / 证书 / Kafka SASL 配置 | **先跑 `hunter-kafka-check` 拿退出码定位到哪一层**（§7.7）：10=配置/口令未填、20=证书/未校时、30=认证或缺 SCRAM 插件、40=网络、50=Topic/ACL；不再靠翻 `kafka_brokers`/`sasl_password` YAML（V0.1.05 起凭据不在 YAML 里） |
 | 平台下发指令无反应 / 一直 `REJECTED` | 指令类型不在白名单、接入包未部署（`command_agent` 降级）、旧 `command_id` 被幂等表拦下、TTL 过期 | `ros2 launch … use_command_agent:=false` 可单独排除该节点；看 `command_agent` 日志里 `REJECT …` 原因字串；`ros2 topic echo /system/health --once` 确认 ROS 侧接口在位 |
 | 视觉节点每帧崩溃（`setSize` 断言） | OpenCV 4.10 / 4.5.4 **混链**（同进程两套 OpenCV，破坏 `cv::Mat` 不变量） | `ldd vision_perception_node \| grep opencv`：只允许 `so.410`、无 `4.5d`、无 `libcv_bridge`；异常时按 §6 专项重编（禁止在视觉进程重新引入 cv_bridge） |
 | 视觉 0Hz，日志 `resize.cu:175 error (-217) no kernel image` | OpenCV CUDA 编译 ARCH 与实机 GPU 不符（如 sm_72 用于 Orin） | `cuobjdump --list-elf /usr/local/lib/libopencv_cudawarping.so.410` 应见 `sm_87`；按 §5.3 以 `CUDA_ARCH_BIN=8.7` 重编后重启节点即恢复 GPU（期间节点自动降级 CPU，感知不断流） |
