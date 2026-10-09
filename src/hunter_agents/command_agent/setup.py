@@ -1,3 +1,5 @@
+import os
+
 from setuptools import find_packages, setup
 
 package_name = 'command_agent'
@@ -12,6 +14,11 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/config', ['config/command_agent_params.yaml']),
         ('share/' + package_name + '/launch', ['launch/command_agent.launch.py']),
+        # 可执行入口装到 lib/<pkg>/：**不依赖 setuptools 发行版元数据**
+        # （console_scripts 生成的是入口包装，--symlink-install 下会因
+        #   easy-install.pth 在 PYTHONPATH 下不生效而抛 PackageNotFoundError，
+        #   HUNTER-001 实机踩中 → command_agent 起后即退）
+        (os.path.join('lib', package_name), ['scripts/command_agent_node']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

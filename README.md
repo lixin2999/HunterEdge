@@ -1122,6 +1122,8 @@ hunter-kafka-check; echo "exit=$?"
 | `agent_env.sh` **不能写行内注释** | 值变成 `nav   # nav=…` → `hunter-edge` 起来但**静默没进自动驾驶准备状态**（launch 参数非法） | **V0.1.06 已修**；该文件是 systemd `EnvironmentFile`，注释只能**独占一行** |
 | `RMW_IMPLEMENTATION` 在 unit 里硬编码 | 开机自启的节点与登录终端里的 `ros2 node list`/`rviz2` **互相看不见**（两套 DDS） | **V0.1.06 已修**：单元不硬编码，改由 `agent_env.sh` 的 `HUNTER_RMW_IMPLEMENTATION` 继承（③ 自动探测运行用户登录 shell 的值；探测不到＝ROS 默认） |
 | `ip -details link show` 的状态回显 | `can2 已启用：` 后面空白 | **V0.1.06 已修**：`bitrate` 与 `can state` 在输出里**分属两行**，必须分开 grep（`hunter_status.sh` 同步补 `can state`，bus-off 一眼可见） |
+| **setuptools 入口包装找不到发行版元数据**（本轮最关键） | `command_agent` 起后即退（进程表里没有）；`ota-agent`/`remote-agent` 停在 `activating` 重启循环；`hunter-kafka-check` 退 1 带 `PackageNotFoundError`；`source install/setup.bash` 也不解决 | **V0.1.06 已修**。根因：`--symlink-install` 下 ament_python 走 `setup.py develop`，元数据留在源码目录并靠 `easy-install.pth` 注入——而 **`.pth` 对 PYTHONPATH 条目不生效**（setup.bash 提供的正是 PYTHONPATH）→ 模块能 import、元数据找不到。修法：三个 Python Agent 改走 `lib/<pkg>/<pkg>_node` **普通脚本**入口（与 `health_monitor` 的 ament_cmake 做法一致）；自检改为**源码方式优先**；命令包装加装 `/usr/local/bin`（免重登）；`hunter_bringup/scripts/*.sh` 与三个 `*_node` 在 git 里记为 `100755` 并新增 ④.1 可执行位自愈 |
+| 脚本可执行位 | `./hunter_status.sh: Permission denied` | **V0.1.06 已修**（git `chmod=+x` + 部署脚本 ④.1 自愈）；临时也可 `bash <脚本路径>` 直接跑 |
 
 ---
 

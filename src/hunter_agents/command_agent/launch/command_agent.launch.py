@@ -25,7 +25,9 @@ def generate_launch_description():
         ),
         Node(
             package='command_agent',
-            executable='command_agent',
+            # 用 lib/command_agent/command_agent_node（普通脚本，不依赖 setuptools 元数据）；
+            # 旧的 console_scripts 入口在 --symlink-install 下会抛 PackageNotFoundError
+            executable='command_agent_node',
             name='command_agent',
             output='screen',
             parameters=[params_file],

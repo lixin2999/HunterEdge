@@ -1,3 +1,5 @@
+import os
+
 from setuptools import find_packages, setup
 
 package_name = 'ota_agent'
@@ -13,6 +15,10 @@ setup(
         ('share/' + package_name + '/config', ['config/ota_agent_params.yaml']),
         ('share/' + package_name + '/launch', ['launch/ota_agent.launch.py']),
         ('share/' + package_name + '/scripts', ['scripts/ota-agent.service']),
+        # 可执行入口装到 lib/<pkg>/：**不依赖 setuptools 发行版元数据**
+        # （console_scripts 入口包装在 --symlink-install 下会抛 PackageNotFoundError，
+        #   HUNTER-001 实机因此陷入 activating 重启循环）
+        (os.path.join('lib', package_name), ['scripts/ota_agent_node']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
