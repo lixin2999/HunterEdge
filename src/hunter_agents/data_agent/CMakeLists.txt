@@ -17,6 +17,7 @@ find_library(SQLITE3_LIB sqlite3)
 
 add_executable(data_agent_node
   src/data_agent.cpp
+  src/kafka_access.cpp
   src/main.cpp
 )
 target_include_directories(data_agent_node PRIVATE include)

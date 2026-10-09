@@ -1,0 +1,30 @@
+# command_agent_params.yaml — HunterCore 平台指令接入参数（接入包 README + 文档 14/16 章）
+#
+# ⚠ 安全约定：本文件**不写任何凭据**。Broker/SCRAM 用户名口令/证书路径一律来自
+#   /etc/hunter/kafka/kafka.properties（HunterCore 接入包，目录 0750 / properties 0640 / 私钥 0600，不入版本库）。
+#   kafka_fallback_* 仅供无接入包的开发机联调，生产车端必须留空。
+command_agent:
+  ros__parameters:
+    # ── 车辆与 Kafka 接入源 ─────────────────────────────────────────
+    vehicle_id: "HUNTER-001"                          # 留空则自动取 properties 的 SASL 用户名（须等于证书 CN）
+    kafka_properties: "/etc/hunter/kafka/kafka.properties"
+    kafka_bundle_dir: "/etc/hunter/kafka"
+    command_group_suffix: "command"                   # 消费组 = <suffix>-<vehicle_id>
+
+    # ── 指令安全护栏 ────────────────────────────────────────────────
+    command_ttl: 10.0                                 # 无 expires_at 时的时效窗口（秒），防断网重连回灌历史指令
+    service_timeout: 10.0                             # ROS 服务调用超时（秒），超时回 TIMEOUT 回执
+    dedup_cache_size: 512                             # command_id 幂等去重容量（LRU）
+    allow_unknown_types: false                        # 生产必须 false：未登记指令一律 REJECTED
+    extra_allowed_types: []                           # 现场临时放开（仍走同一护栏链）
+    static_velocity_threshold: 0.05                   # 解除急停要求的静止速度上限（m/s）
+
+    # ── 运行节拍 ────────────────────────────────────────────────────
+    poll_interval: 0.05                               # Kafka 消费轮询周期（秒）= 20Hz
+    estop_repeat_rate: 2.0                            # 急停锁存重发 /estop=true 的频率（Hz）
+    result_retry_max: 200                             # 回执断线补投队列长度
+
+    # ── 开发机内联参数（生产留空）──────────────────────────────────
+    kafka_fallback_brokers: ""
+    kafka_fallback_username: ""
+    kafka_fallback_password: ""

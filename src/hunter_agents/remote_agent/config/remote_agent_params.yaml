@@ -1,20 +1,25 @@
-# Remote Agent parameters
+# remote_agent_params.yaml — 遥控 Agent 参数（文档第 13 章 + HunterCore 接入包契约）
+#
+# ⚠ 安全约定：本文件**不写任何凭据**。Broker / SCRAM 口令 / mTLS 证书路径统一来自
+#   /etc/hunter/kafka/kafka.properties（目录 0750 / properties 0640 / 私钥 0600，不入版本库）。
+#   remote_agent 为 systemd 服务（非 ROS 节点），启动时按 --config / 本文件覆盖内置默认值。
 remote_agent:
   ros__parameters:
-    vehicle_id: "hunter_001"
-    camera_device: "/dev/video0"
-    bitrate: 3000000
-    srs_host: "127.0.0.1"
+    vehicle_id: "HUNTER-001"                          # 留空或与接入包不一致时以 kafka.properties 为准
+    kafka_properties: "/etc/hunter/kafka/kafka.properties"
+    kafka_bundle_dir: "/etc/hunter/kafka"
+
+    # ── 视频链路（文档 13.2）──────────────────────────────────────
+    camera_device: "/dev/video0"                      # D435 RGB
+    enable_video: true                                # 无相机/纯指令联调时可关闭
+    bitrate: 3000000                                  # 3Mbps CBR
+    srs_host: "127.0.0.1"                             # SRS 媒体服务器
     srs_rtp_port: 8000
-    ws_url: "wss://platform.example.com/ws/remote"
+    ws_url: "wss://platform.example.com/ws/remote"    # 文档 17.2（WebSocket 备用通道）
+
+    # ── 遥控指令（文档 13.4；主通道为 Kafka hunter.<vid>.remote_control）──
     cmd_topic: "/remote/command"
-    kafka_brokers: "120.202.73.105:9093"
-    # Kafka SASL_SSL 认证
-    security_protocol: "SASL_SSL"
-    sasl_mechanism: "SCRAM-SHA-512"
-    sasl_username: "hunter_vehicle"
-    sasl_password: "CHANGE_ME"
-    ssl_ca_location: "/etc/ssl/certs/ca-certificates.crt"
-    max_velocity: 2.0
-    max_steering: 0.4
-    cmd_timeout: 0.5
+    max_velocity: 2.0                                 # 远程限速 2.0 m/s
+    max_steering: 0.4                                 # 转向 ±0.4 rad
+    cmd_timeout: 0.5                                  # 500ms 无指令 → 停车并交还驾驶权
+    remote_cmd_ttl: 1.0                               # remote_control 报文时效（秒），过期丢弃

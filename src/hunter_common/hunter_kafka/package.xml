@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hunter_kafka</name>
+  <version>1.0.0</version>
+  <description>HunterCore 车端 Kafka 接入公共库（kafka.properties 单一可信源 + SASL_SSL/mTLS 配置装配 + 接入自检 CLI）</description>
+  <maintainer email="developer@hunter.ai">HUNTER Development Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- 运行时依赖 confluent-kafka 由 pip 安装（Jetson/Ubuntu apt 源无该包）：
+       pip3 install confluent-kafka  —— 见 Deployment_Guide §5.1 -->
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

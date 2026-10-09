@@ -49,12 +49,20 @@ def generate_launch_description():
     use_perception = LaunchConfiguration('use_perception')
     use_navigation = LaunchConfiguration('use_navigation')
     use_data_agent = LaunchConfiguration('use_data_agent')
+    use_command_agent = LaunchConfiguration('use_command_agent')
     use_autonomous_nav  = LaunchConfiguration('use_autonomous_nav')
     autonomous_nav_mode = LaunchConfiguration('autonomous_nav_mode')
 
     declare_use_perception      = DeclareLaunchArgument('use_perception',      default_value='true')
     declare_use_navigation      = DeclareLaunchArgument('use_navigation',      default_value='true')
     declare_use_data_agent      = DeclareLaunchArgument('use_data_agent',      default_value='true')
+    # HunterCore 平台指令接入（command / command_result Topic）
+    declare_use_command_agent   = DeclareLaunchArgument(
+        'use_command_agent',
+        default_value='true',
+        description='true: 启动 command_agent（消费 hunter.<vehicle_id>.command 并回执 '
+                    'command_result，凭据取 /etc/hunter/kafka/kafka.properties）',
+    )
     # 新增：自主导航开关（默认关闭，不破坏原有启动行为）
     declare_use_autonomous_nav  = DeclareLaunchArgument(
         'use_autonomous_nav',
@@ -207,6 +215,9 @@ def generate_launch_description():
     # ---- 7. Agent（数据采集，文档 14；remote/ota 为 systemd 服务） ----
     data_agent     = _isolated(src('data_agent', 'launch', 'data_agent.launch.py'),
                                condition=IfCondition(use_data_agent))
+    # 平台指令接入（HunterCore）：消费 command → 车端服务/话题 → 回执 command_result
+    command_agent  = _isolated(src('command_agent', 'launch', 'command_agent.launch.py'),
+                               condition=IfCondition(use_command_agent))
 
     # ---- 8. health_monitor（文档 15） ----
     health_monitor = _isolated(src('health_monitor', 'launch', 'health_monitor.launch.py'))
@@ -215,6 +226,7 @@ def generate_launch_description():
         declare_use_perception,
         declare_use_navigation,
         declare_use_data_agent,
+        declare_use_command_agent,
         declare_use_autonomous_nav,
         declare_autonomous_nav_mode,
         declare_map_yaml_path,
@@ -237,6 +249,7 @@ def generate_launch_description():
         autonomous_nav,
         # 7. Agent
         data_agent,
+        command_agent,
         # 8. health_monitor
         health_monitor,
     ])

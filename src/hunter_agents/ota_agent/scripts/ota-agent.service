@@ -1,18 +1,23 @@
 [Unit]
-Description=HUNTER OTA Upgrade Agent (non-ROS systemd service)
-Documentation=docs/hunter/ota.md
+Description=HUNTER OTA Upgrade Agent (HunterCore Kafka: ota_notify / ota_status)
+Documentation=file:///etc/hunter/README_agent_env
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
 User=root
 Group=root
-# 主程序路径（部署到车辆后）
-ExecStart=/usr/bin/python3 /opt/hunter/ota_agent/ota_agent.py
-Restart=on-failure
-RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+# 由 hunter_core_setup.sh 生成：HUNTER_WS_PREFIX 指向 colcon 安装目录
+# （例：/home/hunter/hunter_ws/install），Agent 可执行文件在 <prefix>/lib/<pkg>/<pkg>
+EnvironmentFile=-/etc/hunter/agent_env.sh
+# 必须 source ROS2 与工作空间：两个 Agent 都依赖 hunter_kafka 公共包
+ExecStart=/bin/bash -c 'P="${HUNTER_WS_PREFIX:-/home/hunter/hunter_ws/install}"; source "${HUNTER_ROS_SETUP:-/opt/ros/humble/setup.bash}" && source "$P/setup.bash" && exec "$P/lib/ota_agent/ota_agent" --config "${HUNTER_OTA_CONFIG:-/etc/hunter/ota_agent_params.yaml}"'
+Restart=on-failure
+RestartSec=10
 # 资源限制
 LimitNOFILE=65536
 # 日志

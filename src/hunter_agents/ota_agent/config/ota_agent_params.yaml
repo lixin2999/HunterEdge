@@ -1,14 +1,28 @@
-# OTA Agent parameters
+# ota_agent_params.yaml — OTA 升级 Agent 参数（文档第 12 章 + HunterCore 接入包契约）
+#
+# ⚠ 安全约定：本文件**不写任何凭据**。Broker / SCRAM 口令 / mTLS 证书路径统一来自
+#   /etc/hunter/kafka/kafka.properties（目录 0750 / properties 0640 / 私钥 0600，不入版本库）。
+#   OTA Topic 严格取契约名：hunter.<vehicle_id>.ota_notify / .ota_status
 ota_agent:
   ros__parameters:
-    upgrade_check_interval: 3600  # seconds
-    max_download_size: 1000000000  # bytes
-    upgrade_server_url: "https://upgrade.platform.example.com"
-    upgrade_timeout: 300  # seconds
-    kafka_brokers: "120.202.73.105:9093"
-    # Kafka SASL_SSL 认证
-    security_protocol: "SASL_SSL"
-    sasl_mechanism: "SCRAM-SHA-512"
-    sasl_username: "hunter_vehicle"
-    sasl_password: "CHANGE_ME"
-    ssl_ca_location: "/etc/ssl/certs/ca-certificates.crt"
+    vehicle_id: "HUNTER-001"                          # 与接入包不一致时以 kafka.properties 为准
+    kafka_properties: "/etc/hunter/kafka/kafka.properties"
+    kafka_bundle_dir: "/etc/hunter/kafka"
+    offset_reset: "earliest"                          # 升级通知不可漏（同 task_id 幂等去重）
+    status_flush_timeout: 5.0                         # ota_status 逐条投递证实的等待上限（秒）
+
+    # ── 升级包与备份路径（文档 12.4/12.5）──────────────────────────
+    download_dir: "/data/ota/download"
+    extract_dir: "/data/ota/extract"
+    backup_dir: "/data/ota/backup"
+    task_state_file: "/data/ota/.task_state.json"     # task_id 终态记录（防重复刷机）
+    public_key_path: "/etc/hunter/ota_public_key.pem" # RSA-2048  manifest 签名公钥
+    version_file: "/opt/hunter/version"
+    current_version: "1.0.0"
+    backup_paths: ["/opt/hunter/install"]
+
+    # ── 前置条件（文档 12.4.2）────────────────────────────────────
+    min_battery_soc: 50.0                             # SOC ≥ 50% 才允许升级
+    min_free_space_gb: 2.0                            # 剩余存储 ≥ 2GB
+    platform_host: "192.168.31.35"                    # 网络连通性探测目标（Broker 主机）
+    self_test_on_start: true                          # 重启后自检，失败自动回滚

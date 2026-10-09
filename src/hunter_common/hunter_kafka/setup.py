@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'ota_agent'
+package_name = 'hunter_kafka'
 
 setup(
     name=package_name,
@@ -10,20 +10,18 @@ setup(
         ('share/ament_index/resource_index/packages',
          ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/config', ['config/ota_agent_params.yaml']),
-        ('share/' + package_name + '/launch', ['launch/ota_agent.launch.py']),
-        ('share/' + package_name + '/scripts', ['scripts/ota-agent.service']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='HUNTER Development Team',
     maintainer_email='developer@hunter.ai',
-    description='OTA upgrade management agent for HUNTER autonomous vehicle system',
+    description='HunterCore vehicle-side Kafka access library: kafka.properties single source of '
+                'truth, SASL_SSL + mTLS config assembly for librdkafka, and preflight diagnostics',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'ota_agent = ota_agent.ota_agent:main',
+            'hunter-kafka-check = hunter_kafka.diagnose:main',
         ],
     },
 )

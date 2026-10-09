@@ -1,29 +1,40 @@
-# data_agent_params.yaml — 数据采集 Agent 参数（文档第 14 章）
+# data_agent_params.yaml — 数据采集 Agent 参数（文档第 14 章 + HunterCore 接入包契约）
+#
+# ⚠ 安全约定：本文件**不写任何凭据**。Broker / SCRAM 用户名口令 / mTLS 证书路径
+#   一律来自 /etc/hunter/kafka/kafka.properties（HunterCore 接入包，目录 0750 /
+#   properties 0640 / 私钥 0600，不入版本库；组可读是 Agent 能读到它的前提）。
+#   下方 kafka_brokers / sasl_* / ssl_ca_location 仅供未部署接入包的开发机兜底，
+#   生产车端必须留空或使用默认值（接入包存在时会被 properties 覆盖）。
 data_agent:
   ros__parameters:
-    vehicle_id: "hunter_001"                    # 车辆唯一标识
-    kafka_brokers: "120.202.73.105:9093"        # 车端 Kafka Broker（SASL_SSL）
-    db_path: "/data/data_agent/telemetry.db"    # SQLite 缓存路径
+    # ── 车辆标识与接入源 ───────────────────────────────────────────
+    vehicle_id: ""                                    # 留空 = 自动取 kafka.properties 的 SASL 用户名（须等于证书 CN）
+    kafka_properties: "/etc/hunter/kafka/kafka.properties"
+    kafka_bundle_dir: ""                              # 留空 = properties 同目录
+    kafka_brokers: ""                                 # 仅开发机兜底（生产留空，以 properties 为准）
+    db_path: "/data/data_agent/telemetry.db"          # SQLite 断网缓存路径（telemetry/health/event 三类共表）
 
-    # ─── Kafka 安全认证（SASL_SSL + SCRAM-SHA-512） ───
-    security_protocol: "SASL_SSL"               # 安全协议
-    sasl_mechanism: "SCRAM-SHA-512"             # SASL 机制
-    sasl_username: "hunter_vehicle"             # SASL 用户名（部署时按实际凭据填写）
-    sasl_password: "CHANGE_ME"                  # SASL 密码（部署时按实际凭据填写）
-    ssl_ca_location: "/etc/ssl/certs/ca-certificates.crt"  # CA 证书路径
+    # ── Kafka 安全认证（仅开发机兜底；生产凭据只在 properties）──────
+    security_protocol: "SASL_SSL"                     # 安全协议
+    sasl_mechanism: "SCRAM-SHA-512"                   # SASL 机制
+    sasl_username: ""                                 # SASL 用户名（开发机联调临时填写）
+    sasl_password: ""                                 # SASL 口令（禁止提交到版本库）
+    ssl_ca_location: "/etc/hunter/kafka/ca-cert.pem"  # CA 证书路径（开发机可用系统 CA）
 
-    publish_rate: 10.0        # 文档 14.2.2：遥测打包 10Hz
+    # ── 上报节拍与事件阈值（文档 14.2/14.3）────────────────────────
+    publish_rate: 10.0        # 文档 14.2.2：遥测打包 10Hz（health Topic 固定 1Hz）
 
-    # 事件检测阈值（文档 14.3.1）
     max_velocity: 2.0         # 文档 19.3：限速 2.0 m/s（超速 = 限速×1.1）
     min_battery_soc: 20.0     # 电池低电量 SOC < 20%
     hard_accel: 3.0           # 急加速/急减速 > 3.0 m/s² 持续 0.5s
     hard_turn: 0.8            # 急转弯 横摆角速度 > 0.8 rad/s
 
-    # 网络异常（文档 14.6）
+    # ── 网络异常与断点续传（文档 14.6）─────────────────────────────
     comm_loss_duration: 10.0  # Kafka 断开 > 10s 触发事件
     cache_max_hours: 24.0     # 本地缓存最多 24 小时
+    replay_batch_size: 50     # 链路恢复后每轮回放条数（限流，防瞬时冲击）
+    replay_inflight_limit: 200  # 已投递未证实的回放在途上限
 
-    # 链路兜底（produce() 成功 ≠ 送达，靠投递回调 + 队列积压上限判定）
+    # ── 链路兜底（produce() 成功 ≠ 送达，靠投递回执 + 队列积压上限判定）─
     kafka_queue_limit: 50        # 本地队列积压超过 50 条（约 5s）→ 转 SQLite 缓存
     kafka_flush_timeout_ms: 5000 # 退出时等待投递的超时（毫秒）

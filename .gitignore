@@ -49,3 +49,14 @@ livox_ros_driver2/
 
 #采集构建的地图
 maps/
+
+# HunterCore 接入凭据（部署只落 /etc/hunter/kafka/，严禁进版本库/镜像层，接入 README 硬要求）
+# 车端接入包整目录（ca-cert.pem / client-*.pem / kafka-client.p12 / kafka.properties）
+*.pem
+*.p12
+*.jks
+*.truststore
+kafka.properties
+*hunter-*-bundle/
+agent_env.sh
+*_params.yaml.bak.*
