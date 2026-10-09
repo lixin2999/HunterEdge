@@ -86,8 +86,14 @@ def load_properties(path: str = DEFAULT_PROPERTIES_PATH) -> Dict[str, str]:
             "（请先把 HunterCore 接入包部署到 /etc/hunter/kafka/，见 Deployment_Guide §5.6）")
 
     props: Dict[str, str] = {}
-    with open(path, "r", encoding="utf-8") as fh:
-        raw_lines = fh.read().splitlines()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw_lines = fh.read().splitlines()
+    except OSError as exc:
+        raise KafkaConfigError(
+            f"读不到 Kafka 接入参数文件：{path}（{exc}）；现为哪个用户可读用 "
+            f"`stat -c '%U:%G %a' {path}` 查；该文件需对运行 Agent 的用户开放组读位"
+            "（部署脚本按 root:运行组 0640 落盘）") from exc
 
     # 1) 续行合并：以奇数个反斜杠结尾的行与下一行拼接（jaas 配置常跨行）
     logical: list[str] = []
@@ -319,8 +325,23 @@ def _apply_ssl(conf: Dict[str, str], props: Dict[str, str],
 
 
 def _existing(directory: str, name: str) -> Optional[str]:
+    """从 bundle 目录取文件路径；**存在但读不到时直接报错**，不静默降级。
+
+    静默返回 None 会让 Agent 拿着不完整的 TLS 配置去连 broker，最后报成
+    “认证失败”这类假象（实机踩中过：私钥装成 root:组 0600，0600 只授予属主，
+    以 agilex 跑的 data_agent 打不开，librdkafka 只给
+    `ssl.key.location failed: Permission denied`）。
+    """
     path = os.path.join(directory, name)
-    return path if os.path.isfile(path) else None
+    if not os.path.isfile(path):
+        return None
+    if not os.access(path, os.R_OK):
+        raise KafkaConfigError(
+            f"凭据存在但当前用户读不到：{path}（查：stat -c '%U:%G %a' {path}）。"
+            "0600 只授予属主，所以私钥/PKCS#12 的属主必须就是运行 Agent 的用户。修正："
+            f"sudo chown <运行用户>:<其主组> {path} && sudo chmod 600 {path}"
+            "（或重跑 hunter_core_setup.sh，其步骤②.1 会收敛属主并实测可读性）")
+    return path
 
 
 # ---------------------------------------------------------------------------

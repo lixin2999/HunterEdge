@@ -47,6 +47,20 @@ _FAIL = "\033[31m✗\033[0m"
 _WARN = "\033[33m!\033[0m"
 
 
+def _ensure_text_output() -> None:
+    """给 stdout/stderr 上“编不出就替换”（保留原编码，不强推 UTF-8）。
+
+    输出里带 ✓/✗ 和中文：碰上编不出这些字符的环境（`PYTHONCOERCECLOCALE=0` 后的 C locale、
+    Windows GBK 控制台）会直接 UnicodeEncodeError 崩掉，退成“退出码 1”——那不是链路结论，
+    现场只能看 Traceback。宁可把符号变成 `?`，也不能让自检整体跑不出结果。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):  # 老版本/被重定向的流
+            pass
+
+
 class Check:
     """简单的检查项累加器（统一输出格式，便于现场截图回传给运营）。"""
 
@@ -71,6 +85,34 @@ def _file_mode_ok(path: str, expect: int = 0o600) -> bool:
     return mode == expect
 
 
+def _read_error(path: str) -> str:
+    """真打开一次取首字节，能读到就返回空串。
+
+    只看 `st_mode`/`os.access` 会漏掉“属主不是运行用户”这类实际读不到的情况：
+    私钥按契约给 0600，而 0600 的**组位与其他位都是 0**——若属主是 root，同组的
+    运行用户照样打不开，到 TLS 阶段才报 `ssl.key.location failed: Permission denied`。
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.read(1)
+    except OSError as exc:
+        return str(exc)
+    return ""
+
+
+def _ownership(path: str) -> str:
+    """返回 `owner:group mode`（只看元信息，不读内容），供处置命令直接可粘。"""
+    try:
+        import grp  # 仅 Linux；Windows 开发机上取不到就降级为 "?"
+        import pwd
+        st = os.stat(path)
+        return "%s:%s %s" % (pwd.getpwuid(st.st_uid).pw_name,
+                             grp.getgrgid(st.st_gid).gr_name,
+                             oct(stat.S_IMODE(st.st_mode)))
+    except Exception:  # noqa: BLE001（缺模块/未知 id 都不能让自检挂）
+        return "?"
+
+
 def check_bundle_dir(chk: Check, bundle_dir: str, properties_path: str,
                      require: bool) -> None:
     """检查接入包文件齐备性与权限（私钥必须 0600）。"""
@@ -89,15 +131,27 @@ def check_bundle_dir(chk: Check, bundle_dir: str, properties_path: str,
     for name, must_exist in ((CA_FILE, True), (CLIENT_CERT_FILE, True),
                              (CLIENT_KEY_FILE, True), (CLIENT_P12_FILE, False)):
         path = os.path.join(bundle_dir, name)
-        if os.path.isfile(path):
-            if name.endswith("-key.pem") and not _file_mode_ok(path):
-                chk.fail(EXIT_CONFIG, "私钥权限",
-                         f"{path} 权限为 {oct(stat.S_IMODE(os.stat(path).st_mode))}，"
-                         "必须 0600（README：私钥属敏感凭据）")
-            else:
-                chk.ok(name, path)
-        elif must_exist:
-            chk.fail(EXIT_CONFIG, name, f"缺失：{path}")
+        if not os.path.isfile(path):
+            if must_exist:
+                chk.fail(EXIT_CONFIG, name, f"缺失：{path}")
+            continue
+        if name.endswith("-key.pem") and not _file_mode_ok(path):
+            chk.fail(EXIT_CONFIG, "私钥权限",
+                     f"{path} 权限为 {oct(stat.S_IMODE(os.stat(path).st_mode))}，"
+                     "必须 0600（README：私钥属敏感凭据）")
+            continue
+        why = _read_error(path)
+        if why:
+            # 不是“权限不够大”，而是“属主不对”：凭据必须能被**运行 Agent 的用户**真的打开
+            fix_mode = "0600" if name.endswith("-key.pem") else "0640"
+            chk.fail(EXIT_CONFIG, f"{name} 可读性",
+                     f"当前用户打不开 {path}：{why}（现为 {_ownership(path)}）。"
+                     "0600 只授予属主，**凭据的属主必须就是运行 Agent 的用户**，否则各 Agent "
+                     "与自检都会到 TLS 阶段才报 `ssl.key.location failed … Permission denied`。"
+                     f"处置：sudo chown <运行用户>:<其主组> {path} && sudo chmod {fix_mode} {path}"
+                     "（本版部署脚本已把私钥 chown 到运行用户；旧版装成 root:组 0600 正好踩中）")
+            continue
+        chk.ok(name, path)
 
 
 def check_properties(chk: Check, properties_path: str,
@@ -186,10 +240,10 @@ def check_sasl_mechanism(chk: Check, conf: dict) -> None:
 
     【包名坑】Ubuntu/Debian **没有** cyrus-sasl-scram 这个包（那是 RHEL/openSUSE 的名字，
     照它装会直接 Unable to locate package）。
-    【属主包随架构变】jammy amd64 官方清单把 libscram.so 归到
-    libsasl2-modules-gssapi-mit（Launchpad #1988730），而 Jetson aarch64 实机上文件在
-    /usr/lib/aarch64-linux-gnu/sasl2/ 里、该包的 dpkg -L 却列不出来。因此判据一律用
-    **插件文件**（跨发行版/架构都不失真），属主包现场用 `dpkg -S <文件>` 查。
+    【属主包已现场钉死】Jetson aarch64 jammy 实测：
+    `dpkg -S /usr/lib/aarch64-linux-gnu/sasl2/libscram.so`
+    → **`libsasl2-modules:arm64`**（不是之前从 Launchpad amd64 清单推的 gssapi-mit）。
+    但判据仍一律用**插件文件存不存在**（跨架构/版本都不失真），包名只当处置提示。
     """
     mech = str(conf.get("sasl.mechanism") or "").upper()
     if mech and not mech.startswith("SCRAM"):
@@ -205,14 +259,14 @@ def check_sasl_mechanism(chk: Check, conf: dict) -> None:
         chk.ok("SASL 机制插件", f"{mech} → {hits[0]}")
     else:
         chk.fail(EXIT_AUTH, "SASL 机制插件",
-                 f"未找到 libscram.so，{mech} 必报 No worthy mechs found；"
-                 "Ubuntu/Debian 先两个候选包一起装（属主包随架构/版本变，不要只赌一个）："
-                 "sudo apt install -y libsasl2-modules libsasl2-modules-gssapi-mit；"
-                 "无 cyrus-sasl-scram 包（那是 RHEL 系的名字）；装完用 "
-                 "dpkg -S /usr/lib/*/sasl2/libscram.so 查真正的属主包，"
-                 "确认文件已存在即可重启 Agent（无需重编）；"
-                 "仍无此文件才需自编 cyrus-sasl2（--enable-scram）；"
-                 "千万别装名为 scram 的包（那是概率风险分析工具，与 SASL 无关）")
+                 f"未找到 libscram.so（查过 /usr/lib/sasl2、/usr/lib64/sasl2、/usr/lib/*/sasl2），"
+                 f"{mech} 必报 No worthy mechs found；"
+                 "aarch64 jammy 实测该文件属主包是 **libsasl2-modules**（不是 gssapi-mit），"
+                 "先装它：sudo apt install -y libsasl2-modules；"
+                 "无 cyrus-sasl-scram 包（那是 RHEL 系的名字），也别装名为 scram 的包"
+                 "（那是概率风险分析工具，与 SASL 无关）；"
+                 "已装却无文件时用 dpkg -S /usr/lib/*/sasl2/libscram.so 现查真正属主包，"
+                 "仍不存在才需自编 cyrus-sasl2（--enable-scram）；装完重启 Agent 即可（无需重编）")
 
 
 def check_tcp(chk: Check, bootstrap: str, timeout: float) -> None:
@@ -246,17 +300,27 @@ def _classify_broker_error(text: str, code: Optional[int], default: int) -> tupl
     """把握手/投递期错误归到自检退出码，返回 `(退出码, 标题, 处置提示)`。
 
     先按文本关键字再按错误码：SASL 失败经常被包成 `_TRANSPORT`，只看码会把“口令错”
-    误报成“网络不通”（现场最难排的一类假象）。Ubuntu 上无名为 `cyrus-sasl-scram` 的包，
-    而 `libscram.so` 的属主包**随架构与版本变**，所以只用插件文件与 `dpkg -S` 定性。
+    误报成“网络不通”（现场最难排的一类假象）。SCRAM 插件在 Ubuntu 上没有名为
+    `cyrus-sasl-scram` 的包（aarch64 jammy 实测属主为 `libsasl2-modules`），
+    所以判定只看插件文件存在，属主包用 `dpkg -S` 现查。
     """
+    if ("permission denied" in text or "fopen" in text
+            or "ssl.key.location" in text or "ssl.certificate.location" in text):
+        return (EXIT_TLS, "凭据可读性",
+                "进程打不开接入包里的证书/私钥（OpenSSL 直接报 fopen 失败/Permission denied，"
+                "表象像 TLS 故障）。0600 只授予**属主**，所以私钥的属主必须就是运行 Agent 的用户。"
+                "处置：sudo chown <运行用户>:<其主组> /etc/hunter/kafka/client-key.pem "
+                "&& sudo chmod 0600 /etc/hunter/kafka/client-key.pem（本版部署脚本已按此落盘）；"
+                "也可直接看自检第 1 层各凭据的可读性结论")
     if ("no worthy mechs" in text or "unsupported sasl mechanism" in text
             or "sasl init" in text):
         return (EXIT_AUTH, "SASL 机制",
                 "缺 SCRAM 插件：`ls /usr/lib/*/sasl2/libscram.so` 确认文件在位；"
-                "缺则 `sudo apt install -y libsasl2-modules libsasl2-modules-gssapi-mit`，"
+                "缺则 `sudo apt install -y libsasl2-modules`（aarch64 jammy 实测属主包），"
                 "装完重启 Agent 即可（无需重编）")
     if code in _err_codes(("TOPIC_AUTHORIZATION_FAILED", "CLUSTER_AUTHORIZATION_FAILED",
-                           "GROUP_AUTHORIZATION_FAILED")) or "authorization" in text:
+                           "GROUP_AUTHORIZATION_FAILED")) or "authorization" in text \
+            or "authorized" in text or "access denied" in text:
         return (EXIT_TOPIC, "Broker 握手",
                 "账号无 Describe/List 权限：让平台开通该车账号的 ACL（这不是口令错，改口令无效）")
     if (code in _err_codes(("_AUTHENTICATION", "SASL_AUTHENTICATION_FAILED", "SECURITY_DISABLED"))
@@ -293,9 +357,12 @@ def check_broker(chk: Check, conf: dict, vehicle_id: str, timeout: float) -> Opt
 
     admin_conf = strip_meta(conf)
     admin_conf["socket.timeout.ms"] = str(int(timeout * 1000))
-    admin = AdminClient(admin_conf)
     expected = {f"hunter.{vehicle_id}.{t}" for t in TOPIC_TYPES}
     try:
+        # AdminClient 的**构造**也会抛 KafkaException(_INVALID_ARG)（如 ssl.key.location 打不开
+        # 私钥），必须与 list_topics 走同一套归类；旧写法只包了 list_topics，异常直接穿透成
+        # Traceback + 退出码 1（那不是链路结论，现场只能自己读 OpenSSL 报错）。
+        admin = AdminClient(admin_conf)
         names = admin.list_topics(timeout=timeout).topics
     except KafkaException as exc:
         err = exc.args[0] if exc.args else None
@@ -368,6 +435,7 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--offline", action="store_true",
                         help="仅做本地配置/证书检查，不连 broker")
     args = parser.parse_args(argv)
+    _ensure_text_output()
 
     chk = Check()
     print("=" * 72)

@@ -72,10 +72,18 @@ echo ""
 echo "--- HunterCore 接入 ---"
 if [ -d /etc/hunter/kafka ]; then
   for f in kafka.properties ca-cert.pem client-cert.pem client-key.pem; do
-    if [ -f "/etc/hunter/kafka/$f" ]; then
-      printf "  [OK]   /etc/hunter/kafka/%s (%s)\n" "$f" "$(stat -c '%a' "/etc/hunter/kafka/$f")"
+    p="/etc/hunter/kafka/$f"
+    want_mode=640
+    case "$f" in client-key.pem) want_mode=600 ;; esac
+    if [ ! -f "$p" ]; then
+      printf "  [FAIL] 缺少 %s（重跑 hunter_core_setup.sh --bundle ...）\n" "$p"
+    elif [ ! -r "$p" ]; then
+      # 0600 只授予属主：私钥属主若是 root，跑 Agent 的当前用户就打不开，
+      # 到 TLS 阶段才报 ssl.key.location failed: Permission denied（现场踩过）
+      printf "  [FAIL] %s 当前用户读不到（%s）→ sudo chown %s %s && sudo chmod %s %s\n" \
+        "$p" "$(stat -c '%U:%G %a' "$p")" "$(id -un)" "$p" "$want_mode" "$p"
     else
-      printf "  [FAIL] 缺少 /etc/hunter/kafka/%s（重跑 hunter_core_setup.sh --bundle ...）\n" "$f"
+      printf "  [OK]   %s (%s)\n" "$p" "$(stat -c '%U:%G %a' "$p")"
     fi
   done
 else

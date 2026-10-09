@@ -194,13 +194,14 @@ git clone -b humble https://github.com/agilexrobotics/hunter_ros2.git
 sudo apt install -y ros-humble-navigation2 ros-humble-nav2-bringup
 sudo apt install -y ros-humble-robot-localization
 sudo apt install -y ros-humble-realsense2-camera
-sudo apt install -y librdkafka-dev librdkafka++1 libsqlite3-dev libsasl2-dev libssl-dev libsasl2-modules libsasl2-modules-gssapi-mit   # data_agent/command_agent（Kafka SASL_SSL + mTLS + SQLite 缓存）
+sudo apt install -y librdkafka-dev librdkafka++1 libsqlite3-dev libsasl2-dev libssl-dev libsasl2-modules   # data_agent/command_agent（Kafka SASL_SSL + mTLS + SQLite 缓存；libsasl2-modules 含 SCRAM 插件，实测属主包）
 pip3 install confluent-kafka            # Python Agent（ota_agent / remote_agent / command_agent / hunter_kafka）
 ```
 
 > ⚠️ **【SCRAM 机制必装（V0.1.05）】** 接入口要求的 `SCRAM-SHA-512` 由 Cyrus SASL 插件 `libscram.so` 提供，**缺它必报 `No worthy mechs found`**，表象极像口令错或网络不通，是现场最易误判的一条（详见 §7.7、Deployment_Guide §5.6.3）。
 > **包名坑（jammy 实测）**：Ubuntu/Debian **没有** `cyrus-sasl-scram` 这个包（那是 RHEL/openSUSE 的名字，照它装会直接 `Unable to locate package`）。
-> **属主包随架构变（HUNTER-001 实机纠正）**：jammy amd64 官方清单把 `libscram.so` 归到 **`libsasl2-modules-gssapi-mit`**（Launchpad #1988730），但这台 Jetson（**aarch64**）上 `ls /usr/lib/*/sasl2/libscram.so` 能看到 `/usr/lib/aarch64-linux-gnu/sasl2/libscram.so`，而 `dpkg -L libsasl2-modules-gssapi-mit` 却列不出它 —— 所以**不得按包名断言，一律以插件文件为准**：判可用性用 `ls /usr/lib/*/sasl2/libscram.so`（**单模式查**：写成 `ls A B` 时任一操作数不存在就返回非 0，会把“已装”误判为“缺失”），查属主用 `dpkg -S /usr/lib/*/sasl2/libscram.so`。缺件时两个候选包一起装（`libsasl2-modules libsasl2-modules-gssapi-mit`）。**同名陷阱**：Ubuntu 里有个叫 `scram` 的包，它是概率风险分析工具，与 SASL 无关，别拿它当替代方案。上述依赖与证书落盘可由 `scripts/hunter_core_setup.sh` 一次性完成（它按插件文件在不在来决定装什么，并把实机的属主包直接打到日志里）。
+> **属主包（HUNTER-001 实机定论）**：`dpkg -S /usr/lib/aarch64-linux-gnu/sasl2/libscram.so` → **`libsasl2-modules:arm64`**（不是先前根据官方 amd64 清单推的 `libsasl2-modules-gssapi-mit`）；但判据一律以**插件文件在不在**为准，包名只当处置提示。
+> **查法与陷阱**：判可用性一律用 `ls /usr/lib/*/sasl2/libscram.so`（**单模式查**：写成 `ls A B` 时任一操作数不存在就返回非 0，会把“已装”误判为“缺失”），属主包用 `dpkg -S <那个文件>` 现查（`dpkg -L` 与 `dpkg -S` 可能不一致，以 `dpkg -S` 为准）。**同名陷阱**：Ubuntu 里有个叫 `scram` 的包，它是概率风险分析工具，与 SASL 无关，别拿它当替代方案。上述依赖与证书落盘可由 `scripts/hunter_core_setup.sh` 一次性完成（它按插件文件在不在来决定装什么，并把实机的属主包直接打到日志里）。
 
 以下包需源码编译（vendor 源码）：
 
@@ -398,14 +399,18 @@ hunter-kafka-check --offline      # 仅本地配置/证书/机制层
 
 > ⚠️ **【报 `cannot import name 'AdminClient' from 'confluent_kafka'`】** **不是没装库**：`AdminClient` 属于 `confluent_kafka.admin` 子模块，顶层不重导出（早期代码写成 `from confluent_kafka import AdminClient`，已在本版修正）。因此车上仍见到这条 = 跑的是**旧版代码**，先把仓同步到车上（`--symlink-install` 下 `src/` 里的 `.py` 同步即生效，无需重编）；同步后还报，才是库本身过旧：`sudo pip3 install -U confluent-kafka`（部署脚本 ① 的依赖判据已改为直取 `admin.AdminClient`，不只看 `import confluent_kafka` 成不成功）。
 
+> ⚠️ **【报 `ssl.key.location failed: … Permission denied`（常伴 Traceback + 退 1）】** **不是 TLS 故障，也不是权限“不够大”，而是属主不对**：私钥按契约给 0600，而 0600 的**组位与其他位都是 0**，所以装成 `root:<组> 0600` 时，以 `agilex` 跑的进程（自检、`data_agent`）**根本打不开自己的私钥**——前 5 层全绿、到建客户端才崩就是这一类。处置（一条命令）：
+> `sudo chown agilex:agilex /etc/hunter/kafka/client-key.pem /etc/hunter/kafka/kafka-client.p12 && sudo chmod 600 /etc/hunter/kafka/client-key.pem`，
+> 或直接重跑 `hunter_core_setup.sh`（步骤②.1 会收敛属主并以运行用户身份**实测能真打开**）。本版自检已在**第 1 层**逐件真打开凭据并直接给结论，不会等到第 6 层才报 OpenSSL 原文。
+
 **退出码与处置**（逐层递进，前一层失败即短路）：
 
 | 退出码 | 含义 | 首要处置 |
 |---|---|---|
 | `0` | 全部通过 | 看平台侧该车 `last_online_time` 是否刷新（**联调唯一判据**） |
 | `10` | 参数/文件 | 四件套是否齐全、SCRAM 口令是否仍为占位符、`vehicle_id` 能否推出；**接入包未拷到车上/路径层级传错**也归本类 |
-| `20` | TLS/证书 | 先 `timedatectl` 校时；再查证书有效期、CN 是否等于 `vehicle_id`、私钥是否 0600 |
-| `30` | 认证 | SASL 用户名/口令、账号是否已在平台开通、是否缺 SCRAM 插件（`ls /usr/lib/*/sasl2/libscram.so`；无输出则 `sudo apt install -y libsasl2-modules libsasl2-modules-gssapi-mit`，装完用 `dpkg -S` 查属主包） |
+| `20` | TLS/证书 | 先 `timedatectl` 校时；再查证书有效期、CN 是否等于 `vehicle_id`、私钥是否 **0600 且属主为运行用户**（报 `ssl.key.location failed: … Permission denied` 就是这一条） |
+| `30` | 认证 | SASL 用户名/口令、账号是否已在平台开通、是否缺 SCRAM 插件（`ls /usr/lib/*/sasl2/libscram.so`；无输出则 `sudo apt install -y libsasl2-modules`——**实机 `dpkg -S` 确认的属主包**） |
 | `40` | 网络 | `bootstrap.servers` 的 IP:端口需与 broker `advertised.listeners` 一致 |
 | `50` | Topic/ACL | 平台未按该车建满 8 个 Topic，或账号无 describe/write 权限 |
 | `60` | 投递 | broker 可达但 leader 异常；看 `data_agent` 是否已转 SQLite 缓存 |
@@ -809,7 +814,7 @@ src/
 
 > ⚠ **不新增 ROS 话题/消息字段**（.ai-rules）：指令执行一律落在既有接口上；`command_result` 的车端留痕以 INFO 级日志 `COMMAND_RESULT <json>` 输出（`journalctl` 可核对“平台下发过什么、车端回了什么”）。
 
-**凭据红线**（`.gitignore` 已排除，不得口头约定）：`*.pem` / `*.p12` / `*.jks` / `kafka.properties` / `*hunter-*-bundle/` **一律不得入仓、入镜像层、入日志**；私钥 `client-key.pem` 必须 `0600`（`hunter_core_setup.sh` 权限不符直接失败）；SCRAM 口令只存 `/etc/hunter/kafka/kafka.properties`，**不得写进任何 `*_params.yaml`**；代码侧输出配置快照时必须走 `redact()` 打星（`data_agent` 的 `kafka_access`、`hunter_kafka.config.redact`）。
+**凭据红线**（`.gitignore` 已排除，不得口头约定）：`*.pem` / `*.p12` / `*.jks` / `kafka.properties` / `*hunter-*-bundle/` **一律不得入仓、入镜像层、入日志**；私钥 `client-key.pem` 必须 `0600` **且属主为运行 Agent 的用户**（0600 只授予属主；`hunter_core_setup.sh` 步骤②.1 会收敛属主并实测运行用户真能打开，否则直接失败）；SCRAM 口令只存 `/etc/hunter/kafka/kafka.properties`，**不得写进任何 `*_params.yaml`**；代码侧输出配置快照时必须走 `redact()` 打星（`data_agent` 的 `kafka_access`、`hunter_kafka.config.redact`）。
 
 > ⚠ **模式交还硬约束**：`remote_agent` 的 Kafka 消费超时后必须**停止发布** `/remote/command`（而非发零速顶住），`decision_making` 按该话题 0.5s 新鲜度判定 REMOTE，不发即自动回 AUTO；否则会出现“遥控断开后车辆永不交还自主”缺陷（V0.1.05 已修）。仲裁优先级：ESTOP > REMOTE > AUTO。
 

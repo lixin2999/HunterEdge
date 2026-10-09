@@ -4,8 +4,10 @@
 # 做七件事（幂等，可重复执行；步骤号与运行日志一致）：
 #   ⓪ 前置校参：运行用户与其主组存在、接入包四件套齐、工作空间存在（失败文本带下一步动作）
 #   ① 依赖安装：librdkafka(C++/Python)、SCRAM-SHA-512 机制插件、sqlite3
-#   ② 接入包落盘：把 HUNTER-001 bundle 装到 /etc/hunter/kafka/，私钥 0600；已写入口令的 properties 不覆盖
+#   ② 接入包落盘：把 HUNTER-001 bundle 装到 /etc/hunter/kafka/；已写入口令的 properties 不覆盖
 #        （未传 --bundle 而现场四件套已齐时整段跳过，不碰已部署的凭据）
+#   ②.1 凭据属主收敛：私钥与 p12 置为 `运行用户:其主组 0600` 并实测运行用户真能打开
+#        （0600 只授予属主：装成 root:组 0600 时 Agent 打不开私钥，TLS 阶段报 Permission denied）
 #   ③ 运行期配置：Agent 参数文件落到 /etc/hunter/，生成 agent_env.sh 与 README_agent_env
 #   ④ 编译：以运行用户身份 colcon build 相关包
 #   ⑤ 自检：hunter-kafka-check（接入链路七层自检，退出码非 0 不自启服务）；并给运行用户装
@@ -151,10 +153,12 @@ log "工作空间: $WS_DIR   运行用户: $RUN_USER"
 # ---- ① 依赖 ----
 # 【包名坑（实测）】SCRAM-SHA-512 机制在 Ubuntu 上**不叫** cyrus-sasl-scram（那是
 # RHEL/openSUSE 的名字，在这装直接 Unable to locate package）。
-# 【本次修正】libscram.so 到底在哪个包里**随架构与版本变**：官方 jammy amd64 清单把它
-# 归到 libsasl2-modules-gssapi-mit（Launchpad #1988730），而 HUNTER-001 实机（Jetson
-# aarch64）上文件明明在 /usr/lib/aarch64-linux-gnu/sasl2/ 里，该包的 dpkg -L 却查不到。
-# 所以判据一律用**插件文件**，包只在“缺了才试装”时用，并把属主包直接打进日志（不靠猜）。
+# 【属主包已现场钉死】HUNTER-001 实机（Jetson aarch64 jammy）：
+#   dpkg -S /usr/lib/aarch64-linux-gnu/sasl2/libscram.so
+#   → libsasl2-modules:arm64  （不是先前从官方 amd64 清单推的 libsasl2-modules-gssapi-mit，
+#     Launchpad #1988730 那个归类在 arm64 上不成立）。
+# 但判据仍一律用**插件文件**（跨架构/版本都不失真），包名只当处置提示；
+# 缺件时两个候选一起试装无害（gssapi-mit 额外拉进 Kerberos 依赖，不影响机制）。
 # 【存在性判定要逐个候选测】`ls 路径A 路径B` 只要任一路径不存在就返回非 0，
 # 而 /usr/lib/sasl2 在 Ubuntu 上通常不存在 → 插件在位也会被误判为缺（假阴性，现场已误报过）。
 # 另：Ubuntu 里名为 `scram` 的包是 Probabilistic Risk Analysis Tool，与 SASL 无关，千万别装。
@@ -172,10 +176,10 @@ report_scram_plugin() {   # 不论是否 --skip-deps 都报一句，让现场自
     log "  SCRAM 插件在位：$so（属主包：${owner:-未被任何 dpkg 包记录，多为镜像预置或手工摆放}）"
   else
     warn "  缺 SCRAM 插件（libscram.so）：SASL_SSL + SCRAM-SHA-512 必报 No worthy mechs found。处置：
-       sudo apt install -y libsasl2-modules libsasl2-modules-gssapi-mit   # 两个候选都装，不赌名字
+       sudo apt install -y libsasl2-modules                              # aarch64 jammy 实测属主包
        ls /usr/lib/*/sasl2/libscram.so                                     # 有输出即机制就绪（无需重编，重启 Agent 即可）
-       dpkg -S /usr/lib/*/sasl2/libscram.so                                # 查它真属于哪个包
-     ↳ 仍无输出时才考虑自编 cyrus-sasl2（--enable-scram）；dpkg -L 与 dpkg -S 可能不一致，以 dpkg -S 查到的属主为准"
+       dpkg -S /usr/lib/*/sasl2/libscram.so                                # 拿这台机子的答复为准
+     ↳ 上面两条都说明缺而未补上时再试 libsasl2-modules-gssapi-mit（另一候选，个别版本/架构把它归这里）；dpkg -L 与 dpkg -S 可能不一致，以 dpkg -S 查到的属主为准"
   fi
 }
 if [ "$SKIP_DEPS" -eq 0 ]; then
@@ -254,10 +258,9 @@ if [ -f "$BUNDLE_DIR/kafka-client.p12" ]; then
 fi
 chown root:"$RUN_GROUP" "$KAFKA_DIR"/*
 chmod 0640 "$KAFKA_DIR"/kafka.properties "$KAFKA_DIR"/ca-cert.pem "$KAFKA_DIR"/client-cert.pem
-if [ -f "$KAFKA_DIR/kafka-client.p12" ]; then
-  chmod 0640 "$KAFKA_DIR/kafka-client.p12"
-fi
-chmod 0600 "$KAFKA_DIR/client-key.pem"
+# 私钥与 p12 含私钥材料，它们的属主/权限由下面 ②.1 统一收敛（0600 只授予属主，
+# 而属主必须是运行 Agent 的用户）：放在 ②.1 而不在这里，是为了让省 --bundle 的
+# 重跑也能修正现场已落坏的属主（旧版把私钥装成 root:组 0600，Agent 打不开）
 
 # 私钥权限是接入 README 的硬要求：0600 之外的任何值都说明曾被别的过程改过
 KEY_MODE=$(stat -c '%a' "$KAFKA_DIR/client-key.pem")
@@ -272,6 +275,37 @@ if grep -q '<SCRAM_PASSWORD>' "$PROPS"; then
   warn "kafka.properties 的 sasl.jaas.config 仍是占位口令 <SCRAM_PASSWORD>"
   warn "请由运维人员手工写入真实 SCRAM 口令后重跑本脚本（脚本不会读取/记录该口令）"
 fi
+fi
+
+# ---- ②.1 凭据属主/权限收敛（**不依赖是否重新落盘**，省 --bundle 重跑也会修）----
+if [ -f "$KAFKA_DIR/client-key.pem" ]; then
+  chown "$RUN_USER:$RUN_GROUP" "$KAFKA_DIR/client-key.pem"
+  chmod 0600 "$KAFKA_DIR/client-key.pem"
+fi
+if [ -f "$KAFKA_DIR/kafka-client.p12" ]; then
+  chown "$RUN_USER:$RUN_GROUP" "$KAFKA_DIR/kafka-client.p12"
+  chmod 0600 "$KAFKA_DIR/kafka-client.p12"
+fi
+
+# 以运行用户身份真的 open 一次：只看 mode 会漏“属主是 root 的 0600”这类读不到的情况；
+# 只取 1 字节且输出丢弃，凭据内容不落终端/日志
+if command -v sudo >/dev/null 2>&1; then
+  for f in kafka.properties ca-cert.pem client-cert.pem client-key.pem kafka-client.p12; do
+    [ -f "$KAFKA_DIR/$f" ] || continue
+    if ! sudo -u "$RUN_USER" head -c 1 "$KAFKA_DIR/$f" >/dev/null 2>&1; then
+      want_mode=640
+      case "$f" in
+        client-key.pem|kafka-client.p12) want_mode=600 ;;
+      esac
+      die "$RUN_USER 读不到 $KAFKA_DIR/$f（现为 $(stat -c '%U:%G %a' "$KAFKA_DIR/$f")）
+ ↳ 文件权限只授予属主/属组，而目录又是 root 拥有时就会卡在这；修正：
+     sudo chown $RUN_USER:$RUN_GROUP $KAFKA_DIR/$f && sudo chmod $want_mode $KAFKA_DIR/$f"
+    fi
+  done
+  log "凭据可读性：$RUN_USER 可打开 $KAFKA_DIR 下全部凭据"
+else
+  warn "无 sudo 命令，跳过“运行用户能否真打开凭据”实测；请手工确认 "\
+       "$RUN_USER 可读 $KAFKA_DIR/client-key.pem（否则 TLS 阶段报 Permission denied）"
 fi
 
 # ---- ③ 运行期配置 ----
