@@ -199,7 +199,8 @@ pip3 install confluent-kafka            # Python Agent（ota_agent / remote_agen
 ```
 
 > ⚠️ **【SCRAM 机制必装（V0.1.05）】** 接入口要求的 `SCRAM-SHA-512` 由 Cyrus SASL 插件 `libscram.so` 提供，**缺它必报 `No worthy mechs found`**，表象极像口令错或网络不通，是现场最易误判的一条（详见 §7.7、Deployment_Guide §5.6.3）。
-> **包名坑（jammy 实测）**：Ubuntu/Debian **没有** `cyrus-sasl-scram` 这个包（那是 RHEL/openSUSE 的名字，照它装会直接 `Unable to locate package`）；`libscram.so` 被“错放”在 **`libsasl2-modules-gssapi-mit`** 里（Launchpad #1988730，名字与 MIT/GSSAPI 无关），**光装 `libsasl2-modules` 依旧不够**。判定以文件为准：`ls /usr/lib/*/sasl2/libscram.so`（**单模式查**：写成 `ls A B` 时任一操作数不存在就返回非 0，会把“已装”误判为“缺失”）。**同名陷阱**：Ubuntu 里有个叫 `scram` 的包，它是概率风险分析工具，与 SASL 无关，别拿它当替代方案。上述依赖与证书落盘可由 `scripts/hunter_core_setup.sh` 一次性完成（它按插件文件在不在来决定装什么，不赌包名）。
+> **包名坑（jammy 实测）**：Ubuntu/Debian **没有** `cyrus-sasl-scram` 这个包（那是 RHEL/openSUSE 的名字，照它装会直接 `Unable to locate package`）。
+> **属主包随架构变（HUNTER-001 实机纠正）**：jammy amd64 官方清单把 `libscram.so` 归到 **`libsasl2-modules-gssapi-mit`**（Launchpad #1988730），但这台 Jetson（**aarch64**）上 `ls /usr/lib/*/sasl2/libscram.so` 能看到 `/usr/lib/aarch64-linux-gnu/sasl2/libscram.so`，而 `dpkg -L libsasl2-modules-gssapi-mit` 却列不出它 —— 所以**不得按包名断言，一律以插件文件为准**：判可用性用 `ls /usr/lib/*/sasl2/libscram.so`（**单模式查**：写成 `ls A B` 时任一操作数不存在就返回非 0，会把“已装”误判为“缺失”），查属主用 `dpkg -S /usr/lib/*/sasl2/libscram.so`。缺件时两个候选包一起装（`libsasl2-modules libsasl2-modules-gssapi-mit`）。**同名陷阱**：Ubuntu 里有个叫 `scram` 的包，它是概率风险分析工具，与 SASL 无关，别拿它当替代方案。上述依赖与证书落盘可由 `scripts/hunter_core_setup.sh` 一次性完成（它按插件文件在不在来决定装什么，并把实机的属主包直接打到日志里）。
 
 以下包需源码编译（vendor 源码）：
 
@@ -359,7 +360,7 @@ ros2 launch hunter_bringup hunter_full.launch.py \
 
 ### 7.7 HunterCore 车端接入部署与自检（V0.1.05）
 
-车端与 HunterCore 平台的**全部**数据交互以平台按车下发的**接入包**为唯一可信源（`kafka.properties` + `ca-cert.pem` + `client-cert.pem` + `client-key.pem`），**仓内 YAML 不得出现任何凭据**。接入前提：§5.2 依赖已装齐（尤其 SCRAM 插件 `libscram.so`，Ubuntu 上由 `libsasl2-modules-gssapi-mit` 提供）、车-平台网络可达、系统**已校时**（时间漂移会让 TLS 必失败）。
+车端与 HunterCore 平台的**全部**数据交互以平台按车下发的**接入包**为唯一可信源（`kafka.properties` + `ca-cert.pem` + `client-cert.pem` + `client-key.pem`），**仓内 YAML 不得出现任何凭据**。接入前提：§5.2 依赖已装齐（尤其 SCRAM 插件 `libscram.so`——以 `ls /usr/lib/*/sasl2/libscram.so` 为准，属主包随架构不同）、车-平台网络可达、系统**已校时**（时间漂移会让 TLS 必失败）。
 
 ```bash
 # 前置：接入包不在仓库内，需先从开发机拷到车上（scp / U 盘），否则第一步就报“接入包目录不存在”
@@ -372,6 +373,10 @@ sudo bash src/hunter_bringup/scripts/hunter_core_setup.sh \
 # --user / --ws 一般不写：默认取 sudo 调用者与其家目录下的 HunterEdge（显式写则必须是车上真实存在的用户）
 # 云端不可达时先只查本地配置/证书：追加 --offline
 # 常用开关：--skip-deps / --skip-build / --no-systemd / --force-config / --force-key
+
+# 改完 SCRAM 口令或 /etc/hunter/*.yaml 后的重跑：**不需要再传 --bundle**
+# （/etc/hunter/kafka 四件套齐时脚本自动复用现场凭据并跳过步骤②，不碰已部署的凭据）
+sudo bash src/hunter_bringup/scripts/hunter_core_setup.sh --skip-deps
 ```
 
 > ⚠️ **【口令写入是人工动作】** 接入包模板里 `sasl.jaas.config` 的 `password="<SCRAM_PASSWORD>"` 需由运营/现场负责人**手工**换为平台分配的真实口令；脚本与日志均不经手该值。未替换时 `hunter-kafka-check` 会直接失败（退出码 10），**不要当网络问题排**。**写入口令后可放心重跑部署脚本**：包内仍是占位符时，步骤② 保留现场已写入真值的 `kafka.properties`（仅用 `grep -q` 判占位串，不输出内容），要强制用包内容覆盖才加 `--force-config`。
@@ -383,11 +388,15 @@ source ~/HunterEdge/install/setup.bash
 hunter-kafka-check                # 全量七层自检（含 SASL 机制插件层与端到端投递证实）
 hunter-kafka-check --offline      # 仅本地配置/证书/机制层
 ./src/hunter_bringup/scripts/hunter_status.sh   # 第 8 段输出「HunterCore 接入」状态
-
-# 若 `hunter-kafka-check` 不在 PATH（--symlink-install 下入口可能被装进用户 Python 环境）：
-find ~/HunterEdge/install ~/.local/bin -name hunter-kafka-check 2>/dev/null
-PYTHONPATH=src/hunter_common/hunter_kafka python3 -m hunter_kafka.diagnose --offline   # 等价的源码跑法
 ```
+
+> ⚠️ **【`hunter-kafka-check: command not found`（退 127）是正常的，直到你跑过一次部署脚本】** ament **只把 `<prefix>/bin` 加进 PATH**，而 ament_python 的 `console_script` 实际装在 `<prefix>/lib/<pkg>/` 下（本仓实测：`install/hunter_kafka/lib/hunter_kafka/hunter-kafka-check`），所以**光 `source install/setup.bash` 并不会让这个命令可用**。两种解法：
+> ① 跑一次 `hunter_core_setup.sh`（步骤⑤ 会往运行用户的 `~/.local/bin/` 装一个不依赖包元数据的命令包装，**新开一个 shell** 后 `hunter-kafka-check` 直接可用；未重登则用 `~/.local/bin/hunter-kafka-check`）；
+> ② 不依赖任何安装、现在就能跑的等价命令：`cd ~/HunterEdge && PYTHONPATH=src/hunter_common/hunter_kafka python3 -m hunter_kafka.diagnose`（可自行 `alias` 成短名）。
+
+> ⚠️ **【报 `PackageNotFoundError: No package metadata was found for hunter-kafka`】** 这是直接拿**绝对路径**跑 setuptools 生成的入口脚本所致（`load_entry_point` 包装需要包元数据在 `PYTHONPATH` 上；`sudo` 下的 root 环境尤其不带）。它是解释器报错（退出码 1），**不是链路结论**，也不在 10~60 这套退出码里：改用上面的 `python3 -m hunter_kafka.diagnose`（或部署脚本装的 `~/.local/bin/hunter-kafka-check` 包装），它们不依赖包元数据（部署脚本 ⑤ 已自动补 `PYTHONPATH`，并在遇到退出码 1 时自动改走源码跑法）。
+
+> ⚠️ **【报 `cannot import name 'AdminClient' from 'confluent_kafka'`】** **不是没装库**：`AdminClient` 属于 `confluent_kafka.admin` 子模块，顶层不重导出（早期代码写成 `from confluent_kafka import AdminClient`，已在本版修正）。因此车上仍见到这条 = 跑的是**旧版代码**，先把仓同步到车上（`--symlink-install` 下 `src/` 里的 `.py` 同步即生效，无需重编）；同步后还报，才是库本身过旧：`sudo pip3 install -U confluent-kafka`（部署脚本 ① 的依赖判据已改为直取 `admin.AdminClient`，不只看 `import confluent_kafka` 成不成功）。
 
 **退出码与处置**（逐层递进，前一层失败即短路）：
 
@@ -396,10 +405,12 @@ PYTHONPATH=src/hunter_common/hunter_kafka python3 -m hunter_kafka.diagnose --off
 | `0` | 全部通过 | 看平台侧该车 `last_online_time` 是否刷新（**联调唯一判据**） |
 | `10` | 参数/文件 | 四件套是否齐全、SCRAM 口令是否仍为占位符、`vehicle_id` 能否推出；**接入包未拷到车上/路径层级传错**也归本类 |
 | `20` | TLS/证书 | 先 `timedatectl` 校时；再查证书有效期、CN 是否等于 `vehicle_id`、私钥是否 0600 |
-| `30` | 认证 | SASL 用户名/口令、账号是否已在平台开通、是否缺 SCRAM 插件（`ls /usr/lib/*/sasl2/libscram.so`；Ubuntu 装 `libsasl2-modules-gssapi-mit`） |
+| `30` | 认证 | SASL 用户名/口令、账号是否已在平台开通、是否缺 SCRAM 插件（`ls /usr/lib/*/sasl2/libscram.so`；无输出则 `sudo apt install -y libsasl2-modules libsasl2-modules-gssapi-mit`，装完用 `dpkg -S` 查属主包） |
 | `40` | 网络 | `bootstrap.servers` 的 IP:端口需与 broker `advertised.listeners` 一致 |
 | `50` | Topic/ACL | 平台未按该车建满 8 个 Topic，或账号无 describe/write 权限 |
 | `60` | 投递 | broker 可达但 leader 异常；看 `data_agent` 是否已转 SQLite 缓存 |
+
+> 📌 **退出码按“真因”而非“发在哪一层”**：握手（第 6 层）与投递（第 7 层）的错误都会先按**错误文本关键字**、再按**错误码常量名**归类（常量数值随 librdkafka 版本变，不硬编码数值）——所以投递阶段碰上 `SASL authentication failed` 会报 **30**、`Topic authorization failed` 会报 **50**、`No worthy mechs found` 会报 **30** 并直指缺 SCRAM 插件，而不是一律归到 60（旧写法会把“口令错”伪装成“投递故障”）。
 
 完整 Topic 契约、凭据红线与服务部署细节见 [§11.3](#113-huntercore-车端接入契约v0105) 与 `Deployment_Guide.md` §5.6。
 
@@ -854,8 +865,12 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 # 首次接入 / 换车 / 接入包重新下发（需 sudo，可重复执行；接入包需先拷到车上）
 sudo bash ./hunter_core_setup.sh --bundle ~/HUNTER-001-bundle/HUNTER-001
 
-# 接入链路自检（退出码含义见 §7.7；不在 PATH 时改用 python3 -m hunter_kafka.diagnose）
-source ~/HunterEdge/install/setup.bash && hunter-kafka-check
+# 只是改完口令/参数后重跑（无需再传 --bundle：/etc/hunter/kafka 四件套齐就自动复用现场凭据、跳过步骤②）
+sudo bash ./hunter_core_setup.sh --skip-deps
+
+# 接入链路自检（退出码含义与命令入口见 §7.7）
+~/.local/bin/hunter-kafka-check          # 由部署脚本⑤ 安装；重登一个 shell 后可直接敲 hunter-kafka-check
+PYTHONPATH=~/HunterEdge/src/hunter_common/hunter_kafka python3 -m hunter_kafka.diagnose   # 不依赖任何安装的等价跑法
 
 # 一键确认“接入到底通不通”（含凭据落盘/服务态/health 数据）
 ./hunter_status.sh

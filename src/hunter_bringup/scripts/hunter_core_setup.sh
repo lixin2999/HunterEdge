@@ -5,9 +5,11 @@
 #   ⓪ 前置校参：运行用户与其主组存在、接入包四件套齐、工作空间存在（失败文本带下一步动作）
 #   ① 依赖安装：librdkafka(C++/Python)、SCRAM-SHA-512 机制插件、sqlite3
 #   ② 接入包落盘：把 HUNTER-001 bundle 装到 /etc/hunter/kafka/，私钥 0600；已写入口令的 properties 不覆盖
+#        （未传 --bundle 而现场四件套已齐时整段跳过，不碰已部署的凭据）
 #   ③ 运行期配置：Agent 参数文件落到 /etc/hunter/，生成 agent_env.sh 与 README_agent_env
 #   ④ 编译：以运行用户身份 colcon build 相关包
-#   ⑤ 自检：hunter-kafka-check（接入链路七层自检，退出码非 0 不自启服务）
+#   ⑤ 自检：hunter-kafka-check（接入链路七层自检，退出码非 0 不自启服务）；并给运行用户装
+#        ~/.local/bin/hunter-kafka-check 命令包装（ament 不把 lib/<pkg>/ 加进 PATH，直接 source 后用不了）
 #   ⑥ systemd：安装并启用 ota-agent / remote-agent（data/command agent 由 bring-up 拉起）
 #
 # 凭据红线：kafka.properties 只落盘 /etc/hunter/kafka/，不进工作空间、不进版本库、不进日志。
@@ -17,10 +19,13 @@
 #        [--ws <工作空间>] [--user <登录用户>] [--skip-deps] [--skip-build]
 #        [--offline] [--no-systemd] [--force-config] [--force-key]
 #   # --ws / --user 通常省写：默认取 sudo 调用者的家目录 + ~/HunterEdge
+#   # 改完口令/参数后的“重跑”可以不传 --bundle（/etc/hunter/kafka 四件套齐即自动复用）：
+#   sudo bash hunter_core_setup.sh --skip-deps
 #
 # 参数:
 #   --bundle       接入包目录（含 kafka.properties / ca-cert.pem / client-cert.pem /
-#                  client-key.pem，可选 kafka-client.p12）。**必填**
+#                  client-key.pem，可选 kafka-client.p12）。**首次接入必填**；
+#                  /etc/hunter/kafka 已有四件套时可省写（脚本复用现场凭据并跳过步骤②）。
 #                  注意：接入包不在仓库内，需先从开发机拷到车上（scp / U 盘）；
 #                  传错层级（如传到 HUNTER-001-bundle 而非内层 HUNTER-001）会自动下钻。
 #   --ws           HunterEdge 工作空间根（默认取**运行用户**家目录下的 HunterEdge，
@@ -74,7 +79,30 @@ BUNDLE_DIR="$(expand_tilde "$BUNDLE_DIR")"
 WS_DIR="$(expand_tilde "$WS_DIR")"
 [ -n "$WS_DIR" ] || WS_DIR="${USER_HOME}/HunterEdge"   # 不用 $HOME：sudo 下 $HOME 可能是 /root
 
-[ -n "$BUNDLE_DIR" ] || die "必须指定 --bundle <接入包目录>（先拷到车上：scp -r <开发机>:HUNTER-001-bundle $USER_HOME/）"
+KAFKA_DIR="/etc/hunter/kafka"
+ETC_DIR="/etc/hunter"
+PROPS="$KAFKA_DIR/kafka.properties"
+RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"   # 用户主组（Ubuntu 默认为同名私有组）
+getent group "$RUN_GROUP" >/dev/null || die "运行用户的主组不存在：$RUN_GROUP（用户属组异常，先修 /etc/passwd 与 /etc/group）"
+REQUIRED_FILES=(kafka.properties ca-cert.pem client-cert.pem client-key.pem)
+
+# 【“修完重跑”不该再要求原始接入包（实机反馈）】改完口令/参数只想重跑 ③④⑤⑥ 时，旧写法一进来
+# 就 die “必须指定 --bundle”，现场只能满车找原始包。/etc/hunter/kafka 四件套齐即视为可复用。
+REUSE_BUNDLE=0
+if [ -z "$BUNDLE_DIR" ]; then
+  HAVE_ALL=1
+  for f in "${REQUIRED_FILES[@]}"; do
+    [ -f "$KAFKA_DIR/$f" ] || HAVE_ALL=0
+  done
+  if [ "$HAVE_ALL" -eq 1 ]; then
+    REUSE_BUNDLE=1
+    warn "未指定 --bundle，复用 $KAFKA_DIR 已部署的接入包（步骤② 跳过，不动现场凭据）"
+    warn "  要重装原始包仍加 --bundle <目录>；要用包内容覆盖现场配置再加 --force-config"
+  else
+    die "必须指定 --bundle <接入包目录>（先拷到车上：scp -r <开发机>:HUNTER-001-bundle $USER_HOME/）
+     ↳ 未传 --bundle 且 $KAFKA_DIR 下四件套不全（不能复用现场凭据）：ls -l $KAFKA_DIR"
+  fi
+fi
 if [ ! -f "$BUNDLE_DIR/kafka.properties" ] && [ -d "$BUNDLE_DIR" ]; then
   # 只传了外层包目录时自动下钻一层（平台下发的目录形如 HUNTER-001-bundle/HUNTER-001）
   CANDIDATES=()
@@ -97,17 +125,13 @@ if [ ! -d "$BUNDLE_DIR" ]; then
 fi
 BUNDLE_DIR="$(cd "$BUNDLE_DIR" && pwd)"
 
-KAFKA_DIR="/etc/hunter/kafka"
-ETC_DIR="/etc/hunter"
-PROPS="$KAFKA_DIR/kafka.properties"
-RUN_GROUP="$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")"   # 用户主组（Ubuntu 默认为同名私有组）
-getent group "$RUN_GROUP" >/dev/null || die "运行用户的主组不存在：$RUN_GROUP（用户属组异常，先修 /etc/passwd 与 /etc/group）"
-REQUIRED_FILES=(kafka.properties ca-cert.pem client-cert.pem client-key.pem)
-for f in "${REQUIRED_FILES[@]}"; do
-  [ -f "$BUNDLE_DIR/$f" ] || die "接入包缺少 $f（应在 $BUNDLE_DIR 下）；该目录实际内容如下：
+if [ "$REUSE_BUNDLE" -eq 0 ]; then
+  for f in "${REQUIRED_FILES[@]}"; do
+    [ -f "$BUNDLE_DIR/$f" ] || die "接入包缺少 $f（应在 $BUNDLE_DIR 下）；该目录实际内容如下：
 $(ls -l "$BUNDLE_DIR" 2>&1 | sed 's/^/     /')"
-done
-[ -f "$BUNDLE_DIR/kafka-client.p12" ] || warn "包内无 kafka-client.p12（用 PEM 证书链即可，不影响）"
+  done
+  [ -f "$BUNDLE_DIR/kafka-client.p12" ] || warn "包内无 kafka-client.p12（用 PEM 证书链即可，不影响）"
+fi
 
 AGENT_PKGS=(command_agent data_agent ota_agent remote_agent)
 BUILD_PKGS=(hunter_msgs hunter_kafka "${AGENT_PKGS[@]}" hunter_bringup)   # 含 hunter_bringup：launch 里的 use_command_agent 必须装到 install/ 才生效
@@ -117,36 +141,56 @@ SRC_ROOT="$WS_DIR/src"
 [ -d "$SRC_ROOT/hunter_agents" ] || die "工作空间不对，未找到 $SRC_ROOT/hunter_agents: $WS_DIR"
 [ -d "$SRC_ROOT/hunter_common/hunter_kafka" ] || die "缺少公共包 src/hunter_common/hunter_kafka（本版本新增，先 git pull 或检查仓同步状态）"
 
-log "接入包: $BUNDLE_DIR"
+if [ "$REUSE_BUNDLE" -eq 1 ]; then
+  log "接入包: 复用 $KAFKA_DIR（本次未使用原始包）"
+else
+  log "接入包: $BUNDLE_DIR"
+fi
 log "工作空间: $WS_DIR   运行用户: $RUN_USER"
 
 # ---- ① 依赖 ----
+# 【包名坑（实测）】SCRAM-SHA-512 机制在 Ubuntu 上**不叫** cyrus-sasl-scram（那是
+# RHEL/openSUSE 的名字，在这装直接 Unable to locate package）。
+# 【本次修正】libscram.so 到底在哪个包里**随架构与版本变**：官方 jammy amd64 清单把它
+# 归到 libsasl2-modules-gssapi-mit（Launchpad #1988730），而 HUNTER-001 实机（Jetson
+# aarch64）上文件明明在 /usr/lib/aarch64-linux-gnu/sasl2/ 里，该包的 dpkg -L 却查不到。
+# 所以判据一律用**插件文件**，包只在“缺了才试装”时用，并把属主包直接打进日志（不靠猜）。
+# 【存在性判定要逐个候选测】`ls 路径A 路径B` 只要任一路径不存在就返回非 0，
+# 而 /usr/lib/sasl2 在 Ubuntu 上通常不存在 → 插件在位也会被误判为缺（假阴性，现场已误报过）。
+# 另：Ubuntu 里名为 `scram` 的包是 Probabilistic Risk Analysis Tool，与 SASL 无关，千万别装。
+scram_plugin() {
+  local p
+  for p in /usr/lib/*/sasl2/libscram.so /usr/lib/sasl2/libscram.so /usr/lib64/sasl2/libscram.so; do
+    [ -e "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+report_scram_plugin() {   # 不论是否 --skip-deps 都报一句，让现场自己看到插件到底归谁
+  local so owner
+  if so="$(scram_plugin)"; then
+    owner="$(dpkg -S "$so" 2>/dev/null | cut -d: -f1 || true)"
+    log "  SCRAM 插件在位：$so（属主包：${owner:-未被任何 dpkg 包记录，多为镜像预置或手工摆放}）"
+  else
+    warn "  缺 SCRAM 插件（libscram.so）：SASL_SSL + SCRAM-SHA-512 必报 No worthy mechs found。处置：
+       sudo apt install -y libsasl2-modules libsasl2-modules-gssapi-mit   # 两个候选都装，不赌名字
+       ls /usr/lib/*/sasl2/libscram.so                                     # 有输出即机制就绪（无需重编，重启 Agent 即可）
+       dpkg -S /usr/lib/*/sasl2/libscram.so                                # 查它真属于哪个包
+     ↳ 仍无输出时才考虑自编 cyrus-sasl2（--enable-scram）；dpkg -L 与 dpkg -S 可能不一致，以 dpkg -S 查到的属主为准"
+  fi
+}
 if [ "$SKIP_DEPS" -eq 0 ]; then
   log "① 依赖检查与安装（apt + pip）"
   export DEBIAN_FRONTEND=noninteractive
-  # 【包名坑（jammy 实测）】SCRAM-SHA-512 机制在 Ubuntu 上**不叫** cyrus-sasl-scram（那是
-  # RHEL/openSUSE 的包名，这里装会直接 Unable to locate package）；libscram.so 被错放在
-  # libsasl2-modules-gssapi-mit 里（Launchpad #1988730，名字与 MIT/GSSAPI 无关），
-  # 光装 libsasl2-modules 依旧报 No worthy mechs found。因此这里**按插件文件判定**，
-  # 不赌包名（跨 Ubuntu 版本/架构都不会被包名变化骗到）。
-  # 【重要】判定必须逐个候选测存在：`ls 路径A 路径B` 只要任一路径不存在就返回非 0，
-  # 而 /usr/lib/sasl2 在 Ubuntu 上通常不存在 → 插件在位也会被误判为缺（假阴性）。
-  # 另：Ubuntu 里名为 `scram` 的包是 Probabilistic Risk Analysis Tool，与 SASL 无关，千万别装。
-  scram_plugin() {
-    local p
-    for p in /usr/lib/*/sasl2/libscram.so /usr/lib/sasl2/libscram.so /usr/lib64/sasl2/libscram.so; do
-      [ -e "$p" ] && { echo "$p"; return 0; }
-    done
-    return 1
-  }
   need_pkgs=()
   dpkg -s librdkafka++1  >/dev/null 2>&1 || need_pkgs+=(librdkafka++1)     # data_agent C++ 运行时
   dpkg -s librdkafka-dev >/dev/null 2>&1 || need_pkgs+=(librdkafka-dev)     # ④ 编译期头文件
   dpkg -s libsqlite3-dev >/dev/null 2>&1 || need_pkgs+=(libsqlite3-dev)     # 断网缓存
   dpkg -s libsasl2-modules >/dev/null 2>&1 || need_pkgs+=(libsasl2-modules)
   dpkg -s ca-certificates >/dev/null 2>&1 || need_pkgs+=(ca-certificates)
-  SCRAM_SO="$(scram_plugin || true)"
-  [ -n "$SCRAM_SO" ] || need_pkgs+=(libsasl2-modules-gssapi-mit)            # ← SCRAM 插件真正来源
+  if ! scram_plugin >/dev/null; then
+    # 插件不在位：两个候选包一起试（不同架构/版本分属不同包，只赌一个会“已最新但仍缺”）
+    need_pkgs+=(libsasl2-modules libsasl2-modules-gssapi-mit)
+  fi
   if [ "${#need_pkgs[@]}" -gt 0 ]; then
     log "  待装：${need_pkgs[*]}"
     # update 失败不阻断：包已在本地而源不可达（4G/内网/仓库过期）时照样能装；
@@ -162,25 +206,32 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
   else
     log "  apt 依赖已齐（按本地文件判定，无需联网）"
   fi
-  if SCRAM_SO="$(scram_plugin)"; then
-    log "  SCRAM 插件在位：$SCRAM_SO"
+  # 【判据要用 API，不只看 import 成不成功（实机反馈）】pip 装成功后仍可能因**版本过旧**而
+  # 没有 AdminClient（自检 6/7 层与 Topic 清单核对都靠它），所以直接试取那个符号。
+  if python3 -c "from confluent_kafka.admin import AdminClient" 2>/dev/null; then
+    log "  confluent-kafka 可用：$(python3 -c 'import confluent_kafka as c; print(getattr(c, "__version__", None) or c.version()[0])' 2>/dev/null || echo 未知版本)"
   else
-    warn "  仍缺 SCRAM 插件（libscram.so）：认证必报 No worthy mechs found。用这两行定性：
-       dpkg -L libsasl2-modules-gssapi-mit | grep -F 'sasl2/libscram'
-         └ 清单里有但文件不在 → 包内容被破坏：sudo apt install --reinstall libsasl2-modules-gssapi-mit
-         └ 清单里没有 → 该机所在的 libsasl2 版本确实不含 SCRAM，需自编 cyrus-sasl2（--enable-scram）
-       确认完再把结果告知开发（不要靠猜换包名，也不要装 `scram` 包）"
-  fi
-  if python3 -c "import confluent_kafka" 2>/dev/null; then
-    log "  confluent-kafka 已安装：$(python3 -c 'import confluent_kafka as c; print(c.version()[0])')"
-  else
-    pip3 install --quiet confluent-kafka || die "pip3 安装 confluent-kafka 失败（离线环境请预先准备 wheel；缺它只影响 ota/remote/command 三个 Python Agent，data_agent 仍可上报）"
+    warn "  confluent-kafka 缺失或过旧（取不到 admin.AdminClient，自检第 6/7 层与三个 Python Agent 都依赖它）：尝试安装/升级"
+    pip3 install -U --quiet confluent-kafka \
+      || die "pip3 安装/升级 confluent-kafka 失败（离线环境请预先准备 wheel；缺它只影响 ota/remote/command 三个 Python Agent 与自检 6/7 层，data_agent 仍可上报）
+     ↳ 先看现场装的是什么：python3 -c 'import confluent_kafka as c; print(getattr(c, "__version__", "?"), c.__file__)'
+       版本过旧或路径不在 /usr/local/lib/python3.*/dist-packages → 先卸再装：
+         sudo pip3 uninstall -y confluent-kafka && sudo pip3 install -U confluent-kafka
+       报 librdkafka 相关错误时：sudo apt install -y librdkafka-dev 后重试"
   fi
 else
   log "① 跳过依赖安装（--skip-deps）"
 fi
+report_scram_plugin
 
 # ---- ② 接入包落盘 ----
+# 未传 --bundle 且现场四件套齐时整段跳过（段内语句按原缩进留在 else 分支里，不重排以减小 diff）
+if [ "$REUSE_BUNDLE" -eq 1 ]; then
+  log "② 跳过接入包落盘：复用 $KAFKA_DIR 下的现场凭据（未做任何改动）"
+  if grep -q '<SCRAM_PASSWORD>' "$PROPS" 2>/dev/null; then
+    warn "  但现场 $PROPS 仍是占位口令 <SCRAM_PASSWORD>：请人工写入真实 SCRAM 口令后重跑"
+  fi
+else
 log "② 安装接入包到 $KAFKA_DIR"
 install -d -m 0750 -o root -g "$RUN_GROUP" "$KAFKA_DIR"
 # properties 默认**不覆盖现场**：运营已手改写入 SCRAM 口令、而包内仍是占位符时，
@@ -220,6 +271,7 @@ fi
 if grep -q '<SCRAM_PASSWORD>' "$PROPS"; then
   warn "kafka.properties 的 sasl.jaas.config 仍是占位口令 <SCRAM_PASSWORD>"
   warn "请由运维人员手工写入真实 SCRAM 口令后重跑本脚本（脚本不会读取/记录该口令）"
+fi
 fi
 
 # ---- ③ 运行期配置 ----
@@ -306,20 +358,63 @@ CHECK_ARGS=(--properties "$PROPS" --bundle-dir "$KAFKA_DIR")
 if [ "$OFFLINE" -eq 1 ]; then
   CHECK_ARGS+=(--offline)
 fi
+# 入口脚本是 setuptools 生成的 load_entry_point 包装，运行时需要**包元数据**在 sys.path
+# 上可发现；--symlink-install（develop 布局）把元数据留在源码目录与包内 site-packages，
+# 而 root 的 PYTHONPATH 里没有它们 → 直接执行会抛 PackageNotFoundError 并以退出码 1 结束
+# （那是解释器报错，不是自检结论）。因此手动把两处补上，并对退出码 1 退回源码跑法。
+HK_SRC="$SRC_ROOT/hunter_common/hunter_kafka"
+HK_SITE="$(ls -d "$WS_DIR"/install/hunter_kafka/lib/python3.*/site-packages 2>/dev/null | head -n1 || true)"
+HK_PY="$HK_SRC${HK_SITE:+:$HK_SITE}${PYTHONPATH:+:$PYTHONPATH}"
+# 【为何需要命令包装（实机反馈）】ament 只把 <prefix>/bin 加进 PATH，而 ament_python 的
+# console_script 装在 <prefix>/lib/<pkg>/ 下 → **source install/setup.bash 后仍然
+# “hunter-kafka-check: command not found”（退 127）**；直接拿绝对路径跑又撞上上面的
+# 包元数据问题。所以下面给运行用户装一个不依赖包元数据的命令包装。
+install_check_wrapper() {
+  local w="$USER_HOME/.local/bin/hunter-kafka-check" marker="由 hunter_core_setup.sh 生成"
+  if [ -e "$w" ] && ! grep -qF "$marker" "$w" 2>/dev/null; then
+    warn "  $w 已存在且不是本脚本生成，不覆盖（自己改）"
+    return 0
+  fi
+  install -d -m 0755 -o "$RUN_USER" -g "$RUN_GROUP" "$USER_HOME/.local/bin" || { warn "  建不了 $USER_HOME/.local/bin，跳过包装"; return 0; }
+  cat > "$w" <<EOF
+#!/usr/bin/env bash
+# $marker —— 直接走模块方式，不依赖包元数据，也不管入口被装到哪个目录
+# 工作空间：$WS_DIR
+export PYTHONPATH="$HK_SRC\${PYTHONPATH:+:\$PYTHONPATH}"
+exec python3 -m hunter_kafka.diagnose "\$@"
+EOF
+  chmod 0755 "$w"
+  chown "$RUN_USER:$RUN_GROUP" "$w"
+  log "  已安装命令包装：$w（新开一个 shell 就能直接敲 hunter-kafka-check）"
+}
+install_check_wrapper
+run_check_source() {   # 源码方式跑自检：不依赖包元数据，作为永远可用的兜底
+  PYTHONPATH="$HK_PY" python3 -m hunter_kafka.diagnose "${CHECK_ARGS[@]}" || SELFTEST=$?
+}
 SELFTEST=0
 if [ -n "$CHECK_BIN" ]; then
   log "⑤ 自检：$CHECK_BIN（配置/证书/机制/网络/认证/Topic/投递）"
-  "$CHECK_BIN" "${CHECK_ARGS[@]}" || SELFTEST=$?
-elif python3 -c "import confluent_kafka" 2>/dev/null; then
-  # 未编译（--skip-build）或入口不在工作空间里时退回源码模式，仍可做本地配置/证书核查
-  # （坑：--symlink-install 下 ament_python 可能把 console_script 装进用户 Python 环境，
-  #   而不是 install/<pkg>/bin，root 的 PATH 里找不到它）
+  env PYTHONPATH="$HK_PY" "$CHECK_BIN" "${CHECK_ARGS[@]}" || SELFTEST=$?
+  # diagnose 的正常退出码只有 0/10/20/30/40/50/60，出现 1 即入口本身没跑起来
+  if [ "$SELFTEST" -eq 1 ]; then
+    warn "  入口脚本自身启动失败（退出码 1，多为包元数据不在当前 PYTHONPATH 里）；本次改走源码方式续跑"
+    SELFTEST=0
+    run_check_source
+  fi
+elif [ -f "$HK_SRC/hunter_kafka/diagnose.py" ]; then
+  # 入口没扫到（或 --skip-build 未编译）时走源码方式。confluent_kafka 在 client.py 里是
+  # **惰性导入**，缺它只影响第 6/7 层（SASL 握手与投递），前 5 层结论照样拿得到
   log "⑤ 自检：以源码方式运行 hunter-kafka-check（install/ 与 ~/.local/bin 均未扫到入口）"
-  warn "  查它到底装到哪：find $WS_DIR/install $USER_HOME/.local/bin -name hunter-kafka-check 2>/dev/null"
-  PYTHONPATH="$SRC_ROOT/hunter_common/hunter_kafka" python3 -m hunter_kafka.diagnose "${CHECK_ARGS[@]}" \
-    || SELFTEST=$?
+  python3 -c "from confluent_kafka.admin import AdminClient" 2>/dev/null \
+    || warn "  confluent-kafka 缺失或过旧（无 admin.AdminClient）：第 6/7 层会挂（sudo pip3 install -U confluent-kafka 补齐），前 5 层结论仍有效"
+  run_check_source
 else
-  warn "⑤ 未编译且无 confluent_kafka，跳过自检（编好后手动补跑 hunter-kafka-check）"
+  warn "⑤ 既没扫到自检入口、也缺源码包 src/hunter_common/hunter_kafka，跳过自检"
+fi
+if [ "$SELFTEST" -eq 1 ]; then
+  # 自检自己的退出码不会是 1（只可能是 0/10/20/30/40/50/60），因此 1 = 解释器层报错
+  warn "⑤ 自检未真正执行（退出码 1 不是链路结论，是 Python 报错）：手工复现看 Traceback："
+  warn "    PYTHONPATH=$HK_SRC python3 -m hunter_kafka.diagnose ${CHECK_ARGS[*]}"
 fi
 if [ "$SELFTEST" -ne 0 ]; then
   warn "自检未全通过（退出码 $SELFTEST）：按上面每一条的处置提示修，修完重跑 hunter-kafka-check"
@@ -359,5 +454,7 @@ log "完成。后续步骤："
 log "  1) 启动整栈：ros2 launch hunter_bringup hunter_full.launch.py（含 data_agent + command_agent）"
 log "  2) 现场改参：vi $ETC_DIR/<agent>_params.yaml，再按 params_file 指向它启动"
 log "  3) 联调判据：平台侧该车辆 last_online_time 刷新；车端 hunter-kafka-check 退出码 0"
+log "     （自检命令入口：新开一个 shell 后直接 hunter-kafka-check；未重登则用"
+log "       $USER_HOME/.local/bin/hunter-kafka-check 或 PYTHONPATH=$HK_SRC python3 -m hunter_kafka.diagnose）"
 log "  4) 严禁：把 $KAFKA_DIR 下任何文件拷进工作空间/版本库，或在日志中打印口令"
 exit "$SELFTEST"

@@ -185,10 +185,11 @@ def check_sasl_mechanism(chk: Check, conf: dict) -> None:
     """本地判定 SCRAM 机制插件是否在位。
 
     【包名坑】Ubuntu/Debian **没有** cyrus-sasl-scram 这个包（那是 RHEL/openSUSE 的名字，
-    照它装会直接 Unable to locate package）；libscram.so 被“错放”在
-    libsasl2-modules-gssapi-mit 里（Launchpad #1988730，名字与 MIT/GSSAPI 无关），
-    光装 libsasl2-modules 依旧报 No worthy mechs found。
-    因此判据用**插件文件**而不是包名，跨发行版/架构都不会因包名变化失真。
+    照它装会直接 Unable to locate package）。
+    【属主包随架构变】jammy amd64 官方清单把 libscram.so 归到
+    libsasl2-modules-gssapi-mit（Launchpad #1988730），而 Jetson aarch64 实机上文件在
+    /usr/lib/aarch64-linux-gnu/sasl2/ 里、该包的 dpkg -L 却列不出来。因此判据一律用
+    **插件文件**（跨发行版/架构都不失真），属主包现场用 `dpkg -S <文件>` 查。
     """
     mech = str(conf.get("sasl.mechanism") or "").upper()
     if mech and not mech.startswith("SCRAM"):
@@ -205,10 +206,12 @@ def check_sasl_mechanism(chk: Check, conf: dict) -> None:
     else:
         chk.fail(EXIT_AUTH, "SASL 机制插件",
                  f"未找到 libscram.so，{mech} 必报 No worthy mechs found；"
-                 "Ubuntu/Debian 装：sudo apt install -y libsasl2-modules "
-                 "libsasl2-modules-gssapi-mit（无 cyrus-sasl-scram 包，那是 RHEL 系的名字）；"
-                 "若该包已装仍无此文件：dpkg -L libsasl2-modules-gssapi-mit | grep sasl2/libscram "
-                 "——清单里有但文件不在则 --reinstall，清单里没有则需自编 cyrus-sasl2（--enable-scram）；"
+                 "Ubuntu/Debian 先两个候选包一起装（属主包随架构/版本变，不要只赌一个）："
+                 "sudo apt install -y libsasl2-modules libsasl2-modules-gssapi-mit；"
+                 "无 cyrus-sasl-scram 包（那是 RHEL 系的名字）；装完用 "
+                 "dpkg -S /usr/lib/*/sasl2/libscram.so 查真正的属主包，"
+                 "确认文件已存在即可重启 Agent（无需重编）；"
+                 "仍无此文件才需自编 cyrus-sasl2（--enable-scram）；"
                  "千万别装名为 scram 的包（那是概率风险分析工具，与 SASL 无关）")
 
 
@@ -222,13 +225,70 @@ def check_tcp(chk: Check, bootstrap: str, timeout: float) -> None:
                  f"{host}:{port or 9093} 不可达：{exc}（检查上联链路/DNS/防火墙）")
 
 
+def _err_codes(names: tuple) -> set:
+    """按**常量名**取 librdkafka 错误码（数值随版本变，不能硬编码），取不到的跳过。"""
+    try:
+        from confluent_kafka import KafkaError
+    except ImportError:
+        return set()
+    out = set()
+    for name in names:
+        val = getattr(KafkaError, name, None)
+        try:
+            if val is not None:
+                out.add(int(val))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _classify_broker_error(text: str, code: Optional[int], default: int) -> tuple:
+    """把握手/投递期错误归到自检退出码，返回 `(退出码, 标题, 处置提示)`。
+
+    先按文本关键字再按错误码：SASL 失败经常被包成 `_TRANSPORT`，只看码会把“口令错”
+    误报成“网络不通”（现场最难排的一类假象）。Ubuntu 上无名为 `cyrus-sasl-scram` 的包，
+    而 `libscram.so` 的属主包**随架构与版本变**，所以只用插件文件与 `dpkg -S` 定性。
+    """
+    if ("no worthy mechs" in text or "unsupported sasl mechanism" in text
+            or "sasl init" in text):
+        return (EXIT_AUTH, "SASL 机制",
+                "缺 SCRAM 插件：`ls /usr/lib/*/sasl2/libscram.so` 确认文件在位；"
+                "缺则 `sudo apt install -y libsasl2-modules libsasl2-modules-gssapi-mit`，"
+                "装完重启 Agent 即可（无需重编）")
+    if code in _err_codes(("TOPIC_AUTHORIZATION_FAILED", "CLUSTER_AUTHORIZATION_FAILED",
+                           "GROUP_AUTHORIZATION_FAILED")) or "authorization" in text:
+        return (EXIT_TOPIC, "Broker 握手",
+                "账号无 Describe/List 权限：让平台开通该车账号的 ACL（这不是口令错，改口令无效）")
+    if (code in _err_codes(("_AUTHENTICATION", "SASL_AUTHENTICATION_FAILED", "SECURITY_DISABLED"))
+            or "authentication" in text or "sasl" in text):
+        return (EXIT_AUTH, "SASL 认证",
+                "核对 SCRAM 口令与平台侧账号是否已开通；用户名必须等于 vehicle_id 且等于证书 CN")
+    if code in _err_codes(("_SSL",)) or "certificate" in text or "ssl" in text:
+        return (EXIT_TLS, "Broker 握手",
+                f"TLS 校验未过：确认 {CA_FILE} 与 {CLIENT_CERT_FILE}/{CLIENT_KEY_FILE} 属于同一"
+                " vehicle_id；先 `timedatectl` 校时（时钟漂会让有效证书直接判为无效）")
+    if (code in _err_codes(("_TRANSPORT", "_RESOLVE", "_TIMED_OUT", "_FAIL"))
+            or "transport" in text or "resolve" in text or "resolution" in text
+            or "timed out" in text or "no broker available" in text):
+        return (EXIT_NETWORK, "Broker 握手",
+                "握手期连不上：查上联链路/DNS/防火墙，以及 `bootstrap.servers` 是否与 broker 对外地址一致")
+    return (default, "Broker 握手", f"未归类错误（err={code}）：按原文排查，必要时带本输出报修")
+
+
 def check_broker(chk: Check, conf: dict, vehicle_id: str, timeout: float) -> Optional[set]:
     """SASL_SSL + mTLS 握手 + Topic 清单核对。返回 broker 上的 Topic 集合。"""
     try:
-        from confluent_kafka import AdminClient
-        from confluent_kafka.errors import KafkaException, SaslAuthenticationException
+        # 【坑（实机误判过）】AdminClient 属于 **confluent_kafka.admin** 子模块，顶层不重导出；
+        # 写成 `from confluent_kafka import AdminClient` 会报 `cannot import name 'AdminClient'`，
+        # 看上去像“没装 confluent-kafka”其实是导入路径错。异常类则从顶层取（没有
+        # `confluent_kafka.errors` 这个模块，也没有 SaslAuthenticationException 这个类）。
+        from confluent_kafka import KafkaException
+        from confluent_kafka.admin import AdminClient
     except ImportError as exc:
-        chk.fail(EXIT_CONFIG, "confluent_kafka", f"未安装：{exc}（pip3 install confluent-kafka）")
+        chk.fail(EXIT_CONFIG, "confluent_kafka 依赖",
+                 f"不可用：{exc}（**非接入链路故障**，是车端 Python 包缺失/损坏）；"
+                 "查：python3 -c 'import confluent_kafka as c; print(c.__version__, c.__file__)'；"
+                 "修：sudo pip3 install -U confluent-kafka 后重跑本自检")
         return None
 
     admin_conf = strip_meta(conf)
@@ -237,17 +297,17 @@ def check_broker(chk: Check, conf: dict, vehicle_id: str, timeout: float) -> Opt
     expected = {f"hunter.{vehicle_id}.{t}" for t in TOPIC_TYPES}
     try:
         names = admin.list_topics(timeout=timeout).topics
-    except SaslAuthenticationException as exc:
-        chk.fail(EXIT_AUTH, "SASL 认证", f"{exc}（核对 SCRAM 口令/用户名与平台侧账号是否已开通；"
-                                         "若原文含 No worthy mechs found 则缺 SCRAM 插件，"
-                                         "Ubuntu 上装 libsasl2-modules-gssapi-mit）")
-        return None
     except KafkaException as exc:
-        code = exc.args[0].code() if exc.args else None
-        # 握手期证书不受信 / mTLS 未通过 都落在这里，与认证失败区分开
-        chk.fail(EXIT_TLS if code in (13, 29, -151) else EXIT_AUTH,
-                 "Broker 握手", f"{exc}（err={code}；若提示 certificate 请确认 "
-                 f"{CA_FILE} 与 {CLIENT_CERT_FILE}/{CLIENT_KEY_FILE} 属于同一 vehicle_id）")
+        err = exc.args[0] if exc.args else None
+        code = err.code() if hasattr(err, "code") else None
+        text = (err.str() if hasattr(err, "str") else str(err or exc)).lower()
+        exit_code, title, hint = _classify_broker_error(text, code, EXIT_AUTH)
+        chk.fail(exit_code, title, f"{err if err is not None else exc}：{hint}")
+        return None
+    except Exception as exc:  # noqa: BLE001（旧版/装坏的 wheel 会抛非 KafkaException）
+        chk.fail(EXIT_CONFIG, "Broker 握手",
+                 f"意外异常 {type(exc).__name__}: {exc}（若提示没有 AdminClient，说明装的版本异常："
+                 "sudo pip3 install -U confluent-kafka）")
         return None
 
     chk.ok("Broker 握手（SASL_SSL + mTLS）", f"共见 {len(names)} 个 Topic")
@@ -262,7 +322,7 @@ def check_broker(chk: Check, conf: dict, vehicle_id: str, timeout: float) -> Opt
 
 def check_delivery(chk: Check, conf: dict, vehicle_id: str, timeout: float) -> None:
     """端到端投递证实：produce 一条测试遥测并等 on_delivery（produce() 成功 ≠ 送达）。"""
-    from confluent_kafka import Producer
+    from confluent_kafka import Producer  # Producer/Consumer 顶层可得（AdminClient 不在顶层）
 
     topic = f"hunter.{vehicle_id}.telemetry"
     state: dict = {}
@@ -283,10 +343,15 @@ def check_delivery(chk: Check, conf: dict, vehicle_id: str, timeout: float) -> N
     if state.get("ok"):
         chk.ok("端到端投递", f"{topic} 已收到 broker ack（平台侧应能看到 last_online_time 刷新）")
     elif state.get("err"):
-        chk.fail(EXIT_DELIVERY, "端到端投递", f"投递失败：{state['err']}")
+        err = state["err"]
+        code = err.code() if hasattr(err, "code") else None
+        text = (err.str() if hasattr(err, "str") else str(err)).lower()
+        exit_code, _title, hint = _classify_broker_error(text, code, EXIT_DELIVERY)
+        chk.fail(exit_code, "端到端投递", f"{err}：{hint}")
     else:
         chk.fail(EXIT_DELIVERY, "端到端投递",
-                 f"{timeout:.0f}s 内无投递回调（broker 不可达或分区 leader 异常）")
+                 f"{timeout:.0f}s 内无投递回调（broker 不可达或分区 leader 异常；"
+                 "Topic 不存在时 broker 可能自动建到未知分区，先查第 6 层 Topic 清单结论）")
 
 
 def main(argv: Optional[list] = None) -> int:
