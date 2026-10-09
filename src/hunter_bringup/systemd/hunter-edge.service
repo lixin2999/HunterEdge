@@ -1,0 +1,39 @@
+[Unit]
+Description=HunterEdge Autonomous Driving Stack (ready state; CAN + Kafka + Nav2/auto_mission)
+Documentation=file:///etc/hunter/README_agent_env
+# 上电时序（需求①→②）：先底盘 CAN 通信，再 HunterEdge 整栈。
+# Requires=：CAN 未就绪则不启动本服务（“底盘都没通就别把车挂到 AUTO 待命状态”）；
+# After= 保证 hunter-can 完成（Type=oneshot + RemainAfterExit）后才拉起本服务；
+# network-online.target 保证 Kafka（运营端）接入前网络已就绪。
+Requires=hunter-can.service
+After=hunter-can.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=PYTHONUNBUFFERED=1
+# 自动驾驶准备状态（需求②）：自主导航待命；建图/联调可用 HUNTER_EDGE_* 覆盖
+Environment=HUNTER_EDGE_AUTONOMOUS_NAV=true
+Environment=HUNTER_EDGE_NAV_MODE=nav
+EnvironmentFile=-/etc/hunter/agent_env.sh
+# ExecStartPre：CAN 幂等复查（接口真掉了直接失败 → Restart=on-failure 重新走一遍完整时序）
+ExecStartPre=/bin/bash -c 'S="${HUNTER_CAN_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_can_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_can_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; exec /bin/bash "$S" --quick'
+ExecStart=/bin/bash -c 'S="${HUNTER_EDGE_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_edge_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_edge_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; [ -f "$S" ] || { echo "[hunter-edge] 未找到 hunter_edge_up.sh（用 HUNTER_EDGE_UP_SCRIPT 指定绝对路径）" >&2; exit 1; }; export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"; exec /bin/bash "$S"'
+# 整栈启动含相机硬件复位（initial_reset）与 Nav2 lifecycle，给足启动时间
+TimeoutStartSec=180
+Restart=on-failure
+RestartSec=10
+# 退出宽限：fast_lio2 需在退出瞬间写 PCD（建图模式），data_agent 需 flush 残留消息
+TimeoutStopSec=120
+KillSignal=SIGINT
+KillMode=mixed
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

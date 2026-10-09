@@ -12,14 +12,16 @@
 #   ④ 编译：以运行用户身份 colcon build 相关包
 #   ⑤ 自检：hunter-kafka-check（接入链路七层自检，退出码非 0 不自启服务）；并给运行用户装
 #        ~/.local/bin/hunter-kafka-check 命令包装（ament 不把 lib/<pkg>/ 加进 PATH，直接 source 后用不了）
-#   ⑥ systemd：安装并启用 ota-agent / remote-agent（data/command agent 由 bring-up 拉起）
+#   ⑥ systemd：安装并启用 hunter-can / hunter-edge / ota-agent / remote-agent
+#        （hunter-can 上电启用底盘 CAN；hunter-edge 依赖它启动整栈——
+#         data_agent/command_agent 上报运营端并待命自动驾驶，见 §13.10）
 #
 # 凭据红线：kafka.properties 只落盘 /etc/hunter/kafka/，不进工作空间、不进版本库、不进日志。
 #
 # 用法:
 #   sudo bash hunter_core_setup.sh --bundle ~/HUNTER-001-bundle/HUNTER-001 \
 #        [--ws <工作空间>] [--user <登录用户>] [--skip-deps] [--skip-build]
-#        [--offline] [--no-systemd] [--force-config] [--force-key]
+#        [--offline] [--no-systemd] [--no-start] [--force-config] [--force-key]
 #   # --ws / --user 通常省写：默认取 sudo 调用者的家目录 + ~/HunterEdge
 #   # 改完口令/参数后的“重跑”可以不传 --bundle（/etc/hunter/kafka 四件套齐即自动复用）：
 #   sudo bash hunter_core_setup.sh --skip-deps
@@ -37,6 +39,8 @@
 #   --skip-build   跳过 colcon 编译
 #   --offline      自检只查本地配置/证书，不连 broker（现场无云端网络时用）
 #   --no-systemd   不安装/启用 systemd 服务
+#   --no-start     只安装并 enable systemd 服务，**不立即启动**（台架/无底盘时用；
+#                  不加本项则启动 hunter-can → ota/remote-agent → hunter-edge 整栈）
 #   --force-config 用仓内参数文件/接入包覆盖 /etc/hunter/ 下已有内容（默认保留现场修改，
 #                  含已人工写入口令的 kafka.properties——重跑脚本不会把口令抹回占位符）
 #   --force-key    允许 client-key.pem 权限非 0600 时继续（默认直接失败）
@@ -45,7 +49,7 @@ set -euo pipefail
 BUNDLE_DIR=""
 WS_DIR=""                             # 未指定时按运行用户的家目录推导（见下方“前置检查”）
 RUN_USER="${SUDO_USER:-$(id -un)}"
-SKIP_DEPS=0 SKIP_BUILD=0 OFFLINE=0 NO_SYSTEMD=0 FORCE_CONFIG=0 FORCE_KEY=0
+SKIP_DEPS=0 SKIP_BUILD=0 OFFLINE=0 NO_SYSTEMD=0 FORCE_CONFIG=0 FORCE_KEY=0 NO_START=0
 
 log()  { echo "[hunter-core] $*"; }
 warn() { echo "[hunter-core] ! $*" >&2; }
@@ -60,6 +64,7 @@ while [ $# -gt 0 ]; do
     --skip-build)   SKIP_BUILD=1; shift ;;
     --offline)      OFFLINE=1; shift ;;
     --no-systemd)   NO_SYSTEMD=1; shift ;;
+    --no-start)     NO_START=1; shift ;;
     --force-config) FORCE_CONFIG=1; shift ;;
     --force-key)    FORCE_KEY=1; shift ;;
     -h|--help)      sed -n '/^set -euo pipefail/q; p' "$0"; exit 0 ;;   # 打印文头注释（自动随注释行数变化，不需手工维护行号）
@@ -105,34 +110,40 @@ if [ -z "$BUNDLE_DIR" ]; then
      ↳ 未传 --bundle 且 $KAFKA_DIR 下四件套不全（不能复用现场凭据）：ls -l $KAFKA_DIR"
   fi
 fi
-if [ ! -f "$BUNDLE_DIR/kafka.properties" ] && [ -d "$BUNDLE_DIR" ]; then
-  # 只传了外层包目录时自动下钻一层（平台下发的目录形如 HUNTER-001-bundle/HUNTER-001）
-  CANDIDATES=()
-  while IFS= read -r d; do CANDIDATES+=("$d"); done \
-    < <(find "$BUNDLE_DIR" -mindepth 1 -maxdepth 2 -name kafka.properties -type f 2>/dev/null | sort)
-  if [ "${#CANDIDATES[@]}" -eq 1 ]; then
-    warn "--bundle 指向的目录里没有 kafka.properties，自动下钻：$BUNDLE_DIR → $(dirname "${CANDIDATES[0]}")"
-    BUNDLE_DIR="$(dirname "${CANDIDATES[0]}")"
-  elif [ "${#CANDIDATES[@]}" -gt 1 ]; then
-    die "$BUNDLE_DIR 下找到多个 kafka.properties，请明确指定其中一个目录：
+# 【复用现场凭据时**不做任何包目录校验**】——REUSE_BUNDLE=1 时 BUNDLE_DIR 为空是**正常**的。
+# 旧写法紧接着就 `[ ! -d "$BUNDLE_DIR" ]` → `-d ""` 恒假 → 必然 die “接入包目录不存在:”，
+# 于是“改完口令/参数后重跑（不带 --bundle）”这条**文档承诺的路径一进来就挂**，
+# 连带步骤③④⑤⑥（参数落盘 / 编译 / 自检 / systemd）全都没跑
+# （HUNTER-001 实机复现：systemctl 四个服务 inactive、hunter-kafka-check 命令不存在）。
+if [ "$REUSE_BUNDLE" -eq 0 ]; then
+  if [ ! -f "$BUNDLE_DIR/kafka.properties" ] && [ -d "$BUNDLE_DIR" ]; then
+    # 只传了外层包目录时自动下钻一层（平台下发的目录形如 HUNTER-001-bundle/HUNTER-001）
+    CANDIDATES=()
+    while IFS= read -r d; do CANDIDATES+=("$d"); done \
+      < <(find "$BUNDLE_DIR" -mindepth 1 -maxdepth 2 -name kafka.properties -type f 2>/dev/null | sort)
+    if [ "${#CANDIDATES[@]}" -eq 1 ]; then
+      warn "--bundle 指向的目录里没有 kafka.properties，自动下钻：$BUNDLE_DIR → $(dirname "${CANDIDATES[0]}")"
+      BUNDLE_DIR="$(dirname "${CANDIDATES[0]}")"
+    elif [ "${#CANDIDATES[@]}" -gt 1 ]; then
+      die "$BUNDLE_DIR 下找到多个 kafka.properties，请明确指定其中一个目录：
 $(printf '     %s\n' "${CANDIDATES[@]}")"
+    fi
   fi
-fi
-if [ ! -d "$BUNDLE_DIR" ]; then
-  die "接入包目录不存在: $BUNDLE_DIR
+  if [ ! -d "$BUNDLE_DIR" ]; then
+    die "接入包目录不存在: $BUNDLE_DIR
      ↳ 接入包不在仓库内，需先从开发机拷到车上（scp / U 盘），例：
          scp -r <开发机用户>@<开发机IP>:~/HUNTER-001-bundle $USER_HOME/
      ↳ 已在车上但不知道在哪：sudo find / -name kafka.properties 2>/dev/null
      ↳ 拷过来先自检目录内容：ls -l $BUNDLE_DIR   （应见 kafka.properties + 三个 .pem）"
-fi
-BUNDLE_DIR="$(cd "$BUNDLE_DIR" && pwd)"
-
-if [ "$REUSE_BUNDLE" -eq 0 ]; then
+  fi
+  BUNDLE_DIR="$(cd "$BUNDLE_DIR" && pwd)"
   for f in "${REQUIRED_FILES[@]}"; do
     [ -f "$BUNDLE_DIR/$f" ] || die "接入包缺少 $f（应在 $BUNDLE_DIR 下）；该目录实际内容如下：
 $(ls -l "$BUNDLE_DIR" 2>&1 | sed 's/^/     /')"
   done
   [ -f "$BUNDLE_DIR/kafka-client.p12" ] || warn "包内无 kafka-client.p12（用 PEM 证书链即可，不影响）"
+else
+  log "接入包目录校验：跳过（复用 $KAFKA_DIR，未使用原始包）"
 fi
 
 AGENT_PKGS=(command_agent data_agent ota_agent remote_agent)
@@ -333,6 +344,14 @@ HUNTER_WS_PREFIX=$WS_DIR/install
 HUNTER_ROS_SETUP=/opt/ros/humble/setup.bash
 HUNTER_OTA_CONFIG=$ETC_DIR/ota_agent_params.yaml
 HUNTER_REMOTE_CONFIG=$ETC_DIR/remote_agent_params.yaml
+# ── 开机自启链路（需求①②，见 hunter-can.service / hunter-edge.service）──
+HUNTER_SRC_DIR=$WS_DIR                                # 源码树（脚本/systemd 单元的兜底定位）
+HUNTER_CAN_UP_SCRIPT=$SRC_ROOT/hunter_bringup/scripts/hunter_can_up.sh
+HUNTER_EDGE_UP_SCRIPT=$SRC_ROOT/hunter_bringup/scripts/hunter_edge_up.sh
+HUNTER_EDGE_AUTONOMOUS_NAV=true                       # true = 上电即进入自动驾驶准备状态
+HUNTER_EDGE_NAV_MODE=nav                              # nav（导航巡航）| mapping（建图）
+HUNTER_EDGE_MAP_YAML=$WS_DIR/maps/hunter_map.yaml
+HUNTER_EDGE_MAP_FILE=$WS_DIR/maps/hunter_map.pcd
 EOF
 chmod 0644 "$ETC_DIR/agent_env.sh"
 log "  写入 $ETC_DIR/agent_env.sh（HUNTER_WS_PREFIX=$WS_DIR/install）"
@@ -341,14 +360,28 @@ log "  写入 $ETC_DIR/agent_env.sh（HUNTER_WS_PREFIX=$WS_DIR/install）"
 cat > "$ETC_DIR/README_agent_env" <<EOF
 Agent 运行环境说明（由 hunter_core_setup.sh 生成于 $(date '+%F %T')）
 
-  $ETC_DIR/agent_env.sh              工作空间/ROS 路径与参数文件位置（systemd 单元 source 它）
+  $ETC_DIR/agent_env.sh              工作空间/ROS 路径、参数文件位置、开机自启开关（systemd 单元 source 它）
   $ETC_DIR/<agent>_params.yaml        四个 Agent 的运行期参数（不含凭据）
   $KAFKA_DIR/                         HunterCore 接入包（properties + 证书，私钥 0600）
+
+上电自启链路（需求①→④，systemd 单元按依赖顺序自动拉起）：
+  hunter-can.service   上电即启用底盘 CAN（can2 @500k，抓帧验证）；不是 root 手工敲 ip link
+  hunter-edge.service   CAN 就绪后启动 HunterEdge 整栈（Requires=hunter-can）：
+                        · data_agent     → telemetry 10Hz / health 1Hz / event 上报运营端
+                        · command_agent  → 消费平台指令，进入相应模式并回执 command_result
+                        · 定位/感知/Nav2/auto_mission → 自动驾驶准备状态（待命）
+  ota-agent.service    OTA 通知/状态（hunter.<vid>.ota_notify / ota_status）
+  remote-agent.service 远程操控（hunter.<vid>.remote_control）
 
 常见动作：
   换工作空间目录 / 换车 / 接入包重发  →  sudo bash <仓>/src/hunter_bringup/scripts/hunter_core_setup.sh --bundle <目录>
   改业务参数                        →  vi $ETC_DIR/<agent>_params.yaml && sudo systemctl restart ota-agent remote-agent
+  改自启开关（如建图模式/关闭自主导航）→  vi $ETC_DIR/agent_env.sh && sudo systemctl restart hunter-edge
+  只重启整栈（不动 Agent 服务）        →  sudo systemctl restart hunter-edge
+  看开机时序                              →  systemctl status hunter-can hunter-edge
+                                          journalctl -u hunter-can -u hunter-edge -b --no-pager
   接入不通                          →  hunter-kafka-check（看退出码：10 配置 20 证书 30 认证 40 网络 50 Topic 60 投递）
+  底盘不通                          →  sudo bash <仓>/src/hunter_bringup/scripts/hunter_can_up.sh（看退出码 2=无接口 3=无底盘帧）
   严禁                              →  把凭据写进任何 YAML、拷进仓库/镜像层、或在日志里打印口令
 EOF
 chmod 0644 "$ETC_DIR/README_agent_env"
@@ -455,25 +488,49 @@ if [ "$SELFTEST" -ne 0 ]; then
 fi
 
 # ---- ⑥ systemd ----
+# 开机时序（需求①→②）：hunter-can（底盘 CAN）→ hunter-edge（整栈/自动驾驶准备状态）
+#   → ota-agent / remote-agent（平台侧交互服务，无 CAN 依赖）
+# 单元清单与来源：
+#   hunter_bringup/systemd/{hunter-can,hunter-edge}.service   —— 上电自启链路
+#   hunter_agents/{ota_agent,remote_agent}/scripts/*.service  —— Agent 常驻服务
 if [ "$NO_SYSTEMD" -eq 0 ]; then
-  log "⑥ 安装 systemd 服务（ota-agent / remote-agent）"
-  for pkg in ota_agent remote_agent; do
-    unit="${pkg/_agent/-agent}.service"
-    unit_src="$SRC_ROOT/hunter_agents/$pkg/scripts/$unit"
-    if [ ! -f "$unit_src" ]; then
-      warn "  未找到 $unit_src，跳过"
+  log "⑥ 安装 systemd 服务（hunter-can / hunter-edge / ota-agent / remote-agent）"
+  unit_src_of() {
+    case "$1" in
+      hunter-can|hunter-edge) echo "$SRC_ROOT/hunter_bringup/systemd/$1.service" ;;
+      # ota-agent → hunter_agents/ota_agent/scripts/ota-agent.service
+      *)                      echo "$SRC_ROOT/hunter_agents/${1/-agent/_agent}/scripts/$1.service" ;;
+    esac
+  }
+  for unit in hunter-can hunter-edge ota-agent remote-agent; do
+    src_unit="$(unit_src_of "$unit")"
+    if [ ! -f "$src_unit" ]; then
+      warn "  未找到 $src_unit，跳过 $unit"
       continue
     fi
-    install -m 0644 "$unit_src" "/etc/systemd/system/$unit"
-    log "  安装 $unit"
+    install -m 0644 "$src_unit" "/etc/systemd/system/$unit.service"
+    log "  安装 $unit.service"
   done
   systemctl daemon-reload
+  # 顺序 enable：systemd 会按单元内的 Requires/After 再排一次，这里只是让现场
+  # `systemctl list-unit-files` 一眼看出依赖链
+  systemctl enable hunter-can.service
+  systemctl enable hunter-edge.service
   systemctl enable ota-agent.service remote-agent.service
-  if [ "$OFFLINE" -eq 0 ] && [ "$SELFTEST" -eq 0 ]; then
+  if [ "$OFFLINE" -eq 0 ] && [ "$SELFTEST" -eq 0 ] && [ "$NO_START" -eq 0 ]; then
+    # 先单一 CAN 服务（不是整栈）：即便后续整栈起不来，也先保证底盘通信与诊断路径可用
+    systemctl restart hunter-can.service
     systemctl restart ota-agent.service remote-agent.service
-    log "  已启动并设为开机自启（journalctl -u ota-agent -u remote-agent -f 看日志）"
+    systemctl restart hunter-edge.service
+    log "  已启动并设为开机自启"
+    log "    systemctl status hunter-can hunter-edge ota-agent remote-agent"
+    log "    journalctl -u hunter-can -u hunter-edge -b -f"
+  elif [ "$NO_START" -eq 1 ]; then
+    warn "  已 enable 但按 --no-start **不**立即启动（台架/无底盘现场用）"
+    warn "  需要时手工：sudo systemctl start hunter-can && sudo systemctl start hunter-edge"
   else
     warn "  自检未通过，已 enable 但**不**自动启动（避免坏配置反复重启刷日志）"
+    warn "  修好后：sudo systemctl start hunter-can && sudo systemctl start hunter-edge"
   fi
 else
   log "⑥ 跳过 systemd（--no-systemd）"
@@ -485,10 +542,14 @@ if grep -q '<SCRAM_PASSWORD>' "$PROPS" 2>/dev/null; then
   warn "（重跑不会把你已写入的口令抹回占位符；编译/依赖都齐时可加 --skip-deps --skip-build 只跑⑤⑥）"
 fi
 log "完成。后续步骤："
-log "  1) 启动整栈：ros2 launch hunter_bringup hunter_full.launch.py（含 data_agent + command_agent）"
-log "  2) 现场改参：vi $ETC_DIR/<agent>_params.yaml，再按 params_file 指向它启动"
-log "  3) 联调判据：平台侧该车辆 last_online_time 刷新；车端 hunter-kafka-check 退出码 0"
+log "  1) 开机自启已装好：hunter-can（CAN）→ hunter-edge（整栈/自动驾驶准备状态）"
+log "     现场核对：systemctl status hunter-can hunter-edge；journalctl -u hunter-edge -b -f"
+log "  2) 手工启动整栈（等价于开机自启那条路径）："
+log "     bash $SRC_ROOT/hunter_bringup/scripts/hunter_edge_up.sh"
+log "  3) 现场改参：vi $ETC_DIR/<agent>_params.yaml，再按 params_file 指向它启动；"
+log "     整栈开关（自动驾驶/建图/地图路径）在 $ETC_DIR/agent_env.sh，改后 sudo systemctl restart hunter-edge"
+log "  4) 联调判据：平台侧该车辆 last_online_time 刷新；车端 hunter-kafka-check 退出码 0"
 log "     （自检命令入口：新开一个 shell 后直接 hunter-kafka-check；未重登则用"
 log "       $USER_HOME/.local/bin/hunter-kafka-check 或 PYTHONPATH=$HK_SRC python3 -m hunter_kafka.diagnose）"
-log "  4) 严禁：把 $KAFKA_DIR 下任何文件拷进工作空间/版本库，或在日志中打印口令"
+log "  5) 严禁：把 $KAFKA_DIR 下任何文件拷进工作空间/版本库，或在日志中打印口令"
 exit "$SELFTEST"

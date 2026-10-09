@@ -66,8 +66,33 @@ else
   echo "  (timeout 不可用)"
 fi
 
-# 8. HunterCore 接入状态（文档 §5.6/§5.7）
-# 只查“接入包在不在、服务在不在跑”，不读 kafka.properties 内容（避免口令进日志）
+# 8. 开机自启链路（需求①→②，文档 §13.10）
+# 只查“服务在不在跑 + CAN 接口在不在”，不读 kafka.properties 内容（避免口令进日志）
+echo ""
+echo "--- 上电自启链路 ---"
+CAN_IF="${CAN_IF:-can2}"
+if ip link show "$CAN_IF" >/dev/null 2>&1; then
+  printf "  [OK]   CAN %s：%s（%s）\n" "$CAN_IF" \
+    "$(cat "/sys/class/net/$CAN_IF/operstate" 2>/dev/null || echo unknown)" \
+    "$(ip -details link show "$CAN_IF" 2>/dev/null | grep -o 'bitrate [0-9]*' | head -1)"
+  if command -v candump >/dev/null 2>&1; then
+    # 底盘反馈帧（附录 A：0x211/0x221）——只有它能证明“底盘通信真的建立”
+    if timeout 3 candump "$CAN_IF" 2>/dev/null | grep -qE '211|221'; then
+      echo "  [OK]   底盘反馈帧在发（0x211/0x221）"
+    else
+      echo "  [WARN] 3s 内未见底盘反馈帧：底盘未上电/接线/波特率（sudo bash hunter_can_up.sh 看细节）"
+    fi
+  fi
+else
+  printf "  [FAIL] 未找到 CAN 接口 %s（sudo bash hunter_can_up.sh 诊断；2=无接口 3=无底盘帧）\n" "$CAN_IF"
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  for s in hunter-can hunter-edge ota-agent remote-agent; do
+    printf "  %-16s %s\n" "$s:" "$(systemctl is-active "$s" 2>/dev/null || echo unknown)"
+  done
+fi
+
+# 9. HunterCore 接入状态（文档 §5.6/§5.7）
 echo ""
 echo "--- HunterCore 接入 ---"
 if [ -d /etc/hunter/kafka ]; then
@@ -89,13 +114,22 @@ if [ -d /etc/hunter/kafka ]; then
 else
   echo "  [FAIL] /etc/hunter/kafka 不存在：尚未部署 HunterCore 接入包"
 fi
-if command -v systemctl >/dev/null 2>&1; then
-  for s in ota-agent remote-agent; do
-    printf "  %-14s %s\n" "$s:" "$(systemctl is-active "$s" 2>/dev/null || echo unknown)"
-  done
-fi
 if command -v ros2 >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
   timeout 3 ros2 topic echo /health --once >/dev/null 2>&1 \
     && echo "  [OK]   /health 有数据（data_agent 可上报 health Topic）" \
     || echo "  [WARN] /health 无数据：health_monitor 未起或 data_agent 未订阅到"
+fi
+
+# 10. 运营端上行链路抽样（需求③：判据是平台侧 last_online_time 刷新，这里只做车端侧自证）
+echo ""
+echo "--- 运营端上行（车端侧自证）---"
+if [ -f /data/data_agent/telemetry.db ]; then
+  if command -v sqlite3 >/dev/null 2>&1; then
+    printf "  待回放缓存条数：%s（恢复后应单调降到 0；不为 0 说明链路未证实或刚断过网）\n" \
+      "$(sqlite3 /data/data_agent/telemetry.db 'select count(*) from telemetry_cache;' 2>/dev/null || echo '?')"
+  else
+    echo "  [WARN] 未装 sqlite3：无法读缓存水深（sudo apt install -y sqlite3）"
+  fi
+else
+  echo "  [WARN] /data/data_agent/telemetry.db 不存在：data_agent 未启动过（hunter-edge 是否在跑？）"
 fi

@@ -10,7 +10,9 @@ install(DIRECTORY
   urdf
   behavior_trees
   scripts
+  systemd
   DESTINATION share/${PROJECT_NAME}
+  USE_SOURCE_PERMISSIONS
 )
 
 ament_package()

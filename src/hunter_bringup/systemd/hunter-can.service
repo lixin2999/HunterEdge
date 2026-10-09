@@ -1,0 +1,30 @@
+[Unit]
+Description=HUNTER Chassis CAN Bring-up (can2 @500kbps, frame-verified)
+Documentation=file:///etc/hunter/README_agent_env
+# 车辆上电即启用底盘 CAN：USB-CAN(gs_usb) 枚举晚于内核启动，脚本内部会等待接口出现，
+# 因此不依赖任何网络；可在多用户目标达成前后尽早拉起。
+After=sysinit.target
+Wants=sysinit.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=CAN_IF=can2
+Environment=CAN_BITRATE=500000
+# 严格模式：接口 up 之外还必须抓到底盘反馈帧（0x211/0x221）才算“底盘通信已建立”。
+# 台架/无底盘联调可改成 0（或在命令行加 --no-strict）。
+Environment=CAN_REQUIRE_FRAMES=1
+EnvironmentFile=-/etc/hunter/agent_env.sh
+# 脚本定位顺序：HUNTER_CAN_UP_SCRIPT 显式指定 → install/share 安装副本 → 源码树。
+# （之所以在 bash 里解析而不是写死路径：换工作空间目录后只需改 agent_env.sh。）
+ExecStart=/bin/bash -c 'S="${HUNTER_CAN_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_can_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_can_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; [ -f "$S" ] || { echo "[hunter-can] 未找到 hunter_can_up.sh（用 HUNTER_CAN_UP_SCRIPT 指定绝对路径）" >&2; exit 1; }; exec /bin/bash "$S"'
+# 上电后 CAN 掉线（适配器松动/驱动卸载）→ systemctl reload hunter-can 重新拉起
+ExecReload=/bin/bash -c 'S="${HUNTER_CAN_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_can_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_can_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; exec /bin/bash "$S" --quick'
+TimeoutStartSec=90
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

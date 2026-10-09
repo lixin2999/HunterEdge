@@ -3,17 +3,31 @@
 #include "data_agent/data_agent.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <utility>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/statvfs.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 namespace data_agent
 {
@@ -44,6 +58,155 @@ std::string jsonEscape(const std::string & raw)
     }
   }
   return out;
+}
+
+// 契约要求 minItems:1 的整型数组（chassis.motor_rpm / motor_current / motor_temp 的
+// items 均为 **integer**；float 序列化成 45.000 会被严格的 integer 校验拒绝，
+// 故温度先取整再序列化；缺失测量以 [0] 占位，平台按“无该测量”理解）
+std::string jsonIntArrayNonEmpty(const float * data, std::size_t n)
+{
+  std::ostringstream oss;
+  oss << '[';
+  if (n == 0) {
+    oss << '0';
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    if (i > 0) {
+      oss << ',';
+    }
+    oss << static_cast<int>(std::lround(data[i]));
+  }
+  oss << ']';
+  return oss.str();
+}
+
+// 四元数 → 航向角（yaw，rad，[-π, π]）：契约 localization.heading
+double yawFromQuaternion(const geometry_msgs::msg::Quaternion & q)
+{
+  const double siny = 2.0 * (q.w * q.z + q.x * q.y);
+  const double cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+  return std::atan2(siny, cosy);
+}
+
+// 已用内存 MB（契约 system.memory_usage_mb；/proc/meminfo 的
+// MemTotal - MemAvailable，含 page cache 与共享内存的实际占用）
+int usedMemoryMb()
+{
+  std::ifstream in("/proc/meminfo");
+  if (!in.is_open()) {
+    return 0;
+  }
+  // 逐行解析（不能用 >> 连续取值：部分行无单位字段，会串行错位）
+  long total_kb = 0;
+  long avail_kb = 0;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (total_kb == 0 && line.rfind("MemTotal:", 0) == 0) {
+      total_kb = std::strtol(line.c_str() + 9, nullptr, 10);
+    } else if (avail_kb == 0 && line.rfind("MemAvailable:", 0) == 0) {
+      avail_kb = std::strtol(line.c_str() + 13, nullptr, 10);
+    }
+    if (total_kb > 0 && avail_kb > 0) {
+      break;
+    }
+  }
+  const long used_kb = total_kb - avail_kb;
+  return used_kb > 0 ? static_cast<int>(used_kb / 1024) : 0;
+}
+
+// 根分区可用空间 MB（契约 health.free_storage_mb；OTA 存储门禁 ≥2048MB 的输入）
+unsigned long long freeStorageMb()
+{
+  struct statvfs st{};
+  if (statvfs("/", &st) != 0) {
+    return 0;
+  }
+  return static_cast<unsigned long long>(st.f_bavail) *
+         static_cast<unsigned long long>(st.f_frsize) / (1024ULL * 1024ULL);
+}
+
+// 到 Kafka broker 的 TCP 建连时延（契约 system.network_latency_ms）。
+// 车端无独立网络探针，此处以“能否连通运营端 Kafka 入口 + 建连耗时”作为
+// 车-云链路时延的可观测代理；1Hz 采样（在 publishHealth 中调用），
+// 150ms 超时避免阻塞上报线程。返回 <0 表示不可达。
+double tcpConnectLatencyMs(const std::string & host, int port)
+{
+  if (host.empty() || port <= 0) {
+    return -1.0;
+  }
+  struct addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo * res = nullptr;
+  const std::string port_str = std::to_string(port);
+  if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || res == nullptr) {
+    return -1.0;
+  }
+
+  double latency = -1.0;
+  for (struct addrinfo * it = res; it != nullptr; it = it->ai_next) {
+    const int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (fd < 0) {
+      continue;
+    }
+    // 非阻塞 + 超时，避免 DNS/网络抖动卡住 10Hz 上报线程
+    const int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const int rc = connect(fd, it->ai_addr, it->ai_addrlen);
+    if (rc == 0) {
+      latency = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+      close(fd);
+      break;
+    }
+    if (errno == EINPROGRESS) {
+      struct timeval tv{};
+      tv.tv_sec = 0;
+      tv.tv_usec = 150000;   // 150ms
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      FD_SET(fd, &wfds);
+      const int sel = select(fd + 1, nullptr, &wfds, nullptr, &tv);
+      if (sel > 0) {
+        int soerr = 0;
+        socklen_t len = sizeof(soerr);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &len) == 0 && soerr == 0) {
+          latency = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+          close(fd);
+          break;
+        }
+      }
+    }
+    close(fd);
+  }
+  freeaddrinfo(res);
+  return latency;
+}
+
+// bootstrap.servers（"host1:port1,host2:port2"）→ 首个 host/port
+void parseFirstBroker(const std::string & servers, std::string & host, int & port)
+{
+  host.clear();
+  port = 0;
+  if (servers.empty()) {
+    return;
+  }
+  std::string first = servers.substr(0, servers.find(','));
+  const auto colon = first.rfind(':');
+  if (colon == std::string::npos) {
+    host = first;
+    port = 9092;
+    return;
+  }
+  host = first.substr(0, colon);
+  try {
+    port = std::stoi(first.substr(colon + 1));
+  } catch (const std::exception &) {
+    port = 9092;
+  }
 }
 
 }  // namespace
@@ -146,6 +309,9 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   event_topic_ = "hunter." + vehicle_id_ + ".event";
   health_topic_ = "hunter." + vehicle_id_ + ".health";
 
+  // 运营端入口（用于契约 system.network_latency_ms 采样；取 bootstrap 首个 broker）
+  parseFirstBroker(kafka_brokers_, broker_host_, broker_port_);
+
   // 订阅（文档 14.2.1：/chassis/state 10Hz + /chassis/feedback 50Hz→10Hz）
   chassis_sub_ = create_subscription<hunter_msgs::msg::ChassisState>(
     "/chassis/state", rclcpp::SensorDataQoS(),
@@ -190,6 +356,8 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   // 否则 rclcpp::Time 默认时钟源(RCL_SYSTEM_TIME)与 this->now()(RCL_ROS_TIME)不同，
   // detectEvents 里 now - prev_time_ 会抛 "can't subtract times with different time sources"。
   prev_time_ = this->now();
+  // 感知 FPS 统计窗口起点（契约 perception.fps）
+  perception_window_start_ = this->now();
 
   RCLCPP_INFO(get_logger(), "data_agent 启动：vehicle=%s, brokers=%s",
     vehicle_id_.c_str(), kafka_brokers_.c_str());
@@ -241,12 +409,53 @@ void DataAgent::localizationCallback(const nav_msgs::msg::Odometry::SharedPtr ms
 void DataAgent::fusedObjectsCallback(
   const hunter_msgs::msg::DetectedObjectArray::SharedPtr msg)
 {
+  // 采集契约 perception 段所需的三项（detected_objects / fps / latency_ms / object_types），
+  // 仅统计不缓存完整目标数组（文档 14.2.1：遥测为快照，不搬运点云/目标明细）
+  std::map<std::string, int> types;
+  for (const auto & obj : msg->objects) {
+    const std::string name = obj.class_name.empty() ? "other" : obj.class_name;
+    types[name] += 1;
+  }
+  fused_object_types_ = std::move(types);
   fused_object_count_ = static_cast<int>(msg->objects.size());
+
+  // FPS：单帧回调即计数，窗口满 1s 结算（契约 perception.fps）
+  fused_frames_in_window_ += 1;
+  const rclcpp::Time now = this->now();
+  const double window = (now - perception_window_start_).seconds();
+  if (window >= 1.0) {
+    perception_fps_ = static_cast<double>(fused_frames_in_window_) / window;
+    fused_frames_in_window_ = 0;
+    perception_window_start_ = now;
+  }
+
+  // 端到端延迟：帧头时间戳 → 本节点收到（传输 + 处理），负值钳到 0；
+  // 未填时间戳（stamp=0）时不做减法（否则得到 epoch 量级的假延迟）
+  if (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0) {
+    const double latency_ms = (now - rclcpp::Time(msg->header.stamp)).seconds() * 1000.0;
+    perception_latency_ms_ = latency_ms > 0.0 ? latency_ms : 0.0;
+  }
 }
 
-void DataAgent::trajectoryCallback(const hunter_msgs::msg::Trajectory::SharedPtr)
+void DataAgent::trajectoryCallback(const hunter_msgs::msg::Trajectory::SharedPtr msg)
 {
-  // 规划轨迹仅统计（文档 14.2.1），此处不缓存完整轨迹
+  // 规划段快照（契约 planning）：点数 / 累计弧长 / 计算延迟。
+  // 不缓存完整轨迹点（文档 14.2.1），只在回调内算完即弃。
+  const auto & pts = msg->points;
+  trajectory_points_ = static_cast<int>(pts.size());
+  double length = 0.0;
+  for (std::size_t i = 1; i < pts.size(); ++i) {
+    const double dx = static_cast<double>(pts[i].x) - pts[i - 1].x;
+    const double dy = static_cast<double>(pts[i].y) - pts[i - 1].y;
+    length += std::sqrt(dx * dx + dy * dy);
+  }
+  trajectory_length_ = length;
+  trajectory_received_ = true;
+
+  if (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0) {
+    const double latency_ms = (this->now() - rclcpp::Time(msg->header.stamp)).seconds() * 1000.0;
+    planning_latency_ms_ = latency_ms > 0.0 ? latency_ms : 0.0;
+  }
 }
 
 void DataAgent::controlCallback(const hunter_msgs::msg::ChassisCommand::SharedPtr msg)
@@ -286,6 +495,12 @@ void DataAgent::publishHealth()
 {
   if (vehicle_id_.empty()) {
     return;
+  }
+  // 运营端链路时延采样（契约 system.network_latency_ms）：1Hz，与 health 同频。
+  // 采样失败（不可达）保留上次有效值，避免看板出现 0 的假健康。
+  const double latency = tcpConnectLatencyMs(broker_host_, broker_port_);
+  if (latency >= 0.0) {
+    network_latency_ms_ = latency;
   }
   // health Topic 是平台侧判活（last_online_time）的主要依据，接入包契约 1Hz
   const std::string json = buildHealthJson();
@@ -329,6 +544,9 @@ void DataAgent::dr_cb(RdKafka::Message & msg)
         static_cast<unsigned long>(dr_ok_count_.load()));
     }
     kafka_connected_.store(true);
+    // 链路已证实可用 → 重新武装 communication_loss 事件（下次中断可再触发）
+    link_down_ = false;
+    comm_loss_reported_ = false;
     if (row_id >= 0) {
       sqliteDeleteRow(row_id);
     }
@@ -342,78 +560,195 @@ void DataAgent::dr_cb(RdKafka::Message & msg)
   }
 }
 
+std::string DataAgent::buildSystemSegment() const
+{
+  // 契约 system 段（telemetry 与 health 共用；字段与约束完全相同：
+  // cpu/gpu 0-100、memory_usage_mb ≥0、network_rssi ≤0、network_latency_ms ≥0）
+  const double cpu = health_received_ ? static_cast<double>(health_.cpu_usage) : 0.0;
+  const double gpu = health_received_ ? static_cast<double>(health_.gpu_usage) : 0.0;
+  const double cpu_temp = health_received_ ? static_cast<double>(health_.cpu_temp) : 0.0;
+  const double gpu_temp = health_received_ ? static_cast<double>(health_.gpu_temp) : 0.0;
+
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(2);
+  oss << "\"system\":{";
+  oss << "\"cpu_usage\":" << std::min(100.0, std::max(0.0, cpu));
+  oss << ",\"gpu_usage\":" << std::min(100.0, std::max(0.0, gpu));
+  // health_monitor 的 memory_usage 是百分比；契约要 MB → 直接读 /proc/meminfo
+  oss << ",\"memory_usage_mb\":" << usedMemoryMb();
+  oss << ",\"gpu_temp\":" << gpu_temp;
+  oss << ",\"cpu_temp\":" << cpu_temp;
+  // 本车无蜂窝/无线制式上报通道：契约要求 network_rssi ≤ 0，上报 0（无信号语义）
+  oss << ",\"network_rssi\":" << network_rssi_;
+  oss << ",\"network_latency_ms\":" << (network_latency_ms_ >= 0.0 ? network_latency_ms_ : 0.0);
+  oss << "}";
+  return oss.str();
+}
+
+std::string DataAgent::vehicleStatusForContract() const
+{
+  // health.status = 车辆 8 态业务状态（契约受控词表，不可新增/更改）。
+  // 车端可判定的子集：emergency（急停锁存）/ fault（底盘故障）/ remote_controlled（遥控）/
+  // auto_driving（自主行驶中）/ online_idle（在线待命）。
+  // upgrading / charging / offline 由平台侧状态机与超时判定（车端不臆造对平台的“离线”）。
+  if (chassis_received_) {
+    if (chassis_.vehicle_state == "ESTOP" || chassis_.control_mode == "ESTOP") {
+      return "emergency";
+    }
+    if (chassis_.vehicle_state == "FAULT" || chassis_.fault_code != 0) {
+      return "fault";
+    }
+    if (chassis_.control_mode == "REMOTE") {
+      return "remote_controlled";
+    }
+    if (std::fabs(chassis_.velocity) > 0.05) {
+      return "auto_driving";
+    }
+  }
+  return "online_idle";
+}
+
 std::string DataAgent::buildTelemetryJson()
 {
-  // 构建遥测 JSON（文档 14.2.2）
+  // ── 契约：contracts/kafka/schemas/telemetry.schema.json ─────────────────
+  // required = [vehicle_id, timestamp, seq, chassis, localization, perception,
+  //             planning, control, system]，additionalProperties=false。
+  // 平台 data-collector 消费侧以 schema_name="auto" 做契约校验：**结构不符即进 DLQ**
+  // （旧版平铺字段 velocity/pose_x/... 与契约完全不匹配 → 平台 telemetry 表 0 行，
+  //   表象为“车端发送成功、运营端永远看不到数据”，本次按契约逐段对齐）。
   std::ostringstream oss;
   oss << std::fixed << std::setprecision(3);
   oss << "{";
-  oss << "\"vehicle_id\":\"" << vehicle_id_ << "\"";
+  oss << "\"vehicle_id\":\"" << jsonEscape(vehicle_id_) << "\"";
   oss << ",\"timestamp\":" << this->now().seconds();
-  if (chassis_received_) {
-    oss << ",\"velocity\":" << chassis_.velocity;
-    oss << ",\"steering\":" << chassis_.steering_angle;
-    oss << ",\"battery_soc\":" << chassis_.battery_soc;
-    oss << ",\"control_mode\":\"" << chassis_.control_mode << "\"";
-    oss << ",\"vehicle_state\":\"" << chassis_.vehicle_state << "\"";
+  oss << ",\"seq\":" << (++seq_);
+
+  // ---- chassis（12 项，全部必填）----
+  oss << ",\"chassis\":{";
+  oss << "\"velocity\":" << (chassis_received_ ? chassis_.velocity : 0.0f);
+  oss << ",\"steering_angle\":" << (chassis_received_ ? chassis_.steering_angle : 0.0f);
+  oss << ",\"battery_voltage\":" << (chassis_received_ ? chassis_.battery_voltage : 0.0f);
+  {
+    // 契约 battery_soc 为整数 0-100（平台清洗也会裁剪，这里提前给出合法值）
+    double soc = chassis_received_ ? static_cast<double>(chassis_.battery_soc) : 0.0;
+    soc = std::min(100.0, std::max(0.0, soc));
+    oss << ",\"battery_soc\":" << static_cast<int>(soc);
   }
-  if (chassis_feedback_received_) {
-    oss << ",\"fb_velocity\":" << chassis_feedback_.velocity;
-    oss << ",\"fb_steering\":" << chassis_feedback_.steering_angle;
-  }
+  oss << ",\"battery_current\":" << (chassis_received_ ? chassis_.battery_current : 0.0f);
+  oss << ",\"battery_temp\":" << (chassis_received_ ? chassis_.battery_temperature : 0.0f);
+  oss << ",\"control_mode\":\"" << jsonEscape(chassis_received_ ? chassis_.control_mode : "") << "\"";
+  oss << ",\"vehicle_state\":\"" << jsonEscape(chassis_received_ ? chassis_.vehicle_state : "") << "\"";
+  oss << ",\"fault_code\":" << (chassis_received_ ? static_cast<int>(chassis_.fault_code) : 0);
+  // 底盘驱动当前只发布 motor_temperature（ChassisState 契约字段，.ai‑rules 禁止新增消息字段）；
+  // 契约三数组均要求 minItems:1 → 缺失项以 [0] 占位（平台按“无该测量”理解）
+  oss << ",\"motor_rpm\":[0]";
+  oss << ",\"motor_current\":[0]";
+  oss << ",\"motor_temp\":" << jsonIntArrayNonEmpty(
+    chassis_.motor_temperature.data(), chassis_.motor_temperature.size());
+  oss << "}";
+
+  // ---- localization（10 项，全部必填）----
+  oss << ",\"localization\":{";
   if (localization_received_) {
-    oss << ",\"pose_x\":" << localization_.pose.pose.position.x;
-    oss << ",\"pose_y\":" << localization_.pose.pose.position.y;
+    const auto & pose = localization_.pose.pose;
+    const auto & twist = localization_.twist.twist;
+    oss << "\"x\":" << pose.position.x;
+    oss << ",\"y\":" << pose.position.y;
+    oss << ",\"z\":" << pose.position.z;
+    // 契约 localization 的 roll/pitch/heading 为欧拉角，EKF 输出四元数 → 此处换算
+    const double roll = std::atan2(
+      2.0 * (pose.orientation.w * pose.orientation.x + pose.orientation.y * pose.orientation.z),
+      1.0 - 2.0 * (pose.orientation.x * pose.orientation.x + pose.orientation.y * pose.orientation.y));
+    const double pitch = std::asin(std::max(-1.0, std::min(1.0,
+      2.0 * (pose.orientation.w * pose.orientation.y - pose.orientation.z * pose.orientation.x))));
+    oss << ",\"roll\":" << roll;
+    oss << ",\"pitch\":" << pitch;
+    oss << ",\"heading\":" << yawFromQuaternion(pose.orientation);
+    oss << ",\"linear_velocity\":[" << twist.linear.x << "," << twist.linear.y
+        << "," << twist.linear.z << "]";
+    oss << ",\"angular_velocity\":[" << twist.angular.x << "," << twist.angular.y
+        << "," << twist.angular.z << "]";
+    // 协方差对角元 (x, yaw) → 定位健康度（契约 position_std / heading_std，均 ≥0）
+    const double pos_std = std::sqrt(std::max(0.0, static_cast<double>(localization_.pose.covariance[0])));
+    const double yaw_std = std::sqrt(std::max(0.0, static_cast<double>(localization_.pose.covariance[35])));
+    oss << ",\"position_std\":" << pos_std;
+    oss << ",\"heading_std\":" << yaw_std;
+  } else {
+    // 定位未就绪也必须给出契约结构（零位姿 + 超大 std，平台据此判“未收敛”）
+    oss << "\"x\":0,\"y\":0,\"z\":0,\"roll\":0,\"pitch\":0,\"heading\":0";
+    oss << ",\"linear_velocity\":[0,0,0],\"angular_velocity\":[0,0,0]";
+    oss << ",\"position_std\":9999,\"heading_std\":9999";
   }
-  oss << ",\"fused_object_count\":" << fused_object_count_;
-  if (control_received_) {
-    oss << ",\"target_velocity\":" << control_.target_velocity;
-    oss << ",\"target_steering\":" << control_.target_steering;
+  oss << "}";
+
+  // ---- perception（4 项，全部必填）----
+  oss << ",\"perception\":{";
+  oss << "\"detected_objects\":" << fused_object_count_;
+  oss << ",\"fps\":" << (perception_fps_ >= 0.0 ? perception_fps_ : 0.0);
+  oss << ",\"latency_ms\":" << (perception_latency_ms_ >= 0.0 ? perception_latency_ms_ : 0.0);
+  oss << ",\"object_types\":{";
+  {
+    bool first = true;
+    for (const auto & kv : fused_object_types_) {
+      if (!first) {
+        oss << ",";
+      }
+      oss << "\"" << jsonEscape(kv.first) << "\":" << kv.second;
+      first = false;
+    }
   }
-  if (health_received_) {
-    oss << ",\"overall_status\":\"" << jsonEscape(health_.overall_status) << "\"";
-    oss << ",\"cpu_usage\":" << health_.cpu_usage;
-    oss << ",\"cpu_temp\":" << health_.cpu_temp;
+  oss << "}}";
+
+  // ---- planning（4 项，全部必填）----
+  oss << ",\"planning\":{";
+  oss << "\"trajectory_length\":" << trajectory_length_;
+  oss << ",\"trajectory_points\":" << trajectory_points_;
+  oss << ",\"planning_latency_ms\":" << planning_latency_ms_;
+  // 当前行为：无独立行为话题时以底盘控制模式表示（契约 current_behavior 为自由字符串）
+  oss << ",\"current_behavior\":\""
+      << jsonEscape(chassis_received_ ? chassis_.control_mode : "") << "\"";
+  oss << "}";
+
+  // ---- control（5 项，全部必填；误差 = 目标 − 底盘反馈）----
+  oss << ",\"control\":{";
+  {
+    const double target_v = control_received_ ? static_cast<double>(control_.target_velocity) : 0.0;
+    const double target_s = control_received_ ? static_cast<double>(control_.target_steering) : 0.0;
+    const double fb_v = chassis_feedback_received_ ? static_cast<double>(chassis_feedback_.velocity) : 0.0;
+    const double fb_s = chassis_feedback_received_ ? static_cast<double>(chassis_feedback_.steering_angle) : 0.0;
+    oss << "\"target_velocity\":" << target_v;
+    oss << ",\"target_steer\":" << target_s;
+    oss << ",\"velocity_error\":" << (target_v - fb_v);
+    oss << ",\"steer_error\":" << (target_s - fb_s);
   }
+  // 控制计算延迟无独立埋点：暂以 0 上报（契约 minimum 为 0，字段必须存在）
+  oss << ",\"control_latency_ms\":0";
+  oss << "}";
+
+  // ---- system（7 项，全部必填）----
+  oss << "," << buildSystemSegment();
+
   oss << "}";
   return oss.str();
 }
 
 std::string DataAgent::buildHealthJson()
 {
-  // health Topic（接入包契约）：平台侧设备健康页与 last_online_time 数据源
+  // ── 契约：contracts/kafka/schemas/health.schema.json ────────────────────
+  // required = [vehicle_id, timestamp, status, system]；可选 gear / free_storage_mb / lat / lng。
+  // 平台 data-collector-health 据此写 Redis 读模型 vehicle:status:{id} 并回写车辆台账
+  // status/last_online_time（联调唯一判据：平台侧 last_online_time 刷新）。
   std::ostringstream oss;
   oss << std::fixed << std::setprecision(2);
   oss << "{";
   oss << "\"vehicle_id\":\"" << jsonEscape(vehicle_id_) << "\"";
   oss << ",\"timestamp\":" << this->now().seconds();
-  if (health_received_) {
-    oss << ",\"overall_status\":\"" << jsonEscape(health_.overall_status) << "\"";
-    oss << ",\"cpu_usage\":" << health_.cpu_usage;
-    oss << ",\"gpu_usage\":" << health_.gpu_usage;
-    oss << ",\"memory_usage\":" << health_.memory_usage;
-    oss << ",\"disk_usage\":" << health_.disk_usage;
-    oss << ",\"cpu_temp\":" << health_.cpu_temp;
-    oss << ",\"gpu_temp\":" << health_.gpu_temp;
-    oss << ",\"nodes\":[";
-    for (size_t i = 0; i < health_.node_names.size(); ++i) {
-      if (i > 0) {
-        oss << ",";
-      }
-      const std::string state = i < health_.node_states.size() ? health_.node_states[i] : "";
-      oss << "{\"name\":\"" << jsonEscape(health_.node_names[i])
-          << "\",\"state\":\"" << jsonEscape(state) << "\"}";
-    }
-    oss << "]";
-  } else {
-    // 不能把“health_monitor 没数据”伪造成 OK
-    oss << ",\"overall_status\":\"NO_DATA\"";
-  }
-  if (chassis_received_) {
-    oss << ",\"battery_soc\":" << chassis_.battery_soc;
-    oss << ",\"velocity\":" << chassis_.velocity;
-    oss << ",\"control_mode\":\"" << jsonEscape(chassis_.control_mode) << "\"";
-  }
+  oss << ",\"status\":\"" << vehicleStatusForContract() << "\"";
+  // free_storage_mb（G-08：OTA 存储门禁 ≥2048MB；不上报即门禁缺数据、按安全默认拒绝）
+  oss << ",\"free_storage_mb\":" << freeStorageMb();
+  // gear / lat / lng（G-08 / G-11）：当前底盘驱动未提供档位与 GPS → **不臆造**，
+  // 缺省即不上报，平台按 health.schema.json 描述的安全默认处理
+  oss << "," << buildSystemSegment();
   oss << "}";
   return oss.str();
 }
@@ -428,13 +763,28 @@ void DataAgent::detectEvents()
   const double v = std::fabs(chassis_.velocity);
   const double dt = (now - prev_time_).seconds();
 
+  // ── 契约事件（contracts/kafka/schemas/event.schema.json）─────────────────
+  // event_type ∈ 19 种受控词表、event_level ∈ {info,warning,critical}，
+  // 且 data-collector 会按 EVENT_LEVEL_BY_TYPE 做“类型↔等级”一致性校验：
+  // 等级写错 → 消费侧视为非法（本次把旧版自造名 hard_deceleration/overspeed/
+  // low_battery 与自造等级统一到契约词表，否则平台 events 表 0 行）。
   // 1. 急加速/急减速（文档 14.3：加速度 > 3.0 m/s² 持续 0.5s）
   if (dt > 0.0 && dt < 1.0) {
     const double accel = (chassis_.velocity - prev_velocity_) / dt;
     if (std::fabs(accel) > hard_accel_) {
       accel_duration_ += dt;
       if (accel_duration_ > 0.5) {
-        reportEvent(accel > 0 ? "hard_acceleration" : "hard_deceleration", "warning");
+        char data[192];
+        std::snprintf(data, sizeof(data),
+          "{\"acceleration\":%.3f,\"threshold\":%.3f,\"velocity\":%.3f}",
+          accel, hard_accel_, static_cast<double>(chassis_.velocity));
+        if (accel > 0) {
+          reportEvent("harsh_acceleration", "warning",
+            "急加速：加速度超过阈值并持续 0.5s 以上", data);
+        } else {
+          reportEvent("harsh_braking", "warning",
+            "急减速：减速度超过阈值并持续 0.5s 以上", data);
+        }
         accel_duration_ = 0.0;
       }
     } else {
@@ -446,27 +796,49 @@ void DataAgent::detectEvents()
   if (localization_received_ &&
     std::fabs(localization_.twist.twist.angular.z) > hard_turn_)
   {
-    reportEvent("hard_turn", "warning");
+    const double yaw_rate = localization_.twist.twist.angular.z;
+    char data[160];
+    std::snprintf(data, sizeof(data),
+      "{\"yaw_rate\":%.3f,\"threshold\":%.3f}", yaw_rate, hard_turn_);
+    reportEvent("harsh_turning", "warning", "急转弯：横摆角速度超过阈值", data);
   }
 
   // 3. 超速（文档 14.3：速度 > 限速 × 1.1）
   if (v > max_velocity_ * 1.1) {
-    reportEvent("overspeed", "critical");
+    char data[160];
+    std::snprintf(data, sizeof(data),
+      "{\"velocity\":%.3f,\"limit\":%.3f}", v, max_velocity_);
+    reportEvent("over_speed", "warning", "超速：车速超过限速 110%", data);
   }
 
-  // 4. 电池低电量（文档 14.3：SOC < 20%）
+  // 4. 电池低电量（文档 14.3：SOC < 20%）/ 严重低电（< 10%）
   if (chassis_.battery_soc > 0.0f && chassis_.battery_soc < min_battery_soc_) {
-    reportEvent("low_battery", "warning");
+    const double soc = static_cast<double>(chassis_.battery_soc);
+    char data[160];
+    if (soc < min_battery_soc_ / 2.0) {
+      std::snprintf(data, sizeof(data),
+        "{\"battery_soc\":%.1f,\"threshold\":%.1f}", soc, min_battery_soc_ / 2.0);
+      reportEvent("battery_critical", "critical", "电量严重不足：SOC 低于 10%", data);
+    } else {
+      std::snprintf(data, sizeof(data),
+        "{\"battery_soc\":%.1f,\"threshold\":%.1f}", soc, min_battery_soc_);
+      reportEvent("battery_low", "warning", "电量偏低：SOC 低于 20%", data);
+    }
   }
 
   // 5. 紧急制动（文档 14.3：ESTOP 触发）
   if (chassis_.vehicle_state == "ESTOP" || chassis_.control_mode == "ESTOP") {
-    reportEvent("emergency_stop", "critical");
+    reportEvent("emergency_stop", "critical",
+      "紧急制动：底盘进入 ESTOP",
+      "{\"vehicle_state\":\"" + jsonEscape(chassis_.vehicle_state) +
+      "\",\"control_mode\":\"" + jsonEscape(chassis_.control_mode) + "\"}");
   }
 
   // 6. 人工接管（文档 14.3：模式切换为 REMOTE）
   if (prev_mode_ != "REMOTE" && chassis_.control_mode == "REMOTE") {
-    reportEvent("manual_takeover", "info");
+    reportEvent("manual_takeover", "info",
+      "人工接管：驾驶模式切换为 REMOTE",
+      "{\"previous_mode\":\"" + jsonEscape(prev_mode_) + "\"}");
   }
 
   prev_velocity_ = chassis_.velocity;
@@ -474,17 +846,29 @@ void DataAgent::detectEvents()
   prev_mode_ = chassis_.control_mode;
 }
 
-void DataAgent::reportEvent(const std::string & type, const std::string & level)
+void DataAgent::reportEvent(const std::string & event_type, const std::string & event_level,
+  const std::string & description, const std::string & data_json)
 {
+  // ── 契约：contracts/kafka/schemas/event.schema.json ─────────────────────
+  // required = [vehicle_id, timestamp, event_type, event_level]，
+  // additionalProperties=false：只允许 description / data / data_file_url 三个可选项。
+  // （旧版发 {"type":..,"level":..} 与契约毫无交集 → 平台 events 表 0 行且被 DLQ 拒收）
   std::ostringstream oss;
   oss << std::fixed << std::setprecision(3);
   oss << "{\"vehicle_id\":\"" << jsonEscape(vehicle_id_) << "\"";
   oss << ",\"timestamp\":" << this->now().seconds();
-  oss << ",\"type\":\"" << jsonEscape(type) << "\"";
-  oss << ",\"level\":\"" << jsonEscape(level) << "\"}";
+  oss << ",\"event_type\":\"" << jsonEscape(event_type) << "\"";
+  oss << ",\"event_level\":\"" << jsonEscape(event_level) << "\"";
+  if (!description.empty()) {
+    oss << ",\"description\":\"" << jsonEscape(description) << "\"";
+  }
+  if (!data_json.empty()) {
+    oss << ",\"data\":" << data_json;
+  }
+  oss << "}";
   const std::string json = oss.str();
 
-  RCLCPP_WARN(get_logger(), "事件触发：%s (%s)", type.c_str(), level.c_str());
+  RCLCPP_WARN(get_logger(), "事件触发：%s (%s)", event_type.c_str(), event_level.c_str());
   if (vehicle_id_.empty()) {
     return;
   }
@@ -499,7 +883,7 @@ void DataAgent::reportEvent(const std::string & type, const std::string & level)
     sqliteCache(event_topic_, json);  // 断线时事件也缓存
   }
 
-  triggerBagRecord(type);
+  triggerBagRecord(event_type);
 }
 
 void DataAgent::triggerBagRecord(const std::string & event_type)
@@ -680,6 +1064,25 @@ bool DataAgent::kafkaProduce(
 
 void DataAgent::kafkaReconnect()
 {
+  // 车-云链路中断事件（契约 event_type=communication_loss）：
+  // 链路不可用持续 >= comm_loss_duration_（默认 10s，文档 14.3）时上报一次；
+  // 恢复（dr_cb 成功）后重新武装，可再次触发。
+  const rclcpp::Time now = this->now();
+  if (!link_down_) {
+    link_down_ = true;
+    link_down_since_ = now;
+  }
+  const double down_seconds = (now - link_down_since_).seconds();
+  if (!comm_loss_reported_ && down_seconds >= comm_loss_duration_) {
+    comm_loss_reported_ = true;
+    char data[192];
+    std::snprintf(data, sizeof(data),
+      "{\"duration_s\":%.1f,\"threshold_s\":%.1f,\"broker\":\"%s\"}",
+      down_seconds, comm_loss_duration_, jsonEscape(broker_host_).c_str());
+    reportEvent("communication_loss", "warning",
+      "车-云通信中断：Kafka 链路持续不可用", data);
+  }
+
   if (producer_ && event_producer_) {
     // librdkafka 内部自动重连（文档 14.6：指数退避 1s/2s/4s/8s，最大 30s），
     // 连通性由投递报告回调证实，此处不再直接置位 kafka_connected_

@@ -1,7 +1,7 @@
 # HunterEdge 自动驾驶车载系统 — 开发指南
 
 > **项目**：HunterEdge 自动驾驶车载系统
-> **文档版本**：V2.7（开发指南，对应软件基线 **V0.1.05**：**V0.1.05 HunterCore 车端接入全链打通**——把接入方式从“自填 YAML 参数”改为“**以平台下发的接入包为唯一可信源**”（`/etc/hunter/kafka/kafka.properties` + CA/客户端证书，`SASL_SSL + SCRAM-SHA-512` 上叠加 **mTLS**，主机名校验 `https`）；补齐 8 Topic 契约（`hunter.<vehicle_id>.<type>`）中此前沿未打通的四条断链：`health`（1Hz）、`command`/`command_result`（**新增 `command_agent` 包**）、`remote_control`（`remote_agent` 改为 Kafka 消费驱动，并修复“遥控超时后永不交还 AUTO”缺陷）；`acks` 按 Topic 分档（telemetry/health=1，event/command_result/ota_status=all）、SQLite 缓存加 `topic` 列做**三类消息统一断点续传**（投递证实才删行）、消费端**手动提交 offset**、OTA 按 `task_id` **幂等**；四份 `*_params.yaml` **凭据出仓**；新增 `hunter_kafka` 公共库（properties → librdkafka 映射）+ `hunter-kafka-check` 六层自检 CLI + `hunter_core_setup.sh` 一键部署（详见 §11.3、§7.7 与 Deployment_Guide §5.6）；上一版 V0.1.04**：V0.1.04 车端 Kafka 安全认证配置落地**——完成与数据采集分析系统对接，Broker `120.202.73.105:9093`（SASL_SSL + SCRAM-SHA-512），统一配置到 data_agent/remote_agent/ota_agent 三个模块；上一版 V0.1.03**：V0.1.03 修复「开启自主导航、刚起步车辆即停下、无法进入正常自动驾驶」**——NDT 重定位「跟踪/置信度」彻底解耦：位姿刷新只由跳变闸门 `step_ok` 决定，`fitness_hard_ceiling` 降级为仅调节对外置信度、不再冻结位姿（旧逻辑车一动 fit 越过 ceiling 即冻结 map→odom → 越走越偏 → fit 发散锁死的死亡螺旋），并将 `fitness_max 2.5→3.5`、`fitness_hard_ceiling 3.0→5.0` 容纳稀疏地图行驶期 fit 基线，仅重编 `hunter_relocalization`（根因缓解：行驶期 fit 基线偏高源于全局地图过稀，必要时重建更密地图）；上一版 V0.1.02**：《HUNTER SE 低速自动驾驶避障解决方案》逐条对表落地**——对表审计确认方案的避障主链（扫掠弧闸/REEDS_SHEPP/MPPI 4.0s/自愈四件套/BT/五级预检）**已全部在位**，本轮只补齐 5 处量化参数：① 代价地图尺度（全局 `inflation_radius 0.40→0.55`、全局 `update_frequency 2.0→1.0`、局部 `update_frequency 10.0→5.0` + 窗口 `10m→6m`，局部图算力降至 ≈1/5.6）；② 感知（`lidar_perception` 新增可配 `ground_max_slope 5.0°`、`outlier_mean_k 10→50`、`cluster_tolerance 0.5→0.15`；`sensor_fusion.vision_conf_min 0.45→0.50`）；③ `safety_guard.max_linear_vel` 默认值 `0.8→0.5`；并把 6 项**有意保留的偏差**写明理由（对照全表见 Deployment_Guide §5.5.2、避障 10 项验收见 §5.7、本节 §10.10）。上一版 V0.1.01：**health_monitor「相机崩溃/重启风暴」误报修复**——频率看门狗把 15Hz 标称帧率在系统过载下的正常抖动误判为进程崩溃（`checkNodes` 不 respawn 任何进程，仅按相机话题频率做异常-恢复边沿计数）：`camera_min_rate` 10→5Hz + 措辞去误导（“疑似崩溃/重启”→“频率异常/恢复”，逻辑与对外语义不变），重编 `hunter_monitor`，详见 release.md V0.1.01。上一版 V0.1.00：实车日志「`[FAULT] 任务已锁存（单航点导航超时连续达上限）……处置后将模式开关离开 AUTO 再切回以重启任务`」的彻底修复——`auto_mission` 任务层「**自愈四件套**」：① **逐航点失败隔离 + 自动轮转**（失败计数由「跨航点总量」下沉为「单个航点」，超时/受阻 → 放弃该点 + 清两张代价地图（重新规划）+ 改发下一个可用航点，隔离冷却 120s 后自动重试；任务级 `max_consec_failures`(12) 才兜底进 FAULT）；② **车身四周/脚底「假障碍占位」自动诊断**（`/local_costmap/costmap` × `/perception/lidar_objects` × `/perception/fused_objects`（含仅相机确认的目标）三路交叉：代价地图在车身框±35cm 内占位而两路传感器均无实体 ⇒ 判【假障碍】并自动清图，不再需要人拿 rviz2 看图）；③ **航点可达性按地图范围判定**（5/7 chamfer 净空场 + 8 邻域可通行连通域 BFS，与车位不在同一连通域 ⇒ 永久隔离该点并继续跑其他航点，按冷却周期自动复判）；④ **FAULT 由「永久锁存等人工解锁」改为自愈态**（静置 20s → 诊断 + 清图 + 全航点复判 + 三重门控 → 自动回 IDLE 重启；**遥控接管后切回 AUTO 即自动复驶**）。历史：V0.0.99（阿克曼几何参数一致性修正）、V0.0.98（safety_guard 轨迹扫掠弧碰撞闸 + MPPI 4.0s 时域 + 取消静置门控）、V0.0.97（绕障几何 + goal 世代号）、V0.0.96（航点净空校验、恢复池倒车）修复均已实车验证生效）
+> **文档版本**：V2.8（开发指南，对应软件基线 **V0.1.06**：**V0.1.06 上电自启链路 + Kafka 消息体契约对齐**——① **上电自动启用底盘 CAN**（新增 `hunter_can_up.sh` + `hunter-can.service`：等待 USB-CAN 枚举 → `can2 down / type can bitrate 500000 / up` → `candump` 抓底盘反馈帧 0x211/0x221 才算通过；退出码 2=无接口、3=无底盘帧）；② **CAN 就绪后自动启动 HunterEdge 并进入自动驾驶准备状态**（新增 `hunter_edge_up.sh` + `hunter-edge.service` + `hunter_edge.launch.py`，`Requires/After=hunter-can` 严格时序，生产默认 `use_autonomous_nav=true`）；③ **车端与运营端建立连接并按契约上传数据**——`data_agent` 上行 JSON **逐字段对齐** HunterCore `contracts/kafka/schemas/*.schema.json`（telemetry 六段嵌套 + `seq`；health 8 态 `status` + `system{}` + `free_storage_mb`；event 契约 `event_type`/`event_level`/`description`/`data`），新增 `communication_loss` 中断事件与 `system.network_latency_ms` 实测（旧版平铺字段会被平台 `schema_name="auto"` 判非法 → DLQ，这正是**运营端 0 行**的直接原因）；④ **平台自动驾驶指令 → 进入相应模式**——`command_agent` 改读契约 `command_type/timestamp/params/timeout_ms`（兼容旧 `type/issued_at/payload`）、映射 `enable_auto_driving → MISSION_START`（别名表可配），回执改为契约 `{command_id, vehicle_id, timestamp, success, result_code, message, data}`；`hunter_core_setup.sh` 步骤⑥ 扩到 4 个 systemd 单元（新增 `--no-start`）；`hunter_status.sh` 新增「上电自启链路」与「运营端上行（车端侧自证）」两段，详见 §7.8 / §7.9 / §13.10；上一版 V0.1.05：**V0.1.05 HunterCore 车端接入全链打通**——把接入方式从“自填 YAML 参数”改为“**以平台下发的接入包为唯一可信源**”（`/etc/hunter/kafka/kafka.properties` + CA/客户端证书，`SASL_SSL + SCRAM-SHA-512` 上叠加 **mTLS**，主机名校验 `https`）；补齐 8 Topic 契约（`hunter.<vehicle_id>.<type>`）中此前沿未打通的四条断链：`health`（1Hz）、`command`/`command_result`（**新增 `command_agent` 包**）、`remote_control`（`remote_agent` 改为 Kafka 消费驱动，并修复“遥控超时后永不交还 AUTO”缺陷）；`acks` 按 Topic 分档（telemetry/health=1，event/command_result/ota_status=all）、SQLite 缓存加 `topic` 列做**三类消息统一断点续传**（投递证实才删行）、消费端**手动提交 offset**、OTA 按 `task_id` **幂等**；四份 `*_params.yaml` **凭据出仓**；新增 `hunter_kafka` 公共库（properties → librdkafka 映射）+ `hunter-kafka-check` 六层自检 CLI + `hunter_core_setup.sh` 一键部署（详见 §11.3、§7.7 与 Deployment_Guide §5.6）；上一版 V0.1.04**：V0.1.04 车端 Kafka 安全认证配置落地**——完成与数据采集分析系统对接，Broker `120.202.73.105:9093`（SASL_SSL + SCRAM-SHA-512），统一配置到 data_agent/remote_agent/ota_agent 三个模块；上一版 V0.1.03**：V0.1.03 修复「开启自主导航、刚起步车辆即停下、无法进入正常自动驾驶」**——NDT 重定位「跟踪/置信度」彻底解耦：位姿刷新只由跳变闸门 `step_ok` 决定，`fitness_hard_ceiling` 降级为仅调节对外置信度、不再冻结位姿（旧逻辑车一动 fit 越过 ceiling 即冻结 map→odom → 越走越偏 → fit 发散锁死的死亡螺旋），并将 `fitness_max 2.5→3.5`、`fitness_hard_ceiling 3.0→5.0` 容纳稀疏地图行驶期 fit 基线，仅重编 `hunter_relocalization`（根因缓解：行驶期 fit 基线偏高源于全局地图过稀，必要时重建更密地图）；上一版 V0.1.02**：《HUNTER SE 低速自动驾驶避障解决方案》逐条对表落地**——对表审计确认方案的避障主链（扫掠弧闸/REEDS_SHEPP/MPPI 4.0s/自愈四件套/BT/五级预检）**已全部在位**，本轮只补齐 5 处量化参数：① 代价地图尺度（全局 `inflation_radius 0.40→0.55`、全局 `update_frequency 2.0→1.0`、局部 `update_frequency 10.0→5.0` + 窗口 `10m→6m`，局部图算力降至 ≈1/5.6）；② 感知（`lidar_perception` 新增可配 `ground_max_slope 5.0°`、`outlier_mean_k 10→50`、`cluster_tolerance 0.5→0.15`；`sensor_fusion.vision_conf_min 0.45→0.50`）；③ `safety_guard.max_linear_vel` 默认值 `0.8→0.5`；并把 6 项**有意保留的偏差**写明理由（对照全表见 Deployment_Guide §5.5.2、避障 10 项验收见 §5.7、本节 §10.10）。上一版 V0.1.01：**health_monitor「相机崩溃/重启风暴」误报修复**——频率看门狗把 15Hz 标称帧率在系统过载下的正常抖动误判为进程崩溃（`checkNodes` 不 respawn 任何进程，仅按相机话题频率做异常-恢复边沿计数）：`camera_min_rate` 10→5Hz + 措辞去误导（“疑似崩溃/重启”→“频率异常/恢复”，逻辑与对外语义不变），重编 `hunter_monitor`，详见 release.md V0.1.01。上一版 V0.1.00：实车日志「`[FAULT] 任务已锁存（单航点导航超时连续达上限）……处置后将模式开关离开 AUTO 再切回以重启任务`」的彻底修复——`auto_mission` 任务层「**自愈四件套**」：① **逐航点失败隔离 + 自动轮转**（失败计数由「跨航点总量」下沉为「单个航点」，超时/受阻 → 放弃该点 + 清两张代价地图（重新规划）+ 改发下一个可用航点，隔离冷却 120s 后自动重试；任务级 `max_consec_failures`(12) 才兜底进 FAULT）；② **车身四周/脚底「假障碍占位」自动诊断**（`/local_costmap/costmap` × `/perception/lidar_objects` × `/perception/fused_objects`（含仅相机确认的目标）三路交叉：代价地图在车身框±35cm 内占位而两路传感器均无实体 ⇒ 判【假障碍】并自动清图，不再需要人拿 rviz2 看图）；③ **航点可达性按地图范围判定**（5/7 chamfer 净空场 + 8 邻域可通行连通域 BFS，与车位不在同一连通域 ⇒ 永久隔离该点并继续跑其他航点，按冷却周期自动复判）；④ **FAULT 由「永久锁存等人工解锁」改为自愈态**（静置 20s → 诊断 + 清图 + 全航点复判 + 三重门控 → 自动回 IDLE 重启；**遥控接管后切回 AUTO 即自动复驶**）。历史：V0.0.99（阿克曼几何参数一致性修正）、V0.0.98（safety_guard 轨迹扫掠弧碰撞闸 + MPPI 4.0s 时域 + 取消静置门控）、V0.0.97（绕障几何 + goal 世代号）、V0.0.96（航点净空校验、恢复池倒车）修复均已实车验证生效）
 > **编制依据**：《自动驾驶车辆系统详细设计文档 V2.0》（下称"设计文档"）
 > **面向对象**：开发人员 / 测试与现场运维人员
 
@@ -300,6 +300,49 @@ ros2 launch hunter_bringup hunter_full.launch.py
 | `autonomous_nav_mode` | `nav` | `nav`=导航巡航模式，`mapping`=建图模式 |
 | `map_yaml_path` | `/home/agilex/HunterEdge/maps/hunter_map.yaml` | 导航模式地图 YAML 路径 |
 | `map_file_path` | `/home/agilex/HunterEdge/maps/hunter_map.pcd` | 建图模式 PCD 保存路径 |
+
+### 7.8 上电自动启动（生产运行方式，V0.1.06）→ 详见 §13.10
+
+生产现场**不再手工敲命令**：上电后由 systemd 按依赖链自动拉起，四个需求一次落地：
+
+```bash
+# 上电即自动执行（hunter-can.service → hunter-edge.service）
+#   ① 底盘 CAN：ip link set can2 down/type can bitrate 500000/up + candump 抓帧验证
+#   ② HunterEdge 整栈启动 → 车辆进入自动驾驶准备状态（定位/感知/Nav2/auto_mission 待命）
+#   ③ 车端与运营端建立连接：telemetry 10Hz / health 1Hz / event 事件即发
+#   ④ 收到平台自动驾驶指令 → 进入相应模式，并按 Kafka 消息格式回传 command_result
+
+systemctl status hunter-can hunter-edge        # 开机链路状态
+journalctl -u hunter-can -u hunter-edge -b -f  # 开机时序日志
+
+# 现场手工走同一条路径（排查用；等价于开机自启）
+bash src/hunter_bringup/scripts/hunter_edge_up.sh
+# 仅复跑 CAN 上电与抓帧验证（退出码 0/1/2/3）
+sudo bash src/hunter_bringup/scripts/hunter_can_up.sh
+
+# 建图模式上电自启：改 /etc/hunter/agent_env.sh 的 HUNTER_EDGE_NAV_MODE=mapping
+sudo systemctl restart hunter-edge
+```
+
+> ⚠ 顺序即安全：`hunter-edge.service` 用 `Requires=hunter-can.service` +
+> `After=hunter-can.service network-online.target` 声明依赖——**底盘 CAN 通信没起来，
+> 整栈不会启动**（避免把车挂到“AUTO 待命”却连不上底盘）。CAN 服务为 `Type=oneshot`
+> +`RemainAfterExit`，上电后适配器掉线可用 `sudo systemctl reload hunter-can` 重新拉起。
+
+### 7.9 平台指令接入（需求④：接收自动驾驶指令并进入相应模式，V0.1.06）
+
+平台下发到 `hunter.<vehicle_id>.command` 的指令由 `command_agent` 消费，落地仍复用既有
+ROS 服务/话题（**不新增任何话题/消息**），并按契约回执 `command_result`：
+
+| 平台 `command_type` | 车端动作（内部名） | 说明 |
+|---|---|---|
+| `enable_auto_driving` | `MISSION_START` | 契约示例（`command.schema.json` examples[0]）→ 启动自主任务，进入自动驾驶 |
+| `disable_auto_driving` | `MISSION_STOP` | 退出自动驾驶（停止自主任务） |
+| `MISSION_START` / `MISSION_STOP` / `MAP_CONVERT` / `WAYPOINT_SAVE` / `WAYPOINT_CLEAR` / `ESTOP_ENGAGE` / `ESTOP_RELEASE` / `TEST_MODE_ON` / `TEST_MODE_OFF` / `REMOTE_RELEASE` / `STATUS_QUERY` / `HEARTBEAT_ACK` | 同名 | 车端内部动作名，保持可用 |
+
+> ⚠ 平台侧 `command_type` 取值域**尚未定稿**（HunterCore 契约标 pending #17），
+> 因此映射表做成**配置**（`command_agent_params.yaml` 的 `command_type_aliases`，
+> 形态 `["平台类型=车端动作", ...]`）：定稿后只改 YAML、不动代码。
 
 ### 7.2 仅启动感知
 
@@ -830,10 +873,12 @@ chmod +x ~/HunterEdge/src/hunter_bringup/scripts/*.sh
 
 | 脚本 | 用途 |
 |------|------|
-| `hunter_status.sh` | 查看系统状态、节点存活、资源占用；**V0.1.05 新增第 8 段「HunterCore 接入」**（四件套存在性与私钥权限、systemd 服务态、`/health` 是否有数据；只查元信息不读 `kafka.properties` 内容，避免口令进日志） |
-| `hunter_core_setup.sh` | **V0.1.05 新增**：HunterCore 一键接入部署（依赖 → 接入包落盘 → 参数落盘 → 编译 → 自检 → systemd），六步幂等，可重跑（见 §7.7） |
+| `hunter_status.sh` | 查看系统状态、节点存活、资源占用；**V0.1.05 新增第 8 段「HunterCore 接入」**（四件套存在性与私钥权限、systemd 服务态、`/health` 是否有数据；只查元信息不读 `kafka.properties` 内容，避免口令进日志）；**V0.1.06 新增第 8 段「上电自启链路」**（can2 状态/波特率 + `candump` 抓底盘反馈帧、`hunter-can`/`hunter-edge`/`ota-agent`/`remote-agent` 服务态）与第 10 段「运营端上行（车端侧自证）」（SQLite 待回放缓存条数） |
+| `hunter_core_setup.sh` | **V0.1.05 新增**：HunterCore 一键接入部署（依赖 → 接入包落盘 → 参数落盘 → 编译 → 自检 → systemd），六步幂等，可重跑（见 §7.7）；**V0.1.06**：步骤⑥ 由 2 个单元扩到 4 个（`hunter-can`/`hunter-edge`/`ota-agent`/`remote-agent`）并按依赖顺序 enable+启动，新增 `--no-start`（台架只装不启） |
+| `hunter_can_up.sh` | **V0.1.06 新增**：上电自动启用底盘 CAN（等待 USB-CAN 枚举 → `ip link set can2 down/type can bitrate 500000/up` → `candump` 抓帧验证底盘反馈帧 0x211/0x221）。幂等；退出码 `0` 成功 / `1` 环境 / `2` 无接口 / `3` 无底盘帧；`--quick` 只复查接口、`--no-strict` 只要求接口 up |
+| `hunter_edge_up.sh` | **V0.1.06 新增**：HunterEdge 整栈启动包装（① CAN 复查 → ② 运营端连通性预检 `hunter-kafka-check`（失败不阻断，落 SQLite 待回放）→ ③ `ros2 launch hunter_bringup hunter_edge.launch.py` 进入自动驾驶准备状态）。供 `hunter-edge.service` 调用，也可现场手工执行 |
 | `hunter_log.sh` | 查看/导出系统日志 |
-| `hunter_can_test.sh` | CAN 通信测试 |
+| `hunter_can_test.sh` | CAN 通信测试（手动 `up/down/dump/send/test`；上电自启请用 `hunter_can_up.sh`） |
 | `hunter_bag.sh` | ROS Bag 录制/回放 |
 
 ### 12.1 系统状态
@@ -991,6 +1036,84 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 3. **指令只能走白名单，遥控超时必须交还**：未知指令一律 `REJECTED`；破坏性指令需 `confirm=true`；`remote_control` 断开后 `remote_agent` **停止发布** `/remote/command`（而非持续发零速），否则车辆不会回到 AUTO（见 §11.3）。
 4. **联调判据只看平台侧 `last_online_time`**：车端日志“发送成功”不等于平台收到；`hunter-kafka-check` 退出码 0 且平台在线时刷新才算接入完成（§7.7）。首次接入需确认已**校时**（`timedatectl`）——证书校验对系统时间极为敏感。
 
+### 13.10 上电自动启动链路（V0.1.06）
+
+> ⚠️ **【现场运维视角】** 这一节回答一个具体故障：**“车端自检全绿、平台侧却永远收不到数据”**。
+> 实测根因往往不是链路，而是两件事：① **车端根本没在跑**（上电后没人手工执行 `ip link` 与
+> `ros2 launch`）；② **消息体不符 HunterCore 契约**（平台消费侧 `schema_name="auto"` 校验不通过，
+> 直接进 DLQ，平台表 0 行）。本轮两条一起修。
+
+**一、时序（systemd 依赖链，无需人工干预）**
+
+```
+上电
+ └─ hunter-can.service        Type=oneshot + RemainAfterExit
+      · modprobe gs_usb → 等待 can2 枚举（USB-CAN 晚于内核启动）
+      · ip link set can2 down / type can bitrate 500000 / up
+      · candump can2 抓帧：必须看到底盘反馈帧 0x211/0x221 才算“底盘通信建立”
+      · 退出码：0 成功 / 2 接口始终没出现 / 3 接口 up 但无底盘帧（CAN_REQUIRE_FRAMES=1）
+ └─ hunter-edge.service     Requires=hunter-can.service，After=hunter-can.service network-online.target
+      · ExecStartPre：hunter_can_up.sh --quick（CAN 幂等复查，失败即整服务失败并重试）
+      · ExecStart：hunter_edge_up.sh
+         ① CAN 复查 → ② hunter-kafka-check（运营端预检，失败不阻断、落 SQLite 待回放）
+         → ③ ros2 launch hunter_bringup hunter_edge.launch.py
+              = 传感器/CAN 驱动 → 定位 → 感知 → Nav2/auto_mission（**自动驾驶准备状态**）
+              + data_agent（telemetry 10Hz / health 1Hz / event）
+              + command_agent（消费 command → 进入相应模式 → 回执 command_result）
+ └─ ota-agent.service / remote-agent.service   平台侧交互（与 CAN 无依赖）
+```
+
+**二、关键设计取舍（改前必读）**
+
+| 决策 | 原因 |
+|---|---|
+| CAN 复检放在**两个地方**（`hunter-can.service` + `hunter-edge.ExecStartPre`） | 上电瞬间 CAN 可能尚未枚举，单靠开机一次性 oneshot 容易“第一次就失败”；整栈启动前再复核一次，失败即由 `Restart=on-failure` 走完整时序重试 |
+| 严格模式要求**抓到底盘反馈帧** | 只看 `ip link` 的 UP 标志会把“接线错/波特率错/底盘未上电”判成成功——此时 CAN 写入静默丢弃，车辆看着像在跑却不动（最难查的一类现场故障）。台架可用 `--no-strict` / `CAN_REQUIRE_FRAMES=0` |
+| 运营端预检失败**不阻断**启动 | 断网时 `data_agent` 会把三类报文落 SQLite（`/data/data_agent/telemetry.db`），链路恢复后按序回放（至少一次）；若阻断启动，则连缓存都不会发生 |
+| 整栈启动走 `hunter_edge.launch.py`（新文件）而非直接 `hunter_full.launch.py` | 生产默认 `use_autonomous_nav=true`（自动驾驶准备状态），调试默认是 `false`；薄封装避免改动既有调试入口 |
+| `KillSignal=SIGINT` + `TimeoutStopSec=120` | ros2 launch / fast_lio2 需在退出瞬间写 PCD（建图模式）、data_agent 需 `flush` 残留消息；SIGTERM 截断会写出半截 PCD |
+| 不新增任何 ROS 话题/消息 | `.ai-rules` 第 3 条；指令落地全部复用既有服务与话题 |
+
+**三、消息体契约对齐（V0.1.06 修复；“平台 0 行”的直接原因）**
+
+`data_agent` 与 `command_agent` 的输出**逐字段对齐** HunterCore 契约
+（`contracts/kafka/schemas/*.schema.json`，`additionalProperties=false`）：
+
+| Topic | 旧（不合契约） | 新（契约） |
+|---|---|---|
+| `telemetry` | 平铺 `velocity/angle/pose_x/fused_object_count/...` | 六段嵌套 `chassis / localization / perception / planning / control / system` + `seq` |
+| `health` | `overall_status: OK\|NO_DATA` + 平铺 `cpu_usage` | `status`（8 态受控词表）+ `system{}` + `free_storage_mb` |
+| `event` | `{type: hard_deceleration\|overspeed\|low_battery, level}` | `{event_type: harsh_acceleration\|harsh_braking\|harsh_turning\|over_speed\|battery_low\|battery_critical\|emergency_stop\|manual_takeover\|communication_loss, event_level: info\|warning\|critical, description, data}` |
+| `command`（入向） | 只读 `type` / `issued_at` / `payload` | 读契约 `command_type` / `timestamp` / `params` / `timeout_ms`，**同时兼容**旧名 |
+| `command_result`（出向） | `{type,status,reason,vehicle_state,ts}` | `{command_id, vehicle_id, timestamp, success, result_code, message, data}` |
+
+> ⚠ 平台侧同一份契约也存在自身缺陷（`data-collector` 通配订阅未转正则 → 订阅到字面
+> `hunter.*.telemetry` 而永远无消息；见 HunterCore V1.18.12 修复）。**车端契约对齐是必要条件，
+> 不是充分条件**：两侧都修好，平台 `last_online_time` 与 `data_collector.vehicle_telemetry` 才会刷新。
+>
+> ⚠ 已知缺口（不臆造、不伪造）：契约 `health.gear`（OTA P 档门禁）与 `health.lat/lng`（地理围栏）
+> 需要底盘档位与 GPS 数据源，当前 `ChassisState` 消息无对应字段（`.ai-rules` 禁止新增消息字段），
+> 故**上报中缺省省略**；平台按契约描述“门禁缺数据即拒绝”的安全默认处理。
+
+**四、验收判据（缺一不可）**
+
+```bash
+# 1) 开机链路：两个服务都是 active，且 hunter-can 有抓帧成功日志
+systemctl is-active hunter-can hunter-edge ota-agent remote-agent
+journalctl -u hunter-can -b --no-pager | grep -E '底盘反馈帧|退出码'
+
+# 2) 运营端接入：退出码必须为 0（10 配置 / 20 证书 / 30 认证 / 40 网络 / 50 Topic / 60 投递）
+hunter-kafka-check; echo "exit=$?"
+
+# 3) 平台侧（唯一判据）：该车 last_online_time 刷新 + telemetry/health 有数据
+#    HunterCore 侧：
+#    docker exec hunter-postgres psql -U hunter -d hunter_core -c \
+#      "SELECT count(*), max(time) FROM data_collector.vehicle_telemetry WHERE vehicle_id='HUNTER-001';"
+
+# 4) 指令闭环：平台发 enable_auto_driving → 车端 journalctl 出 COMMAND_RESULT {... success:true}
+#    且 /auto_mission/status 进入巡航态；重复发同一 command_id → message 含 [DUPLICATE]（不重复执行）
+```
+
 ---
 
 ## 14. 文档索引
@@ -1009,5 +1132,5 @@ candump can2 -n 5                                # 期待 0x211/0x221/0x241 等�
 
 ---
 
-*HunterEdge 开发指南 · 文档版本 V2.7 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.1.05 现场实测修正（V0.0.93：方案A 定位架构重构；V0.0.94：“原地不动”残余故障链修复；V0.0.95：“无法绕开障碍物”分层修复；V0.0.96：“行驶一小段立即停下”修复；V0.0.97：阿克曼绕障几何死锁 + 过期 goal 修复；V0.0.98：safety_guard 轨迹扫掠弧碰撞闸、MPPI 4.0s 预测时域与 critic 重标定、auto_mission 取消静置门控、/scan 链降载；V0.0.99：阿克曼几何参数一致性修正（轴距 0.65→0.46、调试 launch 与生产同步）；**V0.1.00：`auto_mission` 任务层「自愈四件套」——逐航点失败隔离与自动轮转（单点超时不再锁存整条任务）、车身四周/脚底假障碍自动诊断（局部代价地图 × 激光 × 相机）、航点可达性按静态地图可通行连通域判定、FAULT 由永久锁存改自愈态（接管后切回 AUTO 即自动复驶）；新增 23 个参数，`nav2_params.yaml` `local_costmap.always_send_full_costmap: true`；不新增任何话题/消息/服务；重编 `auto_mission hunter_bringup`）；**V0.1.01：health_monitor「相机崩溃/重启风暴」误报修复——频率看门狗将 15Hz 标称帧率在系统过载下的正常抖动误判为进程崩溃（`checkNodes` 不 respawn），`camera_min_rate` 10→5Hz + `checkNodes` 措辞去误导（“疑似崩溃/重启”→“频率异常/恢复”，逻辑与对外语义不变），仅重编 `hunter_monitor`）；**V0.1.02：按《HUNTER SE 低速自动驾驶避障解决方案》逐条对表落地——审计确认避障主链（扫掠弧闸/REEDS_SHEPP/MPPI 4.0s/自愈四件套/BT/五级预检）已全部在位，本轮只补 5 处量化参数：全局 `inflation_radius 0.55` + 全局 `update_frequency 1.0` + 局部 `6m×6m @5Hz`（局部图算力 ≈1/5.6）、`lidar_perception` 新增可配 `ground_max_slope 5.0°` 与 `outlier_mean_k 50`、`cluster_tolerance 0.15`、`sensor_fusion.vision_conf_min 0.50`、`safety_guard.max_linear_vel` 默认 `0.5`；6 项有意保留偏差写明理由（§10.10 与 Deployment_Guide §5.5.2）、避障 10 项验收见 Deployment_Guide §5.7；重编 `hunter_safety hunter_bringup lidar_perception`）；**V0.1.03：修复「自主导航刚起步即停下」——NDT 重定位 `alignOnce` 跟踪/置信度彻底解耦，位姿刷新只由跳变闸门 `step_ok` 决定、`fitness_hard_ceiling` 不再冻结位姿（仅调节置信度），`fitness_max 2.5→3.5`、`fitness_hard_ceiling 3.0→5.0`，仅重编 `hunter_relocalization`）；**V0.1.04：车端 Kafka 安全认证配置落地**——Broker `120.202.73.105:9093`（`SASL_SSL + SCRAM-SHA-512`），统一配置到 data_agent/remote_agent/ota_agent 三个模块（该版凭据仍写在 YAML，**V0.1.05 已改为接入包单一可信源**）；**V0.1.05：HunterCore 车端接入全链打通**——以平台下发的接入包为唯一可信源（`/etc/hunter/kafka/kafka.properties` + CA/客户端证书，SASL_SSL 上叠加 **mTLS**、主机名校验 `https`），补齐 8 Topic 契约中此前沿未打通的四条断链：`health`(1Hz)、`command`/`command_result`（**新增 `command_agent` 包**，白名单/TTL/幂等/超时/confirm 五道护栏）、`remote_control`（`remote_agent` 改为 Kafka 消费驱动，并修复“遥控超时后永不交还 AUTO”缺陷）；`acks` 按 Topic 分档（telemetry/health=1，event/command_result/ota_status=all）、SQLite 加 `topic` 列做三类消息统一断点续传（**投递证实才删行**）、消费端**手动提交 offset**、OTA 按 `task_id` **幂等**；四份 `*_params.yaml` **凭据出仓**；新增 `hunter_kafka` 公共库 + `hunter-kafka-check` 六层自检 CLI + `hunter_core_setup.sh` 一键部署（见 §7.7 / §11.3 / §13.9 与 Deployment_Guide §5.6）；重编 `hunter_msgs hunter_kafka command_agent data_agent ota_agent remote_agent hunter_bringup`）*
+*HunterEdge 开发指南 · 文档版本 V2.8 · 编制依据《自动驾驶车辆系统详细设计文档 V2.0》，并含 V0.0.67~V0.1.06 现场实测修正（**V0.1.06：上电自启链路 + Kafka 消息体契约对齐**——新增 `hunter_can_up.sh`/`hunter_edge_up.sh`/`hunter_edge.launch.py` 与 `hunter-can`/`hunter-edge` 两个 systemd 单元，实现“上电 → 底盘 CAN（抓帧验证）→ 整栈启动 → 自动驾驶准备状态 → 运营端上报 → 平台指令进入模式并回执”的全自动链路；`data_agent` 上行 telemetry/health/event 与 `command_agent` 上下行**逐字段对齐** HunterCore `contracts/kafka/schemas/*.schema.json`（旧版平铺字段被平台判非法 → DLQ，是运营端 0 行的直接原因）；详见 §7.8 / §7.9 / §13.10 与 release.md V0.1.06；V0.0.93：方案A 定位架构重构；V0.0.94：“原地不动”残余故障链修复；V0.0.95：“无法绕开障碍物”分层修复；V0.0.96：“行驶一小段立即停下”修复；V0.0.97：阿克曼绕障几何死锁 + 过期 goal 修复；V0.0.98：safety_guard 轨迹扫掠弧碰撞闸、MPPI 4.0s 预测时域与 critic 重标定、auto_mission 取消静置门控、/scan 链降载；V0.0.99：阿克曼几何参数一致性修正（轴距 0.65→0.46、调试 launch 与生产同步）；**V0.1.00：`auto_mission` 任务层「自愈四件套」——逐航点失败隔离与自动轮转（单点超时不再锁存整条任务）、车身四周/脚底假障碍自动诊断（局部代价地图 × 激光 × 相机）、航点可达性按静态地图可通行连通域判定、FAULT 由永久锁存改自愈态（接管后切回 AUTO 即自动复驶）；新增 23 个参数，`nav2_params.yaml` `local_costmap.always_send_full_costmap: true`；不新增任何话题/消息/服务；重编 `auto_mission hunter_bringup`）；**V0.1.01：health_monitor「相机崩溃/重启风暴」误报修复——频率看门狗将 15Hz 标称帧率在系统过载下的正常抖动误判为进程崩溃（`checkNodes` 不 respawn），`camera_min_rate` 10→5Hz + `checkNodes` 措辞去误导（“疑似崩溃/重启”→“频率异常/恢复”，逻辑与对外语义不变），仅重编 `hunter_monitor`）；**V0.1.02：按《HUNTER SE 低速自动驾驶避障解决方案》逐条对表落地——审计确认避障主链（扫掠弧闸/REEDS_SHEPP/MPPI 4.0s/自愈四件套/BT/五级预检）已全部在位，本轮只补 5 处量化参数：全局 `inflation_radius 0.55` + 全局 `update_frequency 1.0` + 局部 `6m×6m @5Hz`（局部图算力 ≈1/5.6）、`lidar_perception` 新增可配 `ground_max_slope 5.0°` 与 `outlier_mean_k 50`、`cluster_tolerance 0.15`、`sensor_fusion.vision_conf_min 0.50`、`safety_guard.max_linear_vel` 默认 `0.5`；6 项有意保留偏差写明理由（§10.10 与 Deployment_Guide §5.5.2）、避障 10 项验收见 Deployment_Guide §5.7；重编 `hunter_safety hunter_bringup lidar_perception`）；**V0.1.03：修复「自主导航刚起步即停下」——NDT 重定位 `alignOnce` 跟踪/置信度彻底解耦，位姿刷新只由跳变闸门 `step_ok` 决定、`fitness_hard_ceiling` 不再冻结位姿（仅调节置信度），`fitness_max 2.5→3.5`、`fitness_hard_ceiling 3.0→5.0`，仅重编 `hunter_relocalization`）；**V0.1.04：车端 Kafka 安全认证配置落地**——Broker `120.202.73.105:9093`（`SASL_SSL + SCRAM-SHA-512`），统一配置到 data_agent/remote_agent/ota_agent 三个模块（该版凭据仍写在 YAML，**V0.1.05 已改为接入包单一可信源**）；**V0.1.05：HunterCore 车端接入全链打通**——以平台下发的接入包为唯一可信源（`/etc/hunter/kafka/kafka.properties` + CA/客户端证书，SASL_SSL 上叠加 **mTLS**、主机名校验 `https`），补齐 8 Topic 契约中此前沿未打通的四条断链：`health`(1Hz)、`command`/`command_result`（**新增 `command_agent` 包**，白名单/TTL/幂等/超时/confirm 五道护栏）、`remote_control`（`remote_agent` 改为 Kafka 消费驱动，并修复“遥控超时后永不交还 AUTO”缺陷）；`acks` 按 Topic 分档（telemetry/health=1，event/command_result/ota_status=all）、SQLite 加 `topic` 列做三类消息统一断点续传（**投递证实才删行**）、消费端**手动提交 offset**、OTA 按 `task_id` **幂等**；四份 `*_params.yaml` **凭据出仓**；新增 `hunter_kafka` 公共库 + `hunter-kafka-check` 六层自检 CLI + `hunter_core_setup.sh` 一键部署（见 §7.7 / §11.3 / §13.9 与 Deployment_Guide §5.6）；重编 `hunter_msgs hunter_kafka command_agent data_agent ota_agent remote_agent hunter_bringup`）*
 

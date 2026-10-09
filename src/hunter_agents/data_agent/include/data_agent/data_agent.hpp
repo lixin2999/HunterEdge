@@ -68,13 +68,21 @@ private:
   void sqliteReplay();                        // 断点续传：投递证实后才删行
   void sqliteDeleteRow(std::int64_t row_id);
 
-  // 事件
-  void reportEvent(const std::string & type, const std::string & level);
+  // 事件（契约 event.schema.json：event_type 19 种 / event_level 3 级）
+  void reportEvent(const std::string & event_type, const std::string & event_level,
+    const std::string & description, const std::string & data_json);
   void triggerBagRecord(const std::string & event_type);
 
-  // JSON 打包（文档 14.2.2）
+  // JSON 打包（HunterCore contracts/kafka/schemas/telemetry.schema.json、
+  // health.schema.json：**六段嵌套结构 + additionalProperties:false**，
+  // 平台 data-collector 以 schema_name="auto" 校验，字段不符即转 DLQ）
   std::string buildTelemetryJson();
   std::string buildHealthJson();
+  // 契约 system 段（遥测与 health 共用，契约明确“系统段字段与遥测完全一致”）
+  std::string buildSystemSegment() const;
+  // 契约 health.status：车辆 8 态业务状态（offline/online_idle/auto_driving/
+  // remote_controlled/upgrading/charging/fault/emergency）
+  std::string vehicleStatusForContract() const;
 
   // 参数
   std::string vehicle_id_;
@@ -140,6 +148,27 @@ private:
   bool localization_received_{false};
   bool control_received_{false};
   bool health_received_{false};
+
+  // ── HunterCore 契约上报所需的统计量（contracts/kafka/schemas/*.schema.json）──
+  std::uint64_t seq_{0};                        // 遥测序号（契约 seq：单调递增，平台幂等/丢包检测）
+  std::map<std::string, int> fused_object_types_;  // 感知按类别计数（契约 perception.object_types）
+  std::size_t fused_frames_in_window_{0};       // 感知 FPS 统计窗口内帧数
+  rclcpp::Time perception_window_start_;        // 感知 FPS 统计窗口起点
+  double perception_fps_{0.0};                  // 契约 perception.fps
+  double perception_latency_ms_{0.0};           // 契约 perception.latency_ms（帧头时间戳到本节点的时延）
+  int trajectory_points_{0};                    // 契约 planning.trajectory_points
+  double trajectory_length_{0.0};               // 契约 planning.trajectory_length（相邻点距离累加）
+  bool trajectory_received_{false};
+  double planning_latency_ms_{0.0};             // 契约 planning.planning_latency_ms
+  double network_latency_ms_{0.0};              // 契约 system.network_latency_ms（到 Kafka broker 的 TCP 建连时延，1Hz 采样）
+  int network_rssi_{0};                         // 契约 system.network_rssi（无无线制式上报 0，≤0 合规）
+  std::string broker_host_;                     // 由 bootstrap.servers 解析出的首个 broker 主机
+  int broker_port_{0};                          // 对应端口（用于 network_latency_ms 采样）
+
+  // 车-云链路中断检测（契约 event_type=communication_loss）
+  bool link_down_{false};
+  bool comm_loss_reported_{false};
+  rclcpp::Time link_down_since_;
 
   // 事件检测状态
   double prev_velocity_;

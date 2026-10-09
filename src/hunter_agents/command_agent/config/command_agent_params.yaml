@@ -3,6 +3,12 @@
 # ⚠ 安全约定：本文件**不写任何凭据**。Broker/SCRAM 用户名口令/证书路径一律来自
 #   /etc/hunter/kafka/kafka.properties（HunterCore 接入包，目录 0750 / properties 0640 / 私钥 0600，不入版本库）。
 #   kafka_fallback_* 仅供无接入包的开发机联调，生产车端必须留空。
+#
+# 字段契约（HunterCore contracts/kafka/schemas/command*.schema.json）：
+#   下行 hunter.<vid>.command        读 command_type / timestamp / params / timeout_ms
+#                                    （兼容旧名 type / issued_at / payload）
+#   上行 hunter.<vid>.command_result {command_id, vehicle_id, timestamp, success,
+#                                    result_code, message, data}（additionalProperties=false）
 command_agent:
   ros__parameters:
     # ── 车辆与 Kafka 接入源 ─────────────────────────────────────────
@@ -12,12 +18,25 @@ command_agent:
     command_group_suffix: "command"                   # 消费组 = <suffix>-<vehicle_id>
 
     # ── 指令安全护栏 ────────────────────────────────────────────────
-    command_ttl: 10.0                                 # 无 expires_at 时的时效窗口（秒），防断网重连回灌历史指令
+    command_ttl: 10.0                                 # 时效窗口（秒）：无 expires_at/timeout_ms 时使用
     service_timeout: 10.0                             # ROS 服务调用超时（秒），超时回 TIMEOUT 回执
     dedup_cache_size: 512                             # command_id 幂等去重容量（LRU）
     allow_unknown_types: false                        # 生产必须 false：未登记指令一律 REJECTED
     extra_allowed_types: []                           # 现场临时放开（仍走同一护栏链）
     static_velocity_threshold: 0.05                   # 解除急停要求的静止速度上限（m/s）
+
+    # ── 平台 command_type → 车端动作 别名表 ─────────────────────────
+    # 平台 HunterCore 契约的 command_type 取值域尚未定稿（pending #17，
+    # “禁止前端硬编码分支”），因此这里做成**配置表**：定稿后只改本文件、不动代码。
+    # 形态固定为 "平台command_type=车端动作名" 的字符串数组
+    # （rcl_yaml_param_parser 不支持嵌套 map，写成 map 会启动即参数解析失败）。
+    # 车端动作名见 command_agent.py 表头映射表：
+    #   MISSION_START / MISSION_STOP / MAP_CONVERT / WAYPOINT_SAVE / WAYPOINT_CLEAR /
+    #   ESTOP_ENGAGE / ESTOP_RELEASE / TEST_MODE_ON / TEST_MODE_OFF / REMOTE_RELEASE /
+    #   STATUS_QUERY / HEARTBEAT_ACK
+    command_type_aliases:
+      - "enable_auto_driving=MISSION_START"       # 契约示例：进入自动驾驶（需求④）
+      - "disable_auto_driving=MISSION_STOP"       # 退出自动驾驶
 
     # ── 运行节拍 ────────────────────────────────────────────────────
     poll_interval: 0.05                               # Kafka 消费轮询周期（秒）= 20Hz

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""command_agent — HunterCore 平台下行指令接入（文档 14/16 章 + 接入包 Topic 契约）。
+r"""command_agent — HunterCore 平台下行指令接入（文档 14/16 章 + 接入包 Topic 契约）。
 
 契约（HunterCore 接入包 README/kafka.properties，8 Topic/车）：
   下行 ``hunter.<vehicle_id>.command``         平台 → 车：指令
@@ -20,6 +20,20 @@
 | REMOTE_RELEASE   | /remote/command 发 control_mode="AUTO" 帧 → 交还驾驶权（文档 13.5） |
 | STATUS_QUERY     | 仅回车端状态快照，不改变任何状态                                    |
 | HEARTBEAT_ACK    | 仅回 SUCCEEDED（平台连通性探测 / last_online_time 刷新）            |
+
+**字段契约对齐（HunterCore contracts/kafka/schemas/command*.schema.json）**：
+
+- 下行信封：契约 required = `[command_id, timestamp, command_type]`，可选
+  `params` / `operator_id` / `timeout_ms` / `vehicle_id` / `target_filter`。
+  本节点读契约名 `command_type`，**同时兼容**仓内既有/平台部分服务实际使用的
+  `type`（remote-control 的 session_command 生产者）与旧字段 `issued_at` / `payload`；
+- 下行语义：契约示例 `command_type="enable_auto_driving"` → 需求④“接收到自动驾驶
+  指令后进入相应模式”，经 `DEFAULT_COMMAND_TYPE_ALIASES` 映射到车端既有动作
+  `MISSION_START`（动作落地仍是既有 ROS 服务，不新增话题/消息）；
+- 上行回执：契约 required = `[command_id, vehicle_id, timestamp, success]`，
+  可选 `result_code` / `message` / `data`，`additionalProperties=false` ——
+  旧版 `{type,status,reason,vehicle_state,ts}` 与契约零交集，平台 data-collector
+  会判非法（schema_invalid）并转 DLQ，**平台侧永远看不到指令回执**，故本轮改为契约信封。
 
 安全护栏（顺序即优先级；任一不过则**不落地执行**，只回相应状态）：
   1. 白名单：未登记 type 一律 REJECTED —— 平台侧新增指令不得在车端"默认放行"。
@@ -72,10 +86,53 @@ class Status:
     TIMEOUT = "TIMEOUT"
 
 
-# 运动类指令（急停/严重故障时拒绝）
+#: 运动类指令（急停/严重故障时拒绝）
 MOTION_COMMANDS = frozenset({"MISSION_START", "TEST_MODE_ON", "REMOTE_RELEASE"})
-# 破坏性指令（需 params.confirm=true）
+#: 破坏性指令（需 params.confirm=true）
 DESTRUCTIVE_COMMANDS = frozenset({"WAYPOINT_CLEAR"})
+
+#: 车端执行状态 → HunterCore 契约 result_code（command_result.schema.json：
+#: result_code 为字符串，"0"/SUCCESS 表示成功，其余为平台错误码表或车端自定义码）
+RESULT_CODE_BY_STATUS = {
+    Status.SUCCEEDED: "0",
+    Status.ACCEPTED: "0",
+    Status.DUPLICATE: "0",     # 幂等：同 command_id 重复投递，效果与成功一致（不重复执行）
+    Status.REJECTED: "4001",   # 车端拒绝（白名单/门禁/确认缺失）
+    Status.FAILED: "4002",     # 执行失败
+    Status.TIMEOUT: "4003",    # 车端执行超时
+    Status.EXPIRED: "4004",    # 指令过期
+}
+
+#: HunterCore 契约 command_type → 车端内部动作。
+#: ⚠ 平台侧 `command_type` 取值域**尚未定稿**（HunterCore 契约 pending #17：
+#: “取值域待设计文档 5.3 节核对，当前不设 enum”）。此处只固化两处有据可依的锚点：
+#:   ① 契约示例 `enable_auto_driving`（command.schema.json examples[0]）——
+#:      即需求④“车辆接收到自动驾驶的指令后进入相应模式”；
+#:   ② 本仓既有内部动作名（MISSION_START/MISSION_STOP/…）保持可用。
+#: 其余取值经参数 `command_type_aliases` 注入，**无需改代码**（禁止硬编码分支）。
+DEFAULT_COMMAND_TYPE_ALIASES = {
+    "enable_auto_driving": "MISSION_START",    # 进入自动驾驶（启动自主任务）
+    "disable_auto_driving": "MISSION_STOP",    # 退出自动驾驶（停止自主任务）
+}
+
+#: ROS 参数形态（rcl_yaml_param_parser 只支持标量/标量数组，嵌套 map 不可用）：
+#: 以 "平台类型=车端动作" 的字符串数组声明，解析见 _parse_type_aliases()
+DEFAULT_COMMAND_TYPE_ALIAS_LIST = [f"{k}={v}" for k, v in DEFAULT_COMMAND_TYPE_ALIASES.items()]
+
+
+def parse_type_aliases(entries: Any) -> Dict[str, str]:
+    """把 ["enable_auto_driving=MISSION_START", ...] 解析成映射；非法项忽略并告警。"""
+    aliases: Dict[str, str] = {}
+    if not entries:
+        return dict(DEFAULT_COMMAND_TYPE_ALIASES)
+    for item in entries:
+        if not isinstance(item, str) or "=" not in item:
+            continue
+        left, _, right = item.partition("=")
+        left, right = left.strip(), right.strip()
+        if left and right:
+            aliases[left] = right
+    return aliases or dict(DEFAULT_COMMAND_TYPE_ALIASES)
 
 
 class CommandAgent(Node):
@@ -98,6 +155,10 @@ class CommandAgent(Node):
         self.declare_parameter("extra_allowed_types", [])         # 现场临时放开（仍走同一护栏）
         self.declare_parameter("static_velocity_threshold", 0.05)
         self.declare_parameter("result_retry_max", 200)
+        # 契约 command_type → 车端内部动作（"平台类型=车端动作" 字符串数组；
+        # rcl_yaml_param_parser 不支持嵌套 map，故用数组形态）。
+        # 平台 command_type 取值域定稿后只改 YAML，不动代码。
+        self.declare_parameter("command_type_aliases", DEFAULT_COMMAND_TYPE_ALIAS_LIST)
         # 接入包尚未部署时的内联参数（仅开发机；生产走 properties 单一可信源）
         self.declare_parameter("kafka_fallback_brokers", "")
         self.declare_parameter("kafka_fallback_username", "")
@@ -113,6 +174,9 @@ class CommandAgent(Node):
         self._allow_unknown = bool(self.get_parameter("allow_unknown_types").value)
         self._static_thr = float(self.get_parameter("static_velocity_threshold").value)
         self._retry_max = int(self.get_parameter("result_retry_max").value)
+        # 契约 command_type 别名表（YAML 未配置时用内置锚点）
+        self._type_aliases = parse_type_aliases(
+            self.get_parameter("command_type_aliases").value)
 
         # ---------------- 车端状态缓存（门控依据）----------------
         self._lock = threading.RLock()
@@ -261,13 +325,46 @@ class CommandAgent(Node):
         self._dispatch(cmd, msg)
 
     # ------------------------------------------------------------------
+    # 契约字段归一：command.schema.json 用 command_type/timestamp/params/timeout_ms；
+    # remote-control 的 session_command 生产者仍发 type/issued_at/payload；
+    # 两者都必须能被同一套护栏与执行链处理（兼容而非二选一）。
+    # ------------------------------------------------------------------
+    def _command_type(self, cmd: Dict[str, Any]) -> str:
+        """取指令类型：契约 `command_type` 优先，回落旧名 `type`，再经别名表映射。"""
+        raw = cmd.get("command_type")
+        if not isinstance(raw, str) or not raw.strip():
+            raw = cmd.get("type")
+        if not isinstance(raw, str) or not raw.strip():
+            return ""
+        name = raw.strip()
+        return self._type_aliases.get(name, name)
+
+    @staticmethod
+    def _command_params(cmd: Dict[str, Any]) -> Dict[str, Any]:
+        """取指令参数：契约 `params` 优先，回落旧名 `payload`。"""
+        for key in ("params", "payload"):
+            value = cmd.get(key)
+            if isinstance(value, dict):
+                return value
+        return {}
+
+    def _command_issued_at(self, cmd: Dict[str, Any]) -> Optional[float]:
+        """指令签发时刻：`timestamp`（契约，自 remote-control 的 issued_at 向后兼容）。"""
+        for key in ("timestamp", "issued_at"):
+            value = cmd.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return float(value)
+        return None
+
+    # ------------------------------------------------------------------
     # 护栏链：返回 None 表示放行
     # ------------------------------------------------------------------
     def _guard(self, cmd: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        ctype = cmd.get("type")
+        ctype = self._command_type(cmd)
         cid = cmd.get("command_id")
-        if not isinstance(ctype, str) or not ctype.strip():
-            return self._result(cmd, Status.REJECTED, "缺少 type 字段")
+        if not ctype:
+            return self._result(cmd, Status.REJECTED,
+                                "缺少 command_type（契约字段）或 type 字段")
         if not cid:
             return self._result(cmd, Status.REJECTED,
                                 "缺少 command_id（车端无法做幂等去重与回执关联）")
@@ -277,7 +374,7 @@ class CommandAgent(Node):
                                 f"extra_allowed_types")
         if not self._is_fresh(cmd):
             return self._result(cmd, Status.EXPIRED,
-                                f"指令已过期（issued_at={cmd.get('issued_at')} "
+                                f"指令已过期（timestamp={self._command_issued_at(cmd)} "
                                 f"expires_at={cmd.get('expires_at')}），拒绝回灌执行")
         with self._lock:
             if cid in self._seen:
@@ -285,8 +382,8 @@ class CommandAgent(Node):
         if self._inflight is not None:
             # 上一条服务指令还没返回：不排队、不并发，让平台重试（确定性优先）
             return self._result(cmd, Status.REJECTED,
-                                f"上一条指令 {self._inflight['cmd'].get('type')} 仍在执行中")
-        params = cmd.get("params") or {}
+                                f"上一条指令 {self._command_type(self._inflight['cmd'])} 仍在执行中")
+        params = self._command_params(cmd)
         if ctype in DESTRUCTIVE_COMMANDS and params.get("confirm") is not True:
             return self._result(cmd, Status.REJECTED,
                                 f"{ctype} 需 params.confirm=true（防误清航点库）")
@@ -303,10 +400,17 @@ class CommandAgent(Node):
         exp = cmd.get("expires_at")
         if isinstance(exp, (int, float)) and exp > 0:
             return now <= float(exp)
-        issued = cmd.get("issued_at")
-        if isinstance(issued, (int, float)) and issued > 0:
-            return (now - float(issued)) <= self._ttl
-        self.get_logger().warn("指令未带 expires_at/issued_at，无法时效校验（按接收时刻放行）")
+        issued = self._command_issued_at(cmd)
+        if issued is not None:
+            # 契约的时效窗口：优先用指令自带 timeout_ms（毫秒），否则用 command_ttl（秒）。
+            # 消费组重建/断网重连可能回灌历史指令，执行几分钟前的“启动巡航”是实车事故级风险。
+            window = self._ttl
+            timeout_ms = cmd.get("timeout_ms")
+            if isinstance(timeout_ms, (int, float)) and timeout_ms > 0:
+                window = max(self._ttl, float(timeout_ms) / 1000.0)
+            return (now - issued) <= window
+        self.get_logger().warn(
+            "指令未带 timestamp/issued_at/expires_at，无法时效校验（按接收时刻放行）")
         return True
 
     def _motion_gate(self) -> Optional[str]:
@@ -325,8 +429,8 @@ class CommandAgent(Node):
     # 执行分发
     # ==================================================================
     def _dispatch(self, cmd: Dict[str, Any], msg) -> None:
-        ctype = cmd["type"]
-        params = cmd.get("params") or {}
+        ctype = self._command_type(cmd)
+        params = self._command_params(cmd)
         handler = self._immediate_handlers().get(ctype)
         if handler is not None:
             try:
@@ -444,7 +548,9 @@ class CommandAgent(Node):
         cid = cmd.get("command_id")
         if cid in self._settled:
             # 超时回执已发、服务迟到的回调又来一次：同一 command_id 只允许一条终态回执
-            self.get_logger().debug("指令 %s 已回执（%s），忽略重复终态", cid, result.get("status"))
+            self.get_logger().debug(
+                "指令 %s 已回执（%s），忽略重复终态",
+                cid, (result.get("data") or {}).get("status"))
             if msg is not None:
                 self._commit(msg)
             return
@@ -458,14 +564,26 @@ class CommandAgent(Node):
             self._commit(msg)
 
     def _result(self, cmd: Dict[str, Any], status: str, reason: str) -> Dict[str, Any]:
+        """构造 HunterCore 契约 command_result 回执（command_result.schema.json）。
+
+        required = [command_id, vehicle_id, timestamp, success]，
+        optional = [result_code, message, data]，additionalProperties=false ——
+        因此车端执行状态/指令类型等附加信息**只能放进 data**（旧版平铺 status/reason/
+        type/vehicle_state 会被平台判为非法报文 → DLQ，运营端看不到任何回执）。
+        """
+        success = status in (Status.SUCCEEDED, Status.ACCEPTED, Status.DUPLICATE)
         return {
-            "vehicle_id": self._vehicle_id,
             "command_id": cmd.get("command_id"),
-            "type": cmd.get("type"),
-            "status": status,
-            "reason": reason,
-            "vehicle_state": self._snapshot(),
-            "ts": int(time.time()),
+            "vehicle_id": self._vehicle_id,
+            "timestamp": time.time(),
+            "success": success,
+            "result_code": RESULT_CODE_BY_STATUS.get(status, "4000"),
+            "message": f"[{status}] {reason}"[:512],
+            "data": {
+                "status": status,
+                "command_type": self._command_type(cmd),
+                "vehicle": self._snapshot(),
+            },
         }
 
     def _publish_result(self, result: Dict[str, Any]) -> None:
@@ -537,8 +655,13 @@ class CommandAgent(Node):
 
     @staticmethod
     def _brief(obj: Dict[str, Any]) -> str:
-        return (f"type={obj.get('type')} id={obj.get('command_id')} "
-                f"status={obj.get('status', '')} reason={obj.get('reason', '')}")
+        """单行摘要（指令信封与回执信封共用）。"""
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        ctype = obj.get("command_type") or obj.get("type") or data.get("command_type")
+        status = data.get("status") or obj.get("status", "")
+        reason = obj.get("message") or obj.get("reason", "")
+        return (f"type={ctype} id={obj.get('command_id')} "
+                f"status={status} reason={reason}")
 
     def _estop_hold_step(self) -> None:
         if self._estop_latched:
