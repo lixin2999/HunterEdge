@@ -67,13 +67,34 @@ ROS_SETUP="${HUNTER_ROS_SETUP:-/opt/ros/humble/setup.bash}"
 # ---- ② 运营端连通性预检（不阻断：断网时车端缓存、恢复后回放）----
 if [ "$RUN_CHECK" -eq 1 ]; then
   log "② 运营端接入预检（hunter-kafka-check）"
-  if [ -x "$WS_PREFIX/lib/hunter_kafka/hunter-kafka-check" ]; then
-    CHECK="$WS_PREFIX/lib/hunter_kafka/hunter-kafka-check"
-  else
-    CHECK="$(command -v hunter-kafka-check || true)"
+  # 优先级（V0.1.06 实机教训：setuptools 入口包装在 --symlink-install 下会抛
+  # PackageNotFoundError，故入口只作最后兜底）：
+  #   ① PATH 上的命令包装（hunter_core_setup.sh 装的 /usr/local/bin 或 ~/.local/bin，
+  #      内容即 `python3 -m hunter_kafka.diagnose`，不依赖包元数据）
+  #   ② 源码方式（HUNTER_SRC_DIR 已知，永远可用）
+  #   ③ install/ 下的入口包装
+  CHECK_CMD=""
+  if command -v hunter-kafka-check >/dev/null 2>&1; then
+    CHECK_CMD="hunter-kafka-check"
+  elif [ -f "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_common/hunter_kafka/hunter_kafka/diagnose.py" ]; then
+    CHECK_CMD="SOURCE"
+  elif [ -x "$WS_PREFIX/lib/hunter_kafka/hunter-kafka-check" ]; then
+    CHECK_CMD="$WS_PREFIX/lib/hunter_kafka/hunter-kafka-check"
   fi
-  if [ -n "$CHECK" ]; then
-    if timeout 60 "$CHECK" >/tmp/hunter_edge_kafka_check.log 2>&1; then
+
+  if [ "$CHECK_CMD" = "SOURCE" ]; then
+    HK_SRC="${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_common/hunter_kafka"
+    log "   以源码方式运行自检（PYTHONPATH=$HK_SRC，不依赖包元数据）"
+    if PYTHONPATH="$HK_SRC${PYTHONPATH:+:$PYTHONPATH}" timeout 60 \
+        python3 -m hunter_kafka.diagnose >/tmp/hunter_edge_kafka_check.log 2>&1; then
+      log "   接入链路可用（自检全过）"
+    else
+      rc=$?
+      warn "   自检未全过（退出码 $rc）：10 配置 / 20 证书 / 30 认证 / 40 网络 / 50 Topic / 60 投递"
+      warn "   详见 /tmp/hunter_edge_kafka_check.log；车端会先落 SQLite 缓存，链路恢复后自动回放"
+    fi
+  elif [ -n "$CHECK_CMD" ]; then
+    if timeout 60 "$CHECK_CMD" >/tmp/hunter_edge_kafka_check.log 2>&1; then
       log "   接入链路可用（自检全过）"
     else
       rc=$?

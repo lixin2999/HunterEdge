@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""command_agent 可执行入口（**不依赖 setuptools 入口元数据**）。
+
+为什么不用 setuptools 的 console_scripts 入口（HUNTER-001 实机踩中）：
+    `colcon build --symlink-install` 对 ament_python 包按 `setup.py develop` 语义安装——
+    发行版元数据（`<pkg>.egg-info`）留在**源码目录**，靠
+    `install/<pkg>/lib/python3.x/site-packages/easy-install.pth` 把源码目录加进 sys.path；
+    而 **`.pth` 只在 site.py 处理的 site-packages 目录里生效，对 PYTHONPATH 条目无效**。
+    于是：模块能 import（site-packages 里是指向源码的符号链接），但 `importlib.metadata`
+    找不到发行版元数据 → setuptools 生成的入口包装执行 `load_entry_point(...)` 时抛
+    `PackageNotFoundError: No package metadata was found for ...`。
+    实机证据：`hunter-kafka-check`（同为入口包装）退 1 并带该 Traceback；
+    `ota-agent`/`remote-agent` 因 `Restart=on-failure` 陷入 `activating` 重启循环；
+    `command_agent` 起后即退（进程表里看不到）。
+
+因此本入口是**普通 Python 脚本**，由 setup.py 的 data_files 安装到
+`lib/<pkg>/<name>_node`（与仓库中 ament_cmake 包把可执行放进 `lib/<pkg>/` 的做法一致：
+`health_monitor` 就是这样，实机一直正常）。`ros2 launch` / systemd 直接执行该绝对路径，
+全程不需要任何发行版元数据。
+"""
+import glob
+import os
+import sys
+
+
+def _ensure_site_packages_on_path() -> None:
+    """兜底：未 source 工作空间时，把同前缀下的 site-packages 加进 sys.path。
+
+    正常路径由 `source install/setup.bash` 提供；这里只做“免 source”兜底
+    （systemd / 手工调 PATH 时环境可能没带全），失败也不抛出——交给下面的 import 报错。
+    """
+    here = os.path.dirname(os.path.realpath(__file__))       # <prefix>/lib/<pkg>
+    prefix = os.path.dirname(os.path.dirname(here))          # <prefix>
+    for path in glob.glob(os.path.join(prefix, 'lib', 'python3.*', 'site-packages')):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+
+def main() -> int:
+    _ensure_site_packages_on_path()
+    # 延迟导入：先补齐 sys.path 再导入本包模块
+    from command_agent.command_agent import main as entry    # noqa: PLC0415
+
+    return entry()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

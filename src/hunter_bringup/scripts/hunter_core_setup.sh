@@ -435,6 +435,17 @@ else
   log "④ 跳过编译（--skip-build）"
 fi
 
+# ---- ④.1 可执行位自愈（脚本与三个 Agent 的入口）----
+# git 在 Linux 上按索引 mode 恢复 +x，但 Windows 侧编辑/传输可能丢位；
+# 这里统一兜一次，避免现场 `./hunter_status.sh: Permission denied`，
+# 或 `ros2 launch` / systemd 找不到 lib/<pkg>/<pkg>_node。
+chmod 0755 "$SRC_ROOT"/hunter_bringup/scripts/*.sh 2>/dev/null || true
+for _pkg in command_agent ota_agent remote_agent; do
+  _node="$SRC_ROOT/hunter_agents/$_pkg/scripts/${_pkg}_node"
+  [ -f "$_node" ] && chmod 0755 "$_node"
+done
+log "④.1 已收敛可执行位（hunter_bringup/scripts/*.sh 与三个 Agent 的 *_node 入口）"
+
 # ---- ⑤ 自检 ----
 # 能离线判定的失败原因（口令占位、证书 CN 与 vehicle_id 不符、时间漂移、
 # 私钥权限、broker 不可达、Topic 缺失）一次跑完，不依赖 ROS 环境
@@ -444,12 +455,10 @@ for _cand in "$WS_DIR/install/hunter_kafka/bin/hunter-kafka-check" \
   [ -x "$_cand" ] && { CHECK_BIN="$_cand"; break; }
 done
 # ament_python 的 console_script 落在 bin/ 还是 lib/<pkg>/ 取决于安装布局，别赌路径：
-# 激活工作空间后用 command -v 兜底（这也是现场手写命令时最稳的入口）
+# 激活工作空间后用 command -v 兜底
 if [ -z "$CHECK_BIN" ] && [ -f "$WS_DIR/install/setup.bash" ]; then
   CHECK_BIN="$(bash -c "source '$WS_DIR/install/setup.bash' >/dev/null 2>&1; command -v hunter-kafka-check" || true)"
 fi
-# 还找不到就扫盘：--symlink-install 下 easy_install 可能把入口放到**运行用户**的 ~/.local/bin，
-# 而本脚本正以 root 跑，root 的 PATH 里没有它（旧写法只盯 bin/，会退化成源码跑）
 if [ -z "$CHECK_BIN" ]; then
   CHECK_BIN="$(find "$WS_DIR/install" "$USER_HOME/.local/bin" -maxdepth 4 -type f -name hunter-kafka-check -perm -u+x 2>/dev/null | sort | head -n1 || true)"
 fi
@@ -457,61 +466,75 @@ CHECK_ARGS=(--properties "$PROPS" --bundle-dir "$KAFKA_DIR")
 if [ "$OFFLINE" -eq 1 ]; then
   CHECK_ARGS+=(--offline)
 fi
-# 入口脚本是 setuptools 生成的 load_entry_point 包装，运行时需要**包元数据**在 sys.path
-# 上可发现；--symlink-install（develop 布局）把元数据留在源码目录与包内 site-packages，
-# 而 root 的 PYTHONPATH 里没有它们 → 直接执行会抛 PackageNotFoundError 并以退出码 1 结束
-# （那是解释器报错，不是自检结论）。因此手动把两处补上，并对退出码 1 退回源码跑法。
+
+# 【为什么优先源码方式（V0.1.06 实机教训）】`--symlink-install` 对 ament_python 走
+# `setup.py develop` 语义：发行版元数据（`<pkg>.egg-info`）留在**源码目录**，靠
+# `install/<pkg>/lib/python3.x/site-packages/easy-install.pth` 把源码目录加进 sys.path；
+# 而 **`.pth` 只在 site.py 处理的 site-packages 目录里生效，对 PYTHONPATH 条目无效**。
+# 因此 setuptools 生成的入口包装（含 `install/hunter_kafka/lib/hunter_kafka/hunter-kafka-check`）
+# 执行 `load_entry_point(...)` 时必抛 `PackageNotFoundError: No package metadata was found for hunter-kafka`
+# （实机 Traceback 已确认；同一根因也让 ota-agent/remote-agent 陷入 activating 重启循环、
+#   command_agent 起后即退 —— 三个 Python Agent 已改走 `lib/<pkg>/<pkg>_node` 普通脚本入口）。
+# 自检同理：**源码方式（`python3 -m hunter_kafka.diagnose`）永远可用，作为首选**；
+# 入口包装仅在源码包缺失时兜底。
 HK_SRC="$SRC_ROOT/hunter_common/hunter_kafka"
 HK_SITE="$(ls -d "$WS_DIR"/install/hunter_kafka/lib/python3.*/site-packages 2>/dev/null | head -n1 || true)"
 HK_PY="$HK_SRC${HK_SITE:+:$HK_SITE}${PYTHONPATH:+:$PYTHONPATH}"
-# 【为何需要命令包装（实机反馈）】ament 只把 <prefix>/bin 加进 PATH，而 ament_python 的
-# console_script 装在 <prefix>/lib/<pkg>/ 下 → **source install/setup.bash 后仍然
-# “hunter-kafka-check: command not found”（退 127）**；直接拿绝对路径跑又撞上上面的
-# 包元数据问题。所以下面给运行用户装一个不依赖包元数据的命令包装。
+run_check_source() {   # 源码方式跑自检：不依赖包元数据，永远可用的路径
+  PYTHONPATH="$HK_PY" python3 -m hunter_kafka.diagnose "${CHECK_ARGS[@]}" || SELFTEST=$?
+}
+# 命令包装：给运行用户装 ~/.local/bin（新 shell 直接可用），
+# 同时装 /usr/local/bin（root，**无需重登**就有命令：现场反馈“跑完脚本 hunter-kafka-check 仍 127”）
 install_check_wrapper() {
-  local w="$USER_HOME/.local/bin/hunter-kafka-check" marker="由 hunter_core_setup.sh 生成"
-  if [ -e "$w" ] && ! grep -qF "$marker" "$w" 2>/dev/null; then
-    warn "  $w 已存在且不是本脚本生成，不覆盖（自己改）"
-    return 0
-  fi
-  install -d -m 0755 -o "$RUN_USER" -g "$RUN_GROUP" "$USER_HOME/.local/bin" || { warn "  建不了 $USER_HOME/.local/bin，跳过包装"; return 0; }
-  cat > "$w" <<EOF
+  local marker="由 hunter_core_setup.sh 生成" w body
+  body="$(cat <<EOF
 #!/usr/bin/env bash
 # $marker —— 直接走模块方式，不依赖包元数据，也不管入口被装到哪个目录
 # 工作空间：$WS_DIR
 export PYTHONPATH="$HK_SRC\${PYTHONPATH:+:\$PYTHONPATH}"
 exec python3 -m hunter_kafka.diagnose "\$@"
 EOF
-  chmod 0755 "$w"
-  chown "$RUN_USER:$RUN_GROUP" "$w"
-  log "  已安装命令包装：$w（新开一个 shell 就能直接敲 hunter-kafka-check）"
+)"
+  # ① 运行用户家目录（推荐；随用户走）
+  w="$USER_HOME/.local/bin/hunter-kafka-check"
+  if [ ! -e "$w" ] || grep -qF "$marker" "$w" 2>/dev/null; then
+    if install -d -m 0755 -o "$RUN_USER" -g "$RUN_GROUP" "$USER_HOME/.local/bin"; then
+      printf '%s\n' "$body" > "$w"
+      chmod 0755 "$w"; chown "$RUN_USER:$RUN_GROUP" "$w"
+      log "  已安装命令包装：$w"
+    else
+      warn "  建不了 $USER_HOME/.local/bin，跳过家目录包装"
+    fi
+  else
+    warn "  $w 已存在且不是本脚本生成，不覆盖（自己改）"
+  fi
+  # ② /usr/local/bin（在默认 PATH 上，登录与否都能敲）
+  w="/usr/local/bin/hunter-kafka-check"
+  if [ ! -e "$w" ] || grep -qF "$marker" "$w" 2>/dev/null; then
+    printf '%s\n' "$body" > "$w" && chmod 0755 "$w" \
+      && log "  已安装系统级命令包装：$w（当前 shell 直接可用，无需重登）" \
+      || warn "  写不了 $w（跳过；用家目录包装或源码方式）"
+  else
+    warn "  $w 已存在且不是本脚本生成，不覆盖（自己改）"
+  fi
 }
 install_check_wrapper
-run_check_source() {   # 源码方式跑自检：不依赖包元数据，作为永远可用的兜底
-  PYTHONPATH="$HK_PY" python3 -m hunter_kafka.diagnose "${CHECK_ARGS[@]}" || SELFTEST=$?
-}
+
 SELFTEST=0
-if [ -n "$CHECK_BIN" ]; then
-  log "⑤ 自检：$CHECK_BIN（配置/证书/机制/网络/认证/Topic/投递）"
-  env PYTHONPATH="$HK_PY" "$CHECK_BIN" "${CHECK_ARGS[@]}" || SELFTEST=$?
-  # diagnose 的正常退出码只有 0/10/20/30/40/50/60，出现 1 即入口本身没跑起来
-  if [ "$SELFTEST" -eq 1 ]; then
-    warn "  入口脚本自身启动失败（退出码 1，多为包元数据不在当前 PYTHONPATH 里）；本次改走源码方式续跑"
-    SELFTEST=0
-    run_check_source
-  fi
-elif [ -f "$HK_SRC/hunter_kafka/diagnose.py" ]; then
-  # 入口没扫到（或 --skip-build 未编译）时走源码方式。confluent_kafka 在 client.py 里是
-  # **惰性导入**，缺它只影响第 6/7 层（SASL 握手与投递），前 5 层结论照样拿得到
-  log "⑤ 自检：以源码方式运行 hunter-kafka-check（install/ 与 ~/.local/bin 均未扫到入口）"
+if [ -f "$HK_SRC/hunter_kafka/diagnose.py" ]; then
+  log "⑤ 自检：源码方式运行 hunter-kafka-check（配置/证书/机制/网络/认证/Topic/投递）"
+  # confluent_kafka 在 client.py 里是**惰性导入**，缺它只影响第 6/7 层（SASL 握手与投递），
+  # 前 5 层结论照样拿得到
   python3 -c "from confluent_kafka.admin import AdminClient" 2>/dev/null \
     || warn "  confluent-kafka 缺失或过旧（无 admin.AdminClient）：第 6/7 层会挂（sudo pip3 install -U confluent-kafka 补齐），前 5 层结论仍有效"
   run_check_source
+elif [ -n "$CHECK_BIN" ]; then
+  log "⑤ 自检：$CHECK_BIN（源码包缺失，改走安装的入口；若抛 PackageNotFoundError 属已知元数据问题）"
+  env PYTHONPATH="$HK_PY" "$CHECK_BIN" "${CHECK_ARGS[@]}" || SELFTEST=$?
 else
   warn "⑤ 既没扫到自检入口、也缺源码包 src/hunter_common/hunter_kafka，跳过自检"
 fi
 if [ "$SELFTEST" -eq 1 ]; then
-  # 自检自己的退出码不会是 1（只可能是 0/10/20/30/40/50/60），因此 1 = 解释器层报错
   warn "⑤ 自检未真正执行（退出码 1 不是链路结论，是 Python 报错）：手工复现看 Traceback："
   warn "    PYTHONPATH=$HK_SRC python3 -m hunter_kafka.diagnose ${CHECK_ARGS[*]}"
 fi

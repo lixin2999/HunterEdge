@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ota_agent 可执行入口（**不依赖 setuptools 入口元数据**）。
+
+背景与 `command_agent/scripts/command_agent_node` 完全相同：`--symlink-install` 下
+setuptools 入口包装会因找不到发行版元数据（`easy-install.pth` 在 PYTHONPATH 下不生效）
+而抛 `PackageNotFoundError`；HUNTER-001 实机上 ota-agent 因此陷入
+`activating`（`Restart=on-failure`）重启循环。
+
+本脚本是普通 Python 脚本，由 setup.py 的 data_files 装到 `lib/ota_agent/ota_agent_node`，
+systemd 直接用绝对路径执行。命令行参数（`--config <yaml>`）原样透传给模块内的 argparse。
+"""
+import glob
+import os
+import sys
+
+
+def _ensure_site_packages_on_path() -> None:
+    """兜底：未 source 工作空间时，把同前缀下的 site-packages 加进 sys.path。"""
+    here = os.path.dirname(os.path.realpath(__file__))       # <prefix>/lib/<pkg>
+    prefix = os.path.dirname(os.path.dirname(here))          # <prefix>
+    for path in glob.glob(os.path.join(prefix, 'lib', 'python3.*', 'site-packages')):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+
+def main() -> int:
+    _ensure_site_packages_on_path()
+    from ota_agent.ota_agent import main as entry            # noqa: PLC0415
+
+    entry()          # 模块内 argparse 读 sys.argv（含 --config）
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
