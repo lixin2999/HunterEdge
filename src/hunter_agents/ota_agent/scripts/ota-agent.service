@@ -1,7 +1,9 @@
 [Unit]
 Description=HUNTER OTA Upgrade Agent (HunterCore Kafka: ota_notify / ota_status)
 Documentation=file:///etc/hunter/README_agent_env
-After=network-online.target
+# V0.1.12：排序上 hunter-can 先起，避免开机自检时 can2 接口未就绪而首次 candump 抓不到 0x211。
+# 不使 Requires（OTA 本身不依赖 CAN，只是自检阶段需要）；_can_ok 已同时改为 3× 2s 重试。
+After=network-online.target hunter-can.service
 Wants=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=10

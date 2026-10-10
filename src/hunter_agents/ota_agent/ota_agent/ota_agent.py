@@ -404,6 +404,52 @@ class OtaAgent:
     # ------------------------------------------------------------------
     # 自检与回滚（文档 12.4.5 / 12.5）
     # ------------------------------------------------------------------
+    # ---- pending_selftest 标记（V0.1.12 新增）---------------------
+    # 旧行为："开机就自检" → 无升级时也会因 version 文件不存在 / ROS daemon 未起 /
+    # 单次 candump 未采到 0x211 而进 rollback 分支，报"无可用备份、回滚失败 → ROLLBACK"。
+    # HUNTER-001 现场日志 09:39:40 / 09:52:11 连续复现。新行为：仅当升级包写入标记后，
+    # 下一次开机才走自检+回滚；无标记则"普通开机"，一行 log 即返 IDLE。
+    def _pending_marker_path(self):
+        return self.config.get(
+            "pending_marker_file", "/data/ota/.pending_selftest.json")
+
+    def _write_pending_marker(self, task_id, target_version):
+        """安装成功后、进入 TEST 阶段前写入；下次开机自检才能定位 task_id 与目标版本。"""
+        if not self.config.get("use_pending_marker", True):
+            return
+        path = self._pending_marker_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"task_id": task_id,
+                           "target_version": target_version,
+                           "written_at": int(time.time())},
+                          fh, ensure_ascii=False)
+            logger.info("pending_selftest 标记已写入：%s (task_id=%s, target=%s)",
+                        path, task_id, target_version)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pending_selftest 标记写入失败：%s（下次开机将回旧行为，可能伪报 ROLLBACK）", exc)
+
+    def _read_pending_marker(self):
+        path = self._pending_marker_path()
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pending_selftest 标记读取异常（视为普通开机）：%s", exc)
+            return None
+
+    def _clear_pending_marker(self):
+        path = self._pending_marker_path()
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                logger.info("pending_selftest 标记已清除：%s", path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pending_selftest 标记清除失败：%s（下次开机仍会自检一次）", exc)
+
     def _load_manifest(self):
         with tarfile.open(self.downloaded_file) as tf:
             member = tf.getmember("manifest.json")
@@ -430,20 +476,49 @@ class OtaAgent:
         except Exception:
             return False
 
-    def _can_ok(self):
-        try:
-            out = subprocess.run(["timeout", "1", "candump", "can2", "-n", "1"],
-                                 capture_output=True, text=True)
-            return "211" in out.stdout
-        except Exception:
-            return True  # 无 candump 工具时降级
+    def _can_ok(self, attempts: int = 3, per_try_sec: int = 2):
+        """CAN 自检（V0.1.12 加固）：hunter-can 接口拉起 + 首帧 0x211 上报需时间，
+        旧写法 `timeout 1 candump can2 -n 1` 单次 1s 窗口在开机时几乎必假阴；
+        改为 3 次 × 2s（中间 0.5s 休息）。无 candump 工具时仍降级回 True（保留旧行为）。
+        """
+        for i in range(attempts):
+            try:
+                out = subprocess.run(
+                    ["timeout", str(per_try_sec), "candump", "can2", "-n", "1"],
+                    capture_output=True, text=True,
+                    timeout=per_try_sec + 1)
+            except FileNotFoundError:
+                return True  # 无 candump 工具时降级
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("  candump 异常（第 %d/%d 次）：%s", i + 1, attempts, exc)
+                out = None
+            if out is not None and "211" in (out.stdout or ""):
+                if i > 0:
+                    logger.info("  CAN 自检第 %d 次通过", i + 1)
+                return True
+            time.sleep(0.5)
+        logger.warning("  CAN 自检连续 %d 次未采到 0x211（确认 hunter-can.service 已 active、can2 接口存在）",
+                       attempts)
+        return False
 
     def _version_ok(self):
+        """升级后的版本校验：优先用 pending 标记里的 target_version（自检阶段 self.task 常为 None）；
+        无任务、无标记时直接 True（不拦普通开机）。"""
+        expected = ""
+        if self.task:
+            expected = self.task.get("version", "")
+        if not expected:
+            marker = self._read_pending_marker()
+            if marker:
+                expected = marker.get("target_version", "")
+        if not expected:
+            return True
         try:
             with open(self.config.get("version_file", "/opt/hunter/version"), "r") as f:
-                return f.read().strip() == self.task.get("version", "")
+                return f.read().strip() == expected
         except Exception:
-            return True
+            # 未接升级任务且无 version 文件属正常（开发机 / 初次部署）；有目标期望时才作硬判断
+            return not bool(expected)
 
     def rollback(self):
         """从备份恢复（文档 12.5：备份恢复方案）"""
@@ -469,15 +544,37 @@ class OtaAgent:
         self._init_kafka()
         logger.info("OTA Agent 启动，当前版本 %s", self.config["current_version"])
 
-        # 启动自检（重启后，文档 12.4.5）
+        # 启动自检（V0.1.12：仅当存在 pending_selftest 标记时才走 rollback 分支）
+        # 旧行为下"普通开机"也会伪报 ROLLBACK，原因见上方法区注释。
+        # 保留 `use_pending_marker=false` 时兼容旧语义（回退到"无任务也自检"）。
         if self.config.get("self_test_on_start", True):
-            self.state = OTAState.TEST
-            if self.self_test():
-                self.report_status("SUCCESS", "启动自检通过")
+            marker = self._read_pending_marker()
+            use_marker = self.config.get("use_pending_marker", True)
+            if use_marker and not marker:
+                logger.info("启动自检：无 pending_selftest 标记 → 普通开机，跳过（避免伪报 ROLLBACK）")
             else:
-                self.rollback()
-                self.report_status("ROLLBACK", "启动自检失败，已回滚")
-            self.state = OTAState.IDLE
+                self.state = OTAState.TEST
+                # 自检前先把 task 指向标记中的 task_id，保证 report_status 带契约必填字段
+                if marker and marker.get("task_id"):
+                    self.task = {"task_id": marker["task_id"],
+                                 "version": marker.get("target_version", "")}
+                passed = self.self_test()
+                task_id = (marker or {}).get("task_id")
+                if passed:
+                    logger.info("启动自检通过（task_id=%s）", task_id or "-")
+                    if task_id:
+                        self.report_status("SUCCESS", "启动自检通过")
+                        self._mark_task(task_id, "SUCCESS")
+                else:
+                    self.rollback()
+                    if task_id:
+                        self.report_status("ROLLBACK", "启动自检失败，已回滚")
+                        self._mark_task(task_id, "ROLLBACK")
+                    else:
+                        self.report_status("ROLLBACK", "启动自检失败（无 task_id，仅本地）")
+                self._clear_pending_marker()
+                self.task = None
+                self.state = OTAState.IDLE
 
         while True:
             notify, msg = self.receive_notify()
@@ -547,7 +644,7 @@ class OtaAgent:
             self._finish_task(task_id, "FAILED", "RSA 签名校验失败")
             return
 
-        # 备份 + 安装（文档 12.4.4/12.5）
+        # 备份 + 安装（文档 12.4.4 / 12.5）
         self.backup()
         self.state = OTAState.INSTALL
         self.report_status("INSTALL", "开始安装")
@@ -557,7 +654,11 @@ class OtaAgent:
             self.rollback()
             self._finish_task(task_id, "ROLLBACK", f"安装失败: {e}")
             return
-
+        
+        # V0.1.12：安装成功后先写 pending_selftest 标记（下一次开机 run() 里才走自检+回滚）；
+        # 没写标记时普通开机不会伪报 ROLLBACK。写在 TEST 上报之前，避免上报途中断电丢标记。
+        self._write_pending_marker(task_id, manifest.get("version", ""))
+        
         # 自检（文档 12.4.5）：生产环境安装后重启，由启动自检判定
         self.state = OTAState.TEST
         self.report_status("TEST", "安装完成，等待重启自检")
@@ -609,6 +710,10 @@ DEFAULT_CONFIG = {
     "min_free_space_gb": 2.0,
     "platform_host": "192.168.31.35",
     "self_test_on_start": True,
+    # V0.1.12：无升级任务时不伪跑自检；仅当 pending 标记存在才进 rollback 分支。
+    # 写false 可回旧行为（无标记也自检），不推荐。
+    "use_pending_marker": True,
+    "pending_marker_file": "/data/ota/.pending_selftest.json",
     "backup_paths": ["/opt/hunter/install"],
 }
 

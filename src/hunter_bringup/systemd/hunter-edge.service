@@ -27,10 +27,18 @@ ExecStart=/bin/bash -c 'S="${HUNTER_EDGE_UP_SCRIPT:-}"; if [ -z "$S" ]; then for
 TimeoutStartSec=180
 Restart=on-failure
 RestartSec=10
-# 退出宽限：fast_lio2 需在退出瞬间写 PCD（建图模式），data_agent 需 flush 残留消息
-TimeoutStopSec=120
+# 退出宽限（V0.1.12 下调）：fast_lio2 建图模式写 PCD + data_agent flush 残留消息一般 < 30s；
+# 旧值 120s 叠 KillMode=mixed 会先 SIGINT 主进程、等满后再 SIGKILL 到全组，残留一堆 root
+# 属主的 /dev/shm/fastrtps_* 段与 sem.fastrtps_*，拖坑下一次开机。30s 够日常、够 PCD 写入。
+TimeoutStopSec=60
 KillSignal=SIGINT
-KillMode=mixed
+# V0.1.12：mixed → control-group（SIGINT 同时下发到整组，launch 与子 ROS 节点一起走
+# finally；避免旧模式下主进程先退、子进程等 SIGKILL 时 DDS Participant 来不及销毁）。
+KillMode=control-group
+# V0.1.12 新增：无论正常退出还是 SIGKILL 后，都主动清一下残留的 SHM 段/信号量，
+# 避免 root 属主文件卡住 agilex 侧的 sem_open(O_RDWR)。CycloneDDS 默认不建 SHM，
+# 属保险起见的兑底；兼容 FastDDS 回退时同样有效。
+ExecStopPost=/bin/bash -c 'rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* /dev/shm/CycloneDDS.* /dev/shm/sem.CycloneDDS.* 2>/dev/null || true'
 LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal

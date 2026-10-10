@@ -25,4 +25,12 @@ ota_agent:
     min_battery_soc: 50.0                             # SOC ≥ 50% 才允许升级
     min_free_space_gb: 2.0                            # 剩余存储 ≥ 2GB
     platform_host: "192.168.31.35"                    # 网络连通性探测目标（Broker 主机）
-    self_test_on_start: true                          # 重启后自检，失败自动回滚
+    self_test_on_start: true                          # 重启后自检（V0.1.12：受 use_pending_marker 门控）
+
+    # ── V0.1.12 新增：防“普通开机伪报 ROLLBACK” ────────────
+    # 旧行为：self_test_on_start=true 下无升级任务时也会因 version 文件缺失/ROS daemon 未起/
+    #   单次 candump 未采 0x211 而进 rollback 分支，报“无可用备份、回滚失败 → ROLLBACK”。
+    # 新行为：安装成功后写 pending_selftest 标记，下一次开机才走自检+回滚；无标记则“普通开机”，
+    #   一行 log 即返 IDLE（不报 ROLLBACK、不写 ota_status）。
+    use_pending_marker: true                          # false 可回旧语义（无标记也自检），不推荐
+    pending_marker_file: "/data/ota/.pending_selftest.json"
