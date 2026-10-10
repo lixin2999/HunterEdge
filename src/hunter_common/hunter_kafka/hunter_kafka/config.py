@@ -249,22 +249,35 @@ def build_client_conf(
         _apply_ssl(conf, props, bundle_dir, role)
 
     # ── 生产者基准参数（对齐 contracts/kafka/topics.yaml#producer_defaults）──
-    for key in ("linger.ms", "batch.size", "retries", "compression.type",
-                "message.timeout.ms", "request.timeout.ms",
-                "reconnect.backoff.ms", "reconnect.backoff.max.ms",
-                "socket.keepalive.enable"):
-        if props.get(key):
-            conf[key] = props[key]
-    if role == "consumer":
+    # ⚠ **仅 producer**：这些键（及 `acks`）对 Consumer 是“生产者属性”，librdkafka 会逐个
+    #   打 CONFWARN 噪声（实机 remote_agent 日志）：
+    #     Configuration property queue.buffering.max.ms / message.send.max.retries /
+    #     compression.codec / batch.size / request.required.acks is a producer property
+    #     and will be ignored by this consumer instance
+    #  （librdkafka 报的是**规范名**：linger.ms→queue.buffering.max.ms、
+    #    compression.type→compression.codec、retries→message.send.max.retries、acks→request.required.acks）
+    if role != "consumer":
+        for key in ("linger.ms", "batch.size", "retries", "compression.type",
+                    "message.timeout.ms", "request.timeout.ms",
+                    "reconnect.backoff.ms", "reconnect.backoff.max.ms",
+                    "socket.keepalive.enable"):
+            if props.get(key):
+                conf[key] = props[key]
+    else:
+        for key in ("reconnect.backoff.ms", "reconnect.backoff.max.ms",
+                    "socket.keepalive.enable"):
+            if props.get(key):
+                conf[key] = props[key]
         for key in ("enable.auto.commit", "auto.offset.reset", "isolation.level",
                     "session.timeout.ms", "max.poll.interval.ms"):
             if props.get(key):
                 conf[key] = props[key]
         # Java 的 true/false 与 librdkafka 一致，无需转换
-    if acks:
-        conf["acks"] = str(acks)
-    elif props.get("acks"):
-        conf["acks"] = str(props["acks"])
+    if role != "consumer":
+        if acks:
+            conf["acks"] = str(acks)
+        elif props.get("acks"):
+            conf["acks"] = str(props["acks"])
 
     if client_id:
         conf["client.id"] = client_id

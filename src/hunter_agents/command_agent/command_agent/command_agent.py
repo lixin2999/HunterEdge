@@ -229,12 +229,7 @@ class CommandAgent(Node):
         # 常驻看门狗：检查在途服务指令是否超时（不能每次调用新建 timer，否则定时器堆积）
         self.create_timer(0.5, self._watch_inflight)
 
-        self.get_logger().info(
-            "command_agent 启动：vehicle_id=%s，指令链路=%s，白名单=%d 项%s",
-            self._vehicle_id or "(未知)",
-            "Kafka 已就绪" if self._kafka_ready else f"降级({self._kafka_err or 'hunter_kafka 不可用'})",
-            len(self._allowed_types()),
-            "，⚠allow_unknown_types=true" if self._allow_unknown else "")
+        self.get_logger().info('command_agent 启动：vehicle_id=%s，指令链路=%s，白名单=%d 项%s' % (self._vehicle_id or "(未知)", "Kafka 已就绪" if self._kafka_ready else f"降级({self._kafka_err or 'hunter_kafka 不可用'})", len(self._allowed_types()), "，⚠allow_unknown_types=true" if self._allow_unknown else ""))
 
     # ==================================================================
     # 订阅回调（只更新缓存，不做业务）
@@ -291,19 +286,16 @@ class CommandAgent(Node):
             self._kafka_ready = True
         except KafkaConfigError as exc:
             self._kafka_err = "配置错误"
-            self.get_logger().fatal(
-                "指令链路配置失败：%s（核对 %s 的 SCRAM 口令、证书权限 0600、"
-                "pip3 install confluent-kafka）", exc, self._properties)
+            self.get_logger().fatal('指令链路配置失败：%s（核对 %s 的 SCRAM 口令、证书权限 0600、pip3 install confluent-kafka）' % (exc, self._properties))
         except Exception as exc:  # noqa: BLE001
             self._kafka_err = "初始化异常"
-            self.get_logger().fatal("指令链路初始化异常：%s", exc)
+            self.get_logger().fatal('指令链路初始化异常：%s' % (exc,))
 
     def _fallback_conf(self) -> Optional[Dict[str, str]]:
         brokers = str(self.get_parameter("kafka_fallback_brokers").value or "")
         if not brokers:
             return None
-        self.get_logger().warn(
-            "使用 YAML 内联 Kafka 参数（仅限开发机；生产请部署接入包到 %s）", self._properties)
+        self.get_logger().warn('使用 YAML 内联 Kafka 参数（仅限开发机；生产请部署接入包到 %s）' % (self._properties,))
         return {
             "bootstrap.servers": brokers,
             "security.protocol": "sasl_ssl",
@@ -322,11 +314,11 @@ class CommandAgent(Node):
         try:
             messages = self._consumer.consume(num_messages=1, timeout=0.0)
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().error("Kafka consume 异常：%s", exc)
+            self.get_logger().error('Kafka consume 异常：%s' % (exc,))
             return
         for msg in messages or []:
             if msg.error():
-                self.get_logger().error("Kafka 消费错误：%s", msg.error())
+                self.get_logger().error('Kafka 消费错误：%s' % (msg.error(),))
                 continue
             self._on_command_message(msg)
 
@@ -335,7 +327,7 @@ class CommandAgent(Node):
             cmd = json.loads(msg.value().decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             # 非法报文无法执行也无法回执关联，直接提交 offset 丢弃（防堵分区）
-            self.get_logger().warn("指令报文非法，丢弃：%s", exc)
+            self.get_logger().warn('指令报文非法，丢弃：%s' % (exc,))
             self._commit(msg)
             return
         if not isinstance(cmd, dict):
@@ -343,7 +335,7 @@ class CommandAgent(Node):
             self._commit(msg)
             return
 
-        self.get_logger().info("收到平台指令：%s", self._brief(cmd))
+        self.get_logger().info('收到平台指令：%s' % (self._brief(cmd),))
         result = self._guard(cmd)
         if result is not None:                   # 护栏拦截，没有进入执行
             self._finish(cmd, msg, result)
@@ -462,7 +454,7 @@ class CommandAgent(Node):
             try:
                 result = handler(cmd, params)
             except Exception as exc:  # noqa: BLE001
-                self.get_logger().error("指令 %s 执行异常：%s", ctype, exc)
+                self.get_logger().error('指令 %s 执行异常：%s' % (ctype, exc))
                 result = self._result(cmd, Status.FAILED, f"执行异常：{exc}")
             self._finish(cmd, msg, result)
             return
@@ -506,8 +498,7 @@ class CommandAgent(Node):
         if time.monotonic() < inflight["deadline"]:
             return
         cmd, msg = inflight["cmd"], inflight["msg"]
-        self.get_logger().error("服务调用超时（%.0fs）：%s",
-                                self._service_timeout, self._brief(cmd))
+        self.get_logger().error('服务调用超时（%.0fs）：%s' % (self._service_timeout, self._brief(cmd)))
         self._finish(cmd, msg, self._result(
             cmd, Status.TIMEOUT, f"车端服务在 {self._service_timeout:.0f}s 内未返回"))
 
@@ -547,7 +538,7 @@ class CommandAgent(Node):
 
     def _do_test_mode(self, cmd, value: bool) -> Dict[str, Any]:
         self._test_mode_pub.publish(Bool(data=value))
-        self.get_logger().info("自动驾驶测试模式切换：/safety/test_mode=%s", value)
+        self.get_logger().info('自动驾驶测试模式切换：/safety/test_mode=%s' % (value,))
         return self._result(cmd, Status.SUCCEEDED, f"/safety/test_mode={value}")
 
     def _do_remote_release(self, cmd, _params) -> Dict[str, Any]:
@@ -574,9 +565,7 @@ class CommandAgent(Node):
         cid = cmd.get("command_id")
         if cid in self._settled:
             # 超时回执已发、服务迟到的回调又来一次：同一 command_id 只允许一条终态回执
-            self.get_logger().debug(
-                "指令 %s 已回执（%s），忽略重复终态",
-                cid, (result.get("data") or {}).get("status"))
+            self.get_logger().debug('指令 %s 已回执（%s），忽略重复终态' % (cid, (result.get("data") or {}).get("status")))
             if msg is not None:
                 self._commit(msg)
             return
@@ -584,7 +573,7 @@ class CommandAgent(Node):
         self._settled_order.append(cid)
         while len(self._settled) > self._dedup_size:
             self._settled.discard(self._settled_order.popleft())
-        self.get_logger().info("指令回执：%s", self._brief(result))
+        self.get_logger().info('指令回执：%s' % (self._brief(result),))
         self._publish_result(result)
         if msg is not None:
             self._commit(msg)
@@ -614,7 +603,7 @@ class CommandAgent(Node):
 
     def _publish_result(self, result: Dict[str, Any]) -> None:
         payload = json.dumps(result, ensure_ascii=False)
-        self.get_logger().info("COMMAND_RESULT %s", payload)   # 车端执行留痕（journal）
+        self.get_logger().info('COMMAND_RESULT %s' % (payload,))   # 车端执行留痕（journal）
         if not self._kafka_ready:
             self._retry_results.append(result)
             self.get_logger().warn("指令链路未就绪，回执入补投队列")
@@ -632,7 +621,7 @@ class CommandAgent(Node):
 
     def _on_result_dr(self, err, _msg) -> None:
         if err is not None:
-            self.get_logger().warn("command_result 投递失败：%s", err)
+            self.get_logger().warn('command_result 投递失败：%s' % (err,))
 
     def _flush_retry_results(self) -> None:
         if not self._kafka_ready or not self._retry_results:
@@ -644,7 +633,7 @@ class CommandAgent(Node):
         try:
             self._consumer.commit(offsets=[msg], asynchronous=False)
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().error("offset 提交失败：%s", exc)
+            self.get_logger().error('offset 提交失败：%s' % (exc,))
 
     # ==================================================================
     # 状态快照与工具
@@ -702,7 +691,7 @@ class CommandAgent(Node):
                 self._producer.flush(1.0)
                 self._consumer.close()
             except Exception as exc:  # noqa: BLE001
-                self.get_logger().warn("Kafka 关闭异常：%s", exc)
+                self.get_logger().warn('Kafka 关闭异常：%s' % (exc,))
         return super().close()
 
 

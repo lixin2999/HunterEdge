@@ -59,9 +59,16 @@ def make_producer(
         properties_path=properties_path, bundle_dir=bundle_dir,
         client_id=f"{vehicle_id}-{kind}", role="producer", acks=acks,
         extra=extra, fallback=fallback)
+    plain = strip_meta(conf)
+    # ⚠ `dr_cb` **不是 librdkafka 配置项**，必须作为 Producer 的**构造参数**传入。
+    #   旧写法 conf["dr_cb"] = cb 会被 librdkafka 判非法并直接抛异常：
+    #     KafkaError{code=_INVALID_ARG, val=-186,
+    #                str="Property \"dr_cb\" must be set through dedicated .._set_..() function"}
+    #   实机影响：command_agent / ota_agent 的 _init_kafka() 启动即崩
+    #   （hunter-kafka-check 不受影响——它不传 dr_cb）。
     if dr_callback is not None:
-        conf["dr_cb"] = dr_callback
-    return Producer(strip_meta(conf))
+        return Producer(plain, dr_cb=dr_callback)
+    return Producer(plain)
 
 
 def make_consumer(

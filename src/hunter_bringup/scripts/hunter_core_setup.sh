@@ -234,6 +234,18 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
          sudo pip3 uninstall -y confluent-kafka && sudo pip3 install -U confluent-kafka
        报 librdkafka 相关错误时：sudo apt install -y librdkafka-dev 后重试"
   fi
+  # remote_agent 的 WebSocket 备用通道（主通道是 Kafka 的 hunter.<vid>.remote_control）：
+  # 缺包只少一条备用路径、不影响指令链；缺失时 remote_agent 日志只提示一次补装命令（不再每 5s 刷屏）
+  if python3 -c "import websocket" 2>/dev/null; then
+    log "  websocket-client 可用（remote_agent 备用 WS 通道可启用）"
+  else
+    if pip3 install -U --quiet websocket-client; then
+      log "  已安装 websocket-client（remote_agent 备用 WS 通道可用）"
+    else
+      warn "  websocket-client 安装失败（离线？）：remote_agent 将只走 Kafka 主通道，WS 备用通道关闭"
+    fi
+  fi
+
 else
   log "① 跳过依赖安装（--skip-deps）"
 fi

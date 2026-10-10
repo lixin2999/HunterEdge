@@ -314,11 +314,19 @@ class RemoteAgent:
     # ------------------------------------------------------------------
     def websocket_loop(self):
         retry = 0
+        ws_missing_logged = False
         while self.running:
             if not HAS_WS:
-                logger.error("websocket-client 不可用")
+                # 主通道是 Kafka（contract 通道）；WS 只是备用，缺包不必每 5s 刷一条 ERROR
+                # （实机 remote_agent 日志被刷屏）。只首条提示一次 + 给出补装命令。
+                if not ws_missing_logged:
+                    logger.error("websocket-client 未安装：WebSocket 备用通道关闭"
+                                 "（Kafka remote_control 主通道不受影响）；"
+                                 "补装：sudo pip3 install websocket-client")
+                    ws_missing_logged = True
                 time.sleep(5)
                 continue
+            ws_missing_logged = False
             try:
                 self.ws = websocket.WebSocket()
                 self.ws.connect(self.ws_url, timeout=10)
