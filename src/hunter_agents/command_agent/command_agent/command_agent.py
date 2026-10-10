@@ -237,6 +237,32 @@ class CommandAgent(Node):
             "，⚠allow_unknown_types=true" if self._allow_unknown else "")
 
     # ==================================================================
+    # 订阅回调（只更新缓存，不做业务）
+    #
+    # ⚠ 这四个回调**必须存在**：__init__ 里的 create_subscription 直接引用了它们。
+    #   一旦缺失就是「启动即崩」——`AttributeError: 'CommandAgent' object has no
+    #   attribute '_health_cb'`（HUNTER-001 实机日志确认：command_agent 一直卡在这里，
+    #   表现为 `ros2 node list` 里没有 command_agent、平台指令永远无回执）。
+    #   缓存用途：_motion_gate()（急停/故障门控）与 _snapshot()（回执里带车端状态）。
+    # ==================================================================
+    def _health_cb(self, msg: SystemHealth) -> None:
+        with self._lock:
+            self._health = msg
+
+    def _chassis_cb(self, msg: ChassisState) -> None:
+        with self._lock:
+            self._chassis = msg
+
+    def _odom_cb(self, msg: Odometry) -> None:
+        with self._lock:
+            self._odom = msg
+
+    def _mission_cb(self, msg: String) -> None:
+        # /auto_mission/status（std_msgs/String，形如「状态|原因」，见 auto_mission 文档）
+        with self._lock:
+            self._mission_state = msg.data
+
+    # ==================================================================
     # Kafka 链路初始化
     # ==================================================================
     def _init_kafka(self) -> None:

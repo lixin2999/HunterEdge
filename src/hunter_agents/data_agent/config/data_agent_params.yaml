@@ -30,7 +30,10 @@ data_agent:
     hard_turn: 0.8            # 急转弯 横摆角速度 > 0.8 rad/s
 
     # ── 网络异常与断点续传（文档 14.6）─────────────────────────────
-    comm_loss_duration: 10.0  # Kafka 断开 > 10s 触发事件
+    comm_loss_duration: 10.0  # Kafka 断开 > 10s 触发 communication_loss 事件
+    event_min_interval: 10.0  # 事件去重抑制期（秒）：同一 event_type 在此间隔内只上报一次
+                              # （detectEvents 为 100ms 判定，无此门控会在低电/超速/急停
+                              #   持续期间每拍重复上报，并为每条拉起一个 ros2 bag record）
     cache_max_hours: 24.0     # 本地缓存最多 24 小时
     replay_batch_size: 50     # 链路恢复后每轮回放条数（限流，防瞬时冲击）
     replay_inflight_limit: 200  # 已投递未证实的回放在途上限

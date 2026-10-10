@@ -170,6 +170,13 @@ private:
   bool comm_loss_reported_{false};
   rclcpp::Time link_down_since_;
 
+  // 事件去重（边沿触发）：同一 event_type 在 event_min_interval_ 秒内只上报一次。
+  // 依据：detectEvents 是 100ms 无状态判定，低电/超速/急转弯/急停在持续期间会每拍
+  // 命中一次 → 旧版每秒上报约 10 条重复事件，且每条都拉起一个 `ros2 bag record`
+  // （实测已见 `ros2 bag record ... _communication_loss` 进程）→ 磁盘与平台双爆。
+  std::map<std::string, rclcpp::Time> last_event_at_;
+  double event_min_interval_{10.0};
+
   // 事件检测状态
   double prev_velocity_;
   rclcpp::Time prev_time_;

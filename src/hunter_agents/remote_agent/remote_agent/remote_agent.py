@@ -61,6 +61,15 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("remote_agent")
 
+#: 事件类型 → 契约等级（HunterCore ``contracts/database/enums.md`` §3，**不可更改**）。
+#: 平台 data-collector 会按 ``EVENT_LEVEL_BY_TYPE`` 校验「类型↔等级」一致性：
+#: 等级写错 = 非法事件（DLQ）。车端只上报本表内的类型，其余（遥控链路噪声）只落本地日志。
+EVENT_LEVEL_BY_TYPE = {
+    "manual_takeover": "info",       # 人工接管（遥控接管生效）
+    "emergency_stop": "critical",    # 遥控急停（如平台下发零速+brake=1 的急停帧）
+}
+
+
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -130,6 +139,9 @@ class RemoteAgent:
         fresh = (time.time() - self.last_cmd_time) <= timeout if self.last_cmd_time else False
 
         if fresh and not self.release_requested:
+            if not self.remote_active:
+                # 遥控接管**开始**：契约受控词表里的 manual_takeover（info）
+                self.report_event("manual_takeover", extra={"source": self.cmd_source})
             self.remote_active = True
             self.publish_command(self.latest_velocity, self.latest_steering, self.latest_brake)
             return
@@ -140,6 +152,7 @@ class RemoteAgent:
             self.remote_active = False
             reason = "release" if self.release_requested else "cmd_timeout"
             logger.warning("遥控链路结束（%s）：已下发停车帧并停止发布 /remote/command", reason)
+            # 契约没有「遥控结束」事件类型 → 只落本地日志（report_event 会过滤掉自造类型）
             self.report_event("remote_%s" % ("released" if reason == "release" else "timeout"),
                               "warning" if reason == "release" else "critical",
                               {"source": self.cmd_source,
@@ -207,16 +220,31 @@ class RemoteAgent:
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Kafka offset 提交失败：%s", exc)
 
-    def report_event(self, event_type, level, extra=None):
-        """遥控会话事件 → hunter.<vid>.event（acks=all）。
-        接入包 Topic 契约没有 remote_status，旧版自发该 Topic 已废弃。"""
+    def report_event(self, event_type, level=None, extra=None):
+        """遥控事件 → ``hunter.<vid>.event``（**契约字段**：``event_type``/``event_level``）。
+
+        ⚠ 契约 ``event.schema.json`` 只认 19 种 ``event_type``（受控词表，
+        ``additionalProperties=false``），等级由 ``EVENT_LEVEL_BY_TYPE`` 固定
+        （``contracts/database/enums.md`` §3：``manual_takeover`` = **info**）。
+        旧版发 ``{type, level}`` 且用了自造类型 ``remote_ws_connected`` /
+        ``remote_ws_disconnected`` / ``remote_released`` / ``remote_timeout``
+        → 平台判非法（DLQ），而且 WS 断线重连每轮都发一条，属噪声污染。
+
+        因此：**只有受控词表内的类型才上平台**，其余仅本地日志留痕。
+        """
+        contract_level = EVENT_LEVEL_BY_TYPE.get(event_type)
+        if contract_level is None:
+            logger.info("遥控事件（契约无此类型，仅本地留痕）：%s %s", event_type, extra or {})
+            return
         payload = {
             "vehicle_id": self.vehicle_id,
             "timestamp": int(time.time()),
-            "type": event_type,
-            "level": level,
+            "event_type": event_type,
+            "event_level": contract_level,
+            "description": f"远程操控：{event_type}",
         }
-        payload.update(extra or {})
+        if extra:
+            payload["data"] = extra
         logger.info("遥控事件上报：%s", json.dumps(payload, ensure_ascii=False))
         if not self.kafka_producer:
             return
@@ -242,14 +270,26 @@ class RemoteAgent:
             logger.warning("指令报文不是 JSON 对象：%r", data)
             return
 
-        # 平台显式交还驾驶权：remote_control 报文带 release=true / control_mode="AUTO"
-        if cmd.get("release") is True or cmd.get("control_mode") == "AUTO":
+        # ── 帧类别与字段名（HunterCore ``remote_control.schema.json``）──────────
+        # 契约：{vehicle_id, timestamp, seq, control:{target_velocity,target_steer,brake,gear,mode},
+        #        heartbeat, reason, session_id, video:{recording,...}}
+        # G-10：boot 帧 heartbeat=true / stop 帧 heartbeat=false 且带 reason，控制量恒零。
+        control = cmd.get("control") if isinstance(cmd.get("control"), dict) else {}
+
+        # 交还驾驶权：契约 stop 帧（reason 非空）→ 兼容旧字段 release / control_mode="AUTO"
+        if ((cmd.get("reason") is not None and cmd.get("heartbeat") is False)
+                or cmd.get("release") is True or cmd.get("control_mode") == "AUTO"):
             self.release_requested = True
-            logger.info("平台请求交还驾驶权（remote_control）")
+            logger.info("平台请求交还驾驶权（remote_control，reason=%s）", cmd.get("reason"))
             return
 
         # 时效校验：断网重连/消费组重建时不得执行历史遥控帧
-        issued = cmd.get("issued_at") or cmd.get("ts")
+        # （契约字段 timestamp，兼容旧名 issued_at/ts；秒级 epoch）
+        issued = cmd.get("timestamp")
+        if not isinstance(issued, (int, float)) or issued <= 0:
+            issued = cmd.get("issued_at")
+        if not isinstance(issued, (int, float)) or issued <= 0:
+            issued = cmd.get("ts")
         if isinstance(issued, (int, float)) and issued > 0:
             ttl = float(self.config.get("remote_cmd_ttl", 1.0))
             if time.time() - float(issued) > ttl:
@@ -257,13 +297,14 @@ class RemoteAgent:
                 return
 
         # 安全限幅（文档 13.4：远程模式最高 2.0 m/s，转向 ±0.4 rad）
+        # 契约字段 control.target_velocity / control.target_steer（兼容旧平铺 velocity/steering_angle）
+        raw_velocity = control.get("target_velocity", cmd.get("velocity", 0.0))
+        raw_steering = control.get("target_steer", cmd.get("steering_angle", 0.0))
         self.latest_velocity = clamp(
-            float(cmd.get("velocity", 0.0)),
-            -float(self.config["max_velocity"]), float(self.config["max_velocity"]))
+            float(raw_velocity), -float(self.config["max_velocity"]), float(self.config["max_velocity"]))
         self.latest_steering = clamp(
-            float(cmd.get("steering_angle", 0.0)),
-            -float(self.config["max_steering"]), float(self.config["max_steering"]))
-        self.latest_brake = bool(cmd.get("brake", False))
+            float(raw_steering), -float(self.config["max_steering"]), float(self.config["max_steering"]))
+        self.latest_brake = bool(control.get("brake", cmd.get("brake", False)))
         self.last_cmd_time = time.time()
         self.release_requested = False
         self.cmd_source = source

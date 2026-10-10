@@ -236,6 +236,9 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   declare_parameter("hard_turn", 0.8);
   declare_parameter("comm_loss_duration", 10.0);
   declare_parameter("cache_max_hours", 24.0);
+  // 事件去重抑制期（秒）：同一 event_type 在此间隔内只上报一次（边沿触发）；
+  // detectEvents 是 100ms 判定，无此门控会在低电/超速/急停持续期间每拍重复上报
+  declare_parameter("event_min_interval", 10.0);
   declare_parameter("kafka_queue_limit", 50);         // 本地队列积压上限（条），超过转 SQLite 缓存
   declare_parameter("kafka_flush_timeout_ms", 5000);  // 退出时等待投递的超时（毫秒）
   declare_parameter("replay_batch_size", 50);         // 每轮回放条数（断点续传限流，防瞬时冲击链路）
@@ -258,6 +261,7 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   hard_accel_ = get_parameter("hard_accel").as_double();
   hard_turn_ = get_parameter("hard_turn").as_double();
   comm_loss_duration_ = get_parameter("comm_loss_duration").as_double();
+  event_min_interval_ = get_parameter("event_min_interval").as_double();
   cache_max_hours_ = get_parameter("cache_max_hours").as_double();
   kafka_queue_limit_ = static_cast<int>(get_parameter("kafka_queue_limit").as_int());
   kafka_flush_timeout_ms_ = static_cast<int>(get_parameter("kafka_flush_timeout_ms").as_int());
@@ -808,7 +812,8 @@ void DataAgent::detectEvents()
     char data[160];
     std::snprintf(data, sizeof(data),
       "{\"velocity\":%.3f,\"limit\":%.3f}", v, max_velocity_);
-    reportEvent("over_speed", "warning", "超速：车速超过限速 110%", data);
+    // 契约等级（contracts/database/enums.md §3）：over_speed = **critical**（不是 warning）
+    reportEvent("over_speed", "critical", "超速：车速超过限速 110%", data);
   }
 
   // 4. 电池低电量（文档 14.3：SOC < 20%）/ 严重低电（< 10%）
@@ -849,6 +854,21 @@ void DataAgent::detectEvents()
 void DataAgent::reportEvent(const std::string & event_type, const std::string & event_level,
   const std::string & description, const std::string & data_json)
 {
+  // ── 事件去重（边沿触发 + 抑制期）────────────────────────────────────────
+  // detectEvents 是 100ms 无状态判定：低电/超速/急转弯/急停在持续期间会**每拍命中**，
+  // 旧版于是每秒上报约 10 条重复事件，且 triggerBagRecord 每条都拉起一个
+  // `ros2 bag record`（实机已见 `..._communication_loss` 录制进程）→ 磁盘与平台双爆、
+  // 平台侧还会把它们当重复事件反复入库。这里做统一门控：同一 event_type 在
+  // event_min_interval_（默认 10s）内只放行一次，其余静默丢弃（连日志也不刷）。
+  const rclcpp::Time now = this->now();
+  const auto last = last_event_at_.find(event_type);
+  if (last != last_event_at_.end() &&
+      (now - last->second).seconds() < event_min_interval_)
+  {
+    return;
+  }
+  last_event_at_[event_type] = now;
+
   // ── 契约：contracts/kafka/schemas/event.schema.json ─────────────────────
   // required = [vehicle_id, timestamp, event_type, event_level]，
   // additionalProperties=false：只允许 description / data / data_file_url 三个可选项。
@@ -1079,7 +1099,7 @@ void DataAgent::kafkaReconnect()
     std::snprintf(data, sizeof(data),
       "{\"duration_s\":%.1f,\"threshold_s\":%.1f,\"broker\":\"%s\"}",
       down_seconds, comm_loss_duration_, jsonEscape(broker_host_).c_str());
-    reportEvent("communication_loss", "warning",
+    reportEvent("communication_loss", "critical",
       "车-云通信中断：Kafka 链路持续不可用", data);
   }
 

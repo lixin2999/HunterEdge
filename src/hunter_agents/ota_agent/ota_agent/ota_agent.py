@@ -68,6 +68,22 @@ class OTAState(Enum):
     FAILED = "FAILED"
 
 
+#: 契约 ``ota_status.schema.json`` 的 ``progress``（0-100 整数，必填）。
+#: 车端暂无逐字节进度源（下载/写分区由外部脚本完成），按状态给**静态度数**，
+#: 不臆造精细百分比；平台用它画进度条（灰度监控）。
+PROGRESS_BY_STATE = {
+    "IDLE": 0,
+    "PENDING": 0,
+    "DOWNLOAD": 25,
+    "INSTALL": 60,
+    "TEST": 80,
+    "SUCCESS": 100,
+    "ROLLBACK": 90,
+    "ROLLED_BACK": 100,
+    "FAILED": 100,
+}
+
+
 class OtaAgent:
     def __init__(self, config):
         self.config = config
@@ -145,18 +161,39 @@ class OtaAgent:
         except Exception as exc:  # noqa: BLE001
             logger.error("ota_notify offset 提交失败：%s", exc)
 
-    def report_status(self, state, detail=""):
-        """状态上报（文档 12.2）：acks=all 并短暂 flush 证实，不让平台状态停留在猜测"""
-        payload = {
-            "vehicle_id": self.vehicle_id,
-            "task_id": self.task.get("task_id") if self.task else None,
-            "state": state,
-            "detail": detail,
-            "timestamp": int(time.time()),
-        }
-        logger.info("状态上报：%s %s", state, detail)
+    def report_status(self, state, detail="", error_code=None):
+        """状态上报（文档 12.2）：**严格按 HunterCore ``ota_status.schema.json`` 组装**。
+
+        契约必填 = ``[vehicle_id, timestamp, task_id, status, progress]``
+        （``additionalProperties=false``，可选 ``phase``/``from_version``/``to_version``/
+        ``error_code``/``error_message``）；消费者是平台 ``ota-service``（推进
+        ``ota_svc.ota_records`` 与 Redis ``ota:progress:{task_id}``）。
+
+        ⚠ 旧版发 ``{state, detail}`` 不是契约字段 → 平台判非法（DLQ），
+        **OTA 进度在平台上永远看不到**。另：无 ``task_id`` 时无法定位记录，
+        本方法只落本地日志、不上报（不伪造 UUID）。
+        """
+        name = state.value if isinstance(state, OTAState) else str(state)
+        task_id = (self.task or {}).get("task_id")
+        logger.info("状态上报：%s %s", name, detail)
+        if not task_id:
+            logger.info("  无 task_id（无进行中任务）→ 不向平台上报 ota_status（契约必填 task_id）")
+            return
         if not self.producer:
             return
+        payload = {
+            "vehicle_id": self.vehicle_id,
+            "timestamp": int(time.time()),
+            "task_id": task_id,
+            "status": name,
+            "phase": name,
+            "progress": PROGRESS_BY_STATE.get(name, 0),
+        }
+        # 失败/回滚类才带错误信息（契约 error_message ≤512；正常态的 detail 只留本地日志）
+        if detail and name in ("ROLLBACK", "ROLLED_BACK", "FAILED"):
+            payload["error_message"] = str(detail)[:512]
+        if error_code:
+            payload["error_code"] = str(error_code)
         try:
             self.producer.produce(self.status_topic,
                                   json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -597,6 +634,11 @@ def main():
                         default=os.environ.get("HUNTER_OTA_CONFIG",
                                                "/etc/hunter/ota_agent_params.yaml"),
                         help="YAML 参数文件（不含任何 Kafka 凭据）")
+    # ⚠ 必须解析 argv：旧版漏了这一行，`load_config(args.config)` 直接抛
+    #   NameError: name 'args' is not defined → 进程非零退出 → systemd
+    #   `Restart=on-failure` 重启循环（`systemctl is-active` 恒为 activating，
+    #   日志只见反复重启）。HUNTER-001 实机 08:47 定位。
+    args = parser.parse_args()
     agent = OtaAgent(load_config(args.config))
     agent.run()
 
