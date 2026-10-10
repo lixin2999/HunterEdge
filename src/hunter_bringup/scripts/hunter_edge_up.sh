@@ -78,7 +78,11 @@ if [ "$RUN_CHECK" -eq 1 ]; then
     CHECK_CMD="hunter-kafka-check"
   elif [ -f "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_common/hunter_kafka/hunter_kafka/diagnose.py" ]; then
     CHECK_CMD="SOURCE"
+  elif [ -x "$WS_PREFIX/hunter_kafka/lib/hunter_kafka/hunter-kafka-check" ]; then
+    # 隔离安装（colcon 默认）：<安装根>/<pkg>/lib/<pkg>/
+    CHECK_CMD="$WS_PREFIX/hunter_kafka/lib/hunter_kafka/hunter-kafka-check"
   elif [ -x "$WS_PREFIX/lib/hunter_kafka/hunter-kafka-check" ]; then
+    # 合并安装（--merge-install）：<安装根>/lib/<pkg>/
     CHECK_CMD="$WS_PREFIX/lib/hunter_kafka/hunter-kafka-check"
   fi
 

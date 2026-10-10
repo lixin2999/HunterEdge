@@ -14,12 +14,14 @@ Environment=PYTHONUNBUFFERED=1
 # 由 hunter_core_setup.sh 生成：HUNTER_WS_PREFIX 指向 colcon 安装目录
 # （例：/home/hunter/hunter_ws/install），Agent 可执行文件在 <prefix>/lib/<pkg>/<pkg>
 EnvironmentFile=-/etc/hunter/agent_env.sh
-# 必须 source ROS2 与工作空间：两个 Agent 都依赖 hunter_kafka 公共包
-# ⚠ 执行的是 **lib/<pkg>/<pkg>_node 普通脚本**（不依赖 setuptools 发行版元数据）。
-#   直接用 console_scripts 入口（lib/<pkg>/<pkg>）在 --symlink-install 下会抛
-#   `PackageNotFoundError: No package metadata was found for ota-agent`
-#   （easy-install.pth 在 PYTHONPATH 下不生效）→ 服务陷入 activating 重启循环（实机踩中）。
-ExecStart=/bin/bash -c 'P="${HUNTER_WS_PREFIX:-/home/hunter/hunter_ws/install}"; source "${HUNTER_ROS_SETUP:-/opt/ros/humble/setup.bash}" && source "$P/setup.bash" && exec "$P/lib/ota_agent/ota_agent_node" --config "${HUNTER_OTA_CONFIG:-/etc/hunter/ota_agent_params.yaml}"'
+# 必须 source ROS2 与工作空间：Agent 依赖 hunter_kafka 公共包
+# ⚠ 可执行文件定位（V0.1.08 修复）：colcon 默认**隔离安装**，包前缀是 <安装根>/<pkg>，
+#   即 <WS>/install/ota_agent/lib/ota_agent/ota_agent_node；
+#   旧写法 <安装根>/lib/<pkg>/... 属 --merge-install 布局 → 实机必报
+#   `127 /bin/bash: .../install/lib/ota_agent/ota_agent_node: No such file or directory`
+#   （ota/remote 双双中招，服务陷入 activating 重启循环）。
+#   这里按「隔离安装 → 合并安装 → 源码树」依次探测；全都找不到就打印候选路径与排查命令后退出 1。
+ExecStart=/bin/bash -c 'R="${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}"; S="${HUNTER_SRC_DIR:-$HOME/HunterEdge}"; source "${HUNTER_ROS_SETUP:-/opt/ros/humble/setup.bash}" >/dev/null 2>&1 || true; source "$R/setup.bash" >/dev/null 2>&1 || true; for c in "$R/ota_agent/lib/ota_agent/ota_agent_node" "$R/lib/ota_agent/ota_agent_node" "$S/src/hunter_agents/ota_agent/scripts/ota_agent_node"; do if [ -f "$c" ]; then exec "$c" --config "${HUNTER_OTA_CONFIG:-/etc/hunter/ota_agent_params.yaml}"; fi; done; echo "[ota-agent] 未找到 ota_agent_node（三个候选路径都不存在）：$R/ota_agent/lib/ota_agent/ota_agent_node | $R/lib/ota_agent/ota_agent_node | $S/src/hunter_agents/ota_agent/scripts/ota_agent_node；处置：colcon build --symlink-install --packages-select ota_agent，并核对 /etc/hunter/agent_env.sh 的 HUNTER_WS_PREFIX/HUNTER_SRC_DIR" >&2; exit 1'
 Restart=on-failure
 RestartSec=10
 # 资源限制
