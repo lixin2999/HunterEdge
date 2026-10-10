@@ -198,7 +198,14 @@ class CommandAgent(Node):
         self._test_mode_pub = self.create_publisher(Bool, "/safety/test_mode", 10)
         self._remote_cmd_pub = self.create_publisher(ChassisCommand, "/remote/command", 10)
 
-        self._clients: Dict[str, Any] = {
+        # 属性名一定要避开 rclpy.Node 的内部字段（`_clients/_services/_publishers/...`）。
+        # 早期这里叫 `self._clients`，把 Node.__init__ 建的 `self._clients: List[Client]`
+        # 覆盖成了 `Dict[str, Client]`：executor 走 `node.clients` 时迭代 dict 拿到 **键（str）**、
+        # 然后对 str 调 `entity._executor_event` → `AttributeError: 'str' object has no attribute
+        # '_executor_event'`；紧随其后的 `destroy_node` 用 `[0]` 查 dict 又抛 `KeyError: 0`，
+        # command_agent 每次 spin 一进回调分发就必崩（HUNTER-001 实机 10:26:38 定位）。
+        # 改名 `_srv_clients` 后与 rclpy 内部不再撞名。
+        self._srv_clients: Dict[str, Any] = {
             "MISSION_START": self.create_client(Trigger, "/auto_mission/start_mapping_cruise"),
             "MISSION_STOP": self.create_client(Trigger, "/auto_mission/stop_mapping_cruise"),
             "MAP_CONVERT": self.create_client(Trigger, "/pcd_to_map/convert"),
@@ -458,7 +465,7 @@ class CommandAgent(Node):
                 result = self._result(cmd, Status.FAILED, f"执行异常：{exc}")
             self._finish(cmd, msg, result)
             return
-        client = self._clients.get(ctype)
+        client = self._srv_clients.get(ctype)
         if client is None:
             result = self._result(cmd, Status.REJECTED, f"指令 {ctype} 无车端实现")
             self._finish(cmd, msg, result)
@@ -677,7 +684,7 @@ class CommandAgent(Node):
 
     def _allowed_types(self) -> Tuple[str, ...]:
         extra = self._param_string_list("extra_allowed_types")
-        base = tuple(sorted(self._clients)) + tuple(sorted(self._immediate_handlers()))
+        base = tuple(sorted(self._srv_clients)) + tuple(sorted(self._immediate_handlers()))
         return tuple(sorted(set(base) | set(extra)))
 
     def _remember(self, cid: str) -> None:
