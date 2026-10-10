@@ -24,6 +24,11 @@ EnvironmentFile=-/etc/hunter/agent_env.sh
 ExecStart=/bin/bash -c 'R="${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}"; S="${HUNTER_SRC_DIR:-$HOME/HunterEdge}"; source "${HUNTER_ROS_SETUP:-/opt/ros/humble/setup.bash}" >/dev/null 2>&1 || true; source "$R/setup.bash" >/dev/null 2>&1 || true; for c in "$R/ota_agent/lib/ota_agent/ota_agent_node" "$R/lib/ota_agent/ota_agent_node" "$S/src/hunter_agents/ota_agent/scripts/ota_agent_node"; do if [ -f "$c" ]; then exec "$c" --config "${HUNTER_OTA_CONFIG:-/etc/hunter/ota_agent_params.yaml}"; fi; done; echo "[ota-agent] 未找到 ota_agent_node（三个候选路径都不存在）：$R/ota_agent/lib/ota_agent/ota_agent_node | $R/lib/ota_agent/ota_agent_node | $S/src/hunter_agents/ota_agent/scripts/ota_agent_node；处置：colcon build --symlink-install --packages-select ota_agent，并核对 /etc/hunter/agent_env.sh 的 HUNTER_WS_PREFIX/HUNTER_SRC_DIR" >&2; exit 1'
 Restart=on-failure
 RestartSec=10
+# 停止语义与 remote-agent 一致（V0.1.10）：SIGINT 让 Python 走 finally（关 Kafka 客户端、
+# 提交/落盘收尾），避免"停止要等满超时再被强杀"。
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=20
 # 资源限制
 LimitNOFILE=65536
 # 日志

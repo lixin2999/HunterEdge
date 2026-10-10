@@ -23,6 +23,14 @@ EnvironmentFile=-/etc/hunter/agent_env.sh
 ExecStart=/bin/bash -c 'R="${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}"; S="${HUNTER_SRC_DIR:-$HOME/HunterEdge}"; source "${HUNTER_ROS_SETUP:-/opt/ros/humble/setup.bash}" >/dev/null 2>&1 || true; source "$R/setup.bash" >/dev/null 2>&1 || true; for c in "$R/remote_agent/lib/remote_agent/remote_agent_node" "$R/lib/remote_agent/remote_agent_node" "$S/src/hunter_agents/remote_agent/scripts/remote_agent_node"; do if [ -f "$c" ]; then exec "$c" --config "${HUNTER_REMOTE_CONFIG:-/etc/hunter/remote_agent_params.yaml}"; fi; done; echo "[remote-agent] 未找到 remote_agent_node（三个候选路径都不存在）：$R/remote_agent/lib/remote_agent/remote_agent_node | $R/lib/remote_agent/remote_agent_node | $S/src/hunter_agents/remote_agent/scripts/remote_agent_node；处置：colcon build --symlink-install --packages-select remote_agent，并核对 /etc/hunter/agent_env.sh 的 HUNTER_WS_PREFIX/HUNTER_SRC_DIR" >&2; exit 1'
 Restart=on-failure
 RestartSec=5
+# ⚠ 停止语义（V0.1.10，实机证据 `Failed with result 'timeout'` + 一串 SIGKILL）：
+#   默认 SIGTERM 会让 Python **直接终止、不走 finally** → GStreamer 子进程残留 →
+#   systemd 等满 TimeoutStopSec 再把整个 cgroup 强杀，表现为"重启要等 90s / 结果 timeout"。
+#   改 SIGINT：Python 抛 KeyboardInterrupt → run() 的 finally 执行 stop_gstreamer()/shutdown()
+#   收拾干净再退出；KillMode=mixed 保证只有主进程收 SIGINT，超时才连带子进程强杀。
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=20
 # 资源限制
 LimitNOFILE=65536
 # 日志

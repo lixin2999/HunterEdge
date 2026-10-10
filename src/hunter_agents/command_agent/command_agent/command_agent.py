@@ -57,6 +57,7 @@ import time
 from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
 import rclpy
+from rclpy.exceptions import ParameterUninitializedException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
@@ -175,8 +176,7 @@ class CommandAgent(Node):
         self._static_thr = float(self.get_parameter("static_velocity_threshold").value)
         self._retry_max = int(self.get_parameter("result_retry_max").value)
         # 契约 command_type 别名表（YAML 未配置时用内置锚点）
-        self._type_aliases = parse_type_aliases(
-            self.get_parameter("command_type_aliases").value)
+        self._type_aliases = parse_type_aliases(self._param_string_list("command_type_aliases"))
 
         # ---------------- 车端状态缓存（门控依据）----------------
         self._lock = threading.RLock()
@@ -657,10 +657,28 @@ class CommandAgent(Node):
                 snap.update({"pose_x": round(pos.x, 3), "pose_y": round(pos.y, 3)})
             return snap
 
+    def _param_string_list(self, name: str) -> list:
+        """读「字符串数组」参数；**空数组在 rclpy 里会落成「未初始化」**，必须容错。
+
+        HUNTER-001 实机：现场 `/etc/hunter/command_agent_params.yaml` 里是
+        `extra_allowed_types: []` → 声明默认值也是空数组时，rclpy 无法推断元素类型，
+        于是 `get_parameter(...).value` 抛
+        `ParameterUninitializedException: The parameter 'extra_allowed_types' is not initialized`
+        → command_agent 启动即崩（这是该节点第五个启动崩溃点）。
+        统一容错为空列表（语义上「没有额外放开的类型」）。
+        """
+        try:
+            value = self.get_parameter(name).value
+        except ParameterUninitializedException:
+            return []
+        if value is None:
+            return []
+        return [str(v) for v in value]
+
     def _allowed_types(self) -> Tuple[str, ...]:
-        extra = self.get_parameter("extra_allowed_types").value or []
+        extra = self._param_string_list("extra_allowed_types")
         base = tuple(sorted(self._clients)) + tuple(sorted(self._immediate_handlers()))
-        return tuple(sorted(set(base) | {str(t) for t in extra}))
+        return tuple(sorted(set(base) | set(extra)))
 
     def _remember(self, cid: str) -> None:
         self._dedup.append(cid)

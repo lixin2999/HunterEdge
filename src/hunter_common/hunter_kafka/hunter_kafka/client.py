@@ -38,6 +38,34 @@ def topic_name(vehicle_id: str, kind: str) -> str:
     return f"hunter.{vehicle_id}.{kind}"
 
 
+class _ProducerWithDeliveryReport:
+    """给 `Producer` 补上「逐条投递证实回调」（`on_delivery`）。
+
+    ⚠ 为什么不用 librdkafka/Python 绑定的全局 `dr_cb`（HUNTER-001 实机 + 本地同版本 2.16.0 双证）：
+      - `Producer(conf, dr_cb=cb)` → `KafkaException: _INVALID_ARG "Property "dr_cb" must be
+        set through dedicated .._set_..() function"`（该版本**不把 dr_cb 当回调 kwarg**，
+        而是并进 conf 交给 `conf_set`，于是被 librdkafka 拒绝）；
+      - `Producer({**conf, "dr_cb": cb})` → 同样 `_INVALID_ARG`；
+      - `p.dr_cb = cb` → `AttributeError`（该版本没有这个属性，只有 error_cb/stats_cb/
+        throttle_cb/logger 几个 kwarg 回调）。
+      该版本**唯一可用**的投递证实入口是 `produce(..., on_delivery=cb)`（官方文档明确：
+      回调在 `poll()`/`flush()` 时触发）——本包装类即在 `produce()` 上自动挂上它，
+      对调用方保持「构造时传 dr_callback，之后每条消息都会回调」的原语义。
+    """
+
+    def __init__(self, producer, dr_callback):
+        self._producer = producer
+        self._dr_callback = dr_callback
+
+    def produce(self, topic, value=None, key=None, *args, **kwargs):
+        # 调用方若已显式传 on_delivery（如 command_agent），尊重其选择
+        kwargs.setdefault("on_delivery", self._dr_callback)
+        return self._producer.produce(topic, value, key, *args, **kwargs)
+
+    def __getattr__(self, name):        # 其余方法/属性透传（poll/flush/produce 计数等）
+        return getattr(self._producer, name)
+
+
 def make_producer(
     vehicle_id: str,
     kind: str,
@@ -50,6 +78,8 @@ def make_producer(
 ):
     """按 Topic 语义创建 Producer（自动选 acks、client.id、linger/batch/compression）。
 
+    ``dr_callback``：投递证实回调（err, msg）——见 :class:`_ProducerWithDeliveryReport`
+    的说明（本版本必须走 `on_delivery`，不能用全局 `dr_cb`）。
     ``fallback``：接入包尚未部署时的内联配置（见 :func:`hunter_kafka.config.load_conf`）。
     """
     from confluent_kafka import Producer  # 延迟导入：降级路径不依赖该包
@@ -60,15 +90,13 @@ def make_producer(
         client_id=f"{vehicle_id}-{kind}", role="producer", acks=acks,
         extra=extra, fallback=fallback)
     plain = strip_meta(conf)
-    # ⚠ `dr_cb` **不是 librdkafka 配置项**，必须作为 Producer 的**构造参数**传入。
-    #   旧写法 conf["dr_cb"] = cb 会被 librdkafka 判非法并直接抛异常：
-    #     KafkaError{code=_INVALID_ARG, val=-186,
-    #                str="Property \"dr_cb\" must be set through dedicated .._set_..() function"}
-    #   实机影响：command_agent / ota_agent 的 _init_kafka() 启动即崩
-    #   （hunter-kafka-check 不受影响——它不传 dr_cb）。
+    # 防御：历史上曾把回调塞进 conf（非法键）→ 这里确保不会带进去
+    plain.pop("dr_cb", None)
+    plain.pop("dr_msg_cb", None)
+    producer = Producer(plain)
     if dr_callback is not None:
-        return Producer(plain, dr_cb=dr_callback)
-    return Producer(plain)
+        return _ProducerWithDeliveryReport(producer, dr_callback)
+    return producer
 
 
 def make_consumer(
