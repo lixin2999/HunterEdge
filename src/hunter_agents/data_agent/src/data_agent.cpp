@@ -520,7 +520,20 @@ void DataAgent::publishHealth()
 
 bool DataAgent::kafkaReady()
 {
-  if (!producer_ || !kafka_connected_.load()) {
+  // V0.1.13 修复：开机即触发的发送死锁。
+  // 旧写法把 kafka_connected_ 当作“能否 produce”的前置条件，但 kafka_connected_ 只能由
+  // dr_cb 置真，而 dr_cb 只有真正 produce 之后才会触发；kafkaInit() 建好 producer 后又显式
+  // 把 kafka_connected_ 置 false（等待投递证实）。于是开机后：kafka_connected_=false →
+  // 本函数恒 false → packAndPublish/publishHealth/reportEvent 全部走 else 落 SQLite 缓存、
+  // 永不 produce → dr_cb 永不触发 → kafka_connected_ 永远停在 false，形成闭环死锁：所有
+  // telemetry/health/event 只落本地库、一条都不发往 broker，平台永远收不到 health（判活依据）
+  // → 车辆“尚未上线”。hunter-kafka-check 是独立进程、自带 producer，不受此门控，故自检全绿
+  // 却掩盖了该问题。
+  // 修复：只要 producer 就绪且本地队列未积压即尝试 produce，连通性完全交由 dr_cb 异步
+  // 证实/回退（成功置 kafka_connected_=true，失败置 false）。broker 真不可达时，消息在
+  // message.timeout.ms 后经 dr_cb 失败，本地队列积压超 kafka_queue_limit_ 自动回落 SQLite
+  // 缓存 + 触发 communication_loss——断网缓存与续传语义完整保留。
+  if (!producer_) {
     return false;
   }
   // 本地队列积压超过上限 → 视为链路不可用（消息滞留队列最终会被
