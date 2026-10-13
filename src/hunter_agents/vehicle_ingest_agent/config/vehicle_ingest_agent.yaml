@@ -118,6 +118,7 @@ kafka:
     enable_idempotence: true
     compression: lz4
     message_max_bytes: 4194304       # 4MB；超限产物只传对象存储指针
+    message_timeout_ms: 600000       # librdkafka 合法区间 0..2147483647（不可用 -1）；淘汰仍由 outbox 掌控
   # 开发机兜底（生产留空，以 properties 为准）
   fallback_brokers: ""
   fallback_username: ""

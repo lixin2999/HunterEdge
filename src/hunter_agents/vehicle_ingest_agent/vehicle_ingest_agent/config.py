@@ -107,7 +107,7 @@ DEFAULTS: Dict[str, Any] = {
         },
         "producer": {"acks_critical": "all", "acks_progress": "1",
                      "enable_idempotence": True, "compression": "lz4",
-                     "message_max_bytes": 4194304},
+                     "message_max_bytes": 4194304, "message_timeout_ms": 600000},
         "fallback_brokers": "",
         "fallback_username": "",
         "fallback_password": "",

@@ -127,6 +127,11 @@ class KafkaBus:
     def _make_producer(self, acks: str, suffix: str, props_path, bundle_dir, fb):
         from confluent_kafka import Producer
         pconf = self.cfg.get("kafka.producer", {})
+        # librdkafka message.timeout.ms 合法区间 0..2147483647（-1 会被拒 → 构造异常）。
+        # 消息淘汰仍由 outbox 掌控（§6.8.1）：取一个足够长的有限值，超时失败后 on_delivery
+        # 触发、outbox 行不置 done、后续 flush 重试（at-least-once）。
+        mto = int(pconf.get("message_timeout_ms", 600000))
+        mto = max(0, min(mto, 2147483647))
         extra = {
             "acks": acks,
             "enable.idempotence": str(pconf.get("enable_idempotence", True)).lower(),
@@ -134,7 +139,7 @@ class KafkaBus:
             "linger.ms": "50",
             "batch.size": "262144",
             "max.in.flight.requests.per.connection": "5",
-            "message.timeout.ms": "-1",       # 淘汰由 outbox 掌控（§6.8.1）
+            "message.timeout.ms": str(mto),
             "queue.buffering.max.ms": str(pconf.get("queue_buffering_ms", 100)),
             "message.max.bytes": str(pconf.get("message_max_bytes", 4194304)),
         }
