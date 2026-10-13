@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vehicle_ingest_agent</name>
+  <version>1.0.0</version>
+  <description>Vehicle-side rosbag ingest agent: segmented recording (500MB/10min) into a ring-buffer
+    local cache, integrity verification, manifest metadata, safe raw-bag upload and disk governance.
+    Parsing/slicing/structuring are deferred to the server (degraded raw-upload mode by default).</description>
+  <maintainer email="developer@hunter.ai">HUNTER Development Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- 核心链路不依赖 ROS 节点；仅复用 hunter_kafka 公共接入库。
+       rclpy/hunter_msgs 为可选（录制通过外部 ros2 bag record 子进程，无需本包引入消息类型）。 -->
+  <exec_depend>hunter_kafka</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

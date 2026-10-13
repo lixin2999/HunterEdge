@@ -1,0 +1,38 @@
+[Unit]
+Description=HunterCore Vehicle Rosbag Ingest Agent (segmented recording cache + manifest + upload)
+Documentation=file:///etc/hunter/README_agent_env
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=PYTHONUNBUFFERED=1
+# 由 hunter_core_setup.sh 生成：HUNTER_WS_PREFIX 指向 colcon 安装目录
+EnvironmentFile=-/etc/hunter/agent_env.sh
+# 主配置（环形录制/上传/磁盘水位参数）；Kafka 凭据不在此，来自 /etc/hunter/kafka/kafka.properties
+Environment=HUNTER_VIA_CONFIG=/etc/hunter/vehicle_ingest_agent.yaml
+# ⚠ 必须 source ROS2 + 工作空间：本 Agent 通过外部 `ros2 bag record` 子进程做分段录制，
+#   且依赖 hunter_kafka 公共接入库。可执行文件按「隔离安装 → 合并安装 → 源码树」探测。
+ExecStart=/bin/bash -c 'R="${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}"; S="${HUNTER_SRC_DIR:-$HOME/HunterEdge}"; source "${HUNTER_ROS_SETUP:-/opt/ros/humble/setup.bash}" >/dev/null 2>&1 || true; source "$R/setup.bash" >/dev/null 2>&1 || true; for c in "$R/vehicle_ingest_agent/lib/vehicle_ingest_agent/vehicle_ingest_agent_node" "$R/lib/vehicle_ingest_agent/vehicle_ingest_agent_node" "$S/src/hunter_agents/vehicle_ingest_agent/scripts/vehicle_ingest_agent_node"; do if [ -f "$c" ]; then exec "$c" --config "$HUNTER_VIA_CONFIG"; fi; done; echo "[vehicle-ingest-agent] 未找到 vehicle_ingest_agent_node（三候选路径均不存在）；处置：colcon build --symlink-install --packages-select vehicle_ingest_agent" >&2; exit 1'
+Restart=always
+RestartSec=5
+# 优雅停止（设计 §12 drain 模式）：SIGINT → asyncio 主循环捕获 KeyboardInterrupt，
+# 完成当前上传批次 / flush outbox / seal 当前录制片段后再退出。
+KillSignal=SIGINT
+KillMode=mixed
+# 录制片段收尾（ros2 bag record 写 metadata.yaml）+ 在途分片上传，给足停止宽限
+TimeoutStopSec=90
+# 资源配额（设计 §12）：不与自动驾驶主计算争抢；IO 降权
+MemoryMax=1536M
+CPUQuota=150%
+IOWeight=50
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

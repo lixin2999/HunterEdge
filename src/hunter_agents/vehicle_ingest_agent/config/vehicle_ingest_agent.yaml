@@ -1,0 +1,134 @@
+# vehicle_ingest_agent.yaml — 车端 rosbag 落地 / 环形缓存 / 上传 Agent 主配置
+#
+# 严格对齐《车端 rosbag 解析与上传 Agent 详细设计文档》附录 A + §6.6 磁盘治理 + §6.7 上传；
+# 并落地本轮需求 2：录制大 bag 的**切片环形本地缓存 + 自动上传释放**。
+#
+# ⚠ 安全约定（与 command_agent/data_agent 同源）：本文件**不写任何凭据**。
+#   Kafka Broker / SCRAM 用户名口令 / mTLS 证书路径一律来自
+#   /etc/hunter/kafka/kafka.properties（HunterCore 接入包，目录 0750 / 文件 0640 / 私钥 0600，
+#   不入版本库）；对象存储凭据优先 STS，落 /etc/hunter/oss/credentials（0600）。
+#   下方 kafka_fallback_* / oss_access_key 仅供无接入包的开发机兜底，生产必须留空。
+#
+# 配置三层优先级（设计 §6.10，低→高）：内置默认 < 本文件 < /var/lib/huntercore-agent/config.override.yaml（远程下发）。
+
+vehicle_id: ""                       # 留空 = 自动取 kafka.properties 的 SASL 用户名（== 证书 CN）
+agent_version: "1.0.0"
+
+# ── 目录布局（设计 §4）─────────────────────────────────────────────
+paths:
+  root: /var/lib/huntercore-agent    # 运行态根（独立分区，容量 ≥ 200GB）
+  bags_dir: bags                     # 录制目录（相对 root）
+  spool_dir: spool                   # 解析产物暂存（降级模式仅缓存原始片段）
+  state_dir: state                   # SQLite（状态机 + outbox + segments）
+  part_state_dir: part-state         # 分片上传断点
+  logs_dir: logs                     # JSON lines
+
+# ── 分段录制 + 环形本地缓存（需求 2 核心）─────────────────────────
+# 录制进程持续写入本地磁盘 → 按 500MB / 10min 自动切分为**独立可删片段**
+# → 环形只保留最近 N 个片段 → 上传成功的片段立即删除 → 磁盘低于阈值删除最旧未传片段
+# → 关键事件片段标记 protected，不自动删除。
+recording:
+  enabled: true
+  # ros2 bag record 录制话题（对齐 data_agent §14.4.2 既有话题，不自造新话题；.ai-rules）
+  topics:
+    - /lidar_points
+    - /camera/camera/color/image_raw
+    - /imu/data
+    - /chassis/state
+  record_transport: ros2             # ros2 | none（none=由外部录制组件产出，Agent 只发现/落地）
+  max_segment_bytes: 524288000       # 500MB：单片段体积上限，达到即切分（seg 收尾另起）
+  max_segment_duration_s: 600        # 10min：单片段时长上限，达到即切分
+  retention_max_segments: 10         # N：环形本地缓存保留的最近片段数（未删除上限）
+  seal_grace_s: 3.0                  # 切分时 SIGINT 后等待 metadata.yaml 落盘的超时
+  poll_interval_s: 2.0               # 片段体积/时长巡检周期
+  min_sealed_duration_s: 1.0         # 有效片段最短时长（低于此判空片段丢弃，对应设计 E_EMPTY_BAG）
+
+# ── 磁盘水位治理（设计 §6.6 + 需求 2）─────────────────────────────
+disk:
+  spool_max_bytes: 161061273600      # 150GB：bag + spool 合计软上限
+  high_watermark: 0.85               # ≥85% 触发淘汰（删除最旧**未上传**非保护片段释放空间）
+  low_watermark: 0.70                # 淘汰目标水位：降至此以下停止删除
+  critical_watermark: 0.95           # ≥95% 且无可清理对象 → agent.disk.critical 告警（保护未上传数据）
+  evict_unuploaded_on_pressure: true # 允许在告急时删除最旧未上传片段（protected 片段除外）
+  gc:
+    done_ttl_h: 48                   # done 片段中间产物 TTL（保留 manifest）
+    raw_ttl_d: 7                     # 原始片段本地兜底 GC 天数
+
+# ── 元数据 / manifest（设计 §6.2 / §7.1）──────────────────────────
+manifest:
+  compute_sha256: true               # 流式 sha256（分块 8MB，限速）
+  hash_chunk_mb: 8
+  min_duration_s: 1.0                # 校验：duration ≥ 该值，否则 E_EMPTY_BAG
+  target_topic_whitelist: []         # 空=不限制；非空则须命中 ≥1，否则 E_NO_TARGET_TOPIC
+
+# ── 解析调度（设计 §6.3）：本轮按需求把解析/切片/结构化放服务端，默认降级=原样上传 ──
+parse:
+  enabled: false                     # false=降级模式：仅上传原始片段，服务端集中解析
+  workers: 2
+  pin_cores: [4, 5]
+  throttle: {msg_per_sec: 20000, nice: 10}
+
+# ── 上传引擎（设计 §6.7）──────────────────────────────────────────
+upload:
+  enabled: true
+  endpoint_type: s3                  # s3 | gateway
+  endpoint: https://minio.internal:9000
+  region: us-east-1
+  bucket: bags
+  bucket_version: v1                 # 对象路径版本段（设计 §7.2）
+  use_tls: true
+  # 凭据：留空 = 走 /etc/hunter/oss/credentials（STS 优先）；仅开发机兜底内联
+  access_key: ""
+  secret_key: ""
+  part_size_mb: 16                   # 分片大小（8~32 可配）
+  concurrency:
+    per_object_parts: 4              # 单对象分片并发
+    objects: 3                       # 跨对象并发
+  rate_limit_mbps: 160               # 令牌桶全局上限
+  schedule:                          # 时间窗限速（弱网/白天降载）
+    - {window: "09:00-18:00", rate_mbps: 40}
+  max_attempts: 12                   # 超过 → task=upload_failed 挂起，保留现场
+  retry_backoff_base_s: 1
+  retry_backoff_max_s: 600
+  keep_raw: delete_on_uploaded     # 需求2默认：上传成功立即删除本地片段 | keep | after_confirmed
+  # 优先级：raw 片段本体在降级模式下按 P4 处理，manifest 走 P0
+
+# ── Kafka（设计 §6.8）：Topic 沿用 HunterCore 接入包契约 hunter.<vid>.<type> ──
+kafka:
+  properties_path: /etc/hunter/kafka/kafka.properties
+  bundle_dir: /etc/hunter/kafka
+  outbox:
+    flush_interval_ms: 100
+    batch: 200
+    max_pending: 500000              # 积压超阈值仅告警不清理
+    done_ttl_h: 24                   # done 消息 24h 后清理
+  # ingest 事件用专用 topic（契约外扩展，见 config.py 注释）；heartbeat/alert 走既有 event/health
+  topic_map:
+    manifest: vehicle.bag.manifest
+    task_status: vehicle.bag.task.status
+    parse_progress: vehicle.bag.parse.progress
+    artifact_uploaded: vehicle.bag.artifact.uploaded
+    heartbeat: vehicle.agent.heartbeat
+    alert: vehicle.agent.alert
+    cmd: vehicle.agent.cmd
+    cmd_ack: vehicle.agent.cmd.ack
+  producer:
+    acks_critical: all               # manifest/task.status/alert
+    acks_progress: "1"               # parse.progress/heartbeat
+    enable_idempotence: true
+    compression: lz4
+    message_max_bytes: 4194304       # 4MB；超限产物只传对象存储指针
+  # 开发机兜底（生产留空，以 properties 为准）
+  fallback_brokers: ""
+  fallback_username: ""
+  fallback_password: ""
+
+# ── 时间同步校验（设计 §6.5）──────────────────────────────────────
+clock:
+  skew_warn_ms: 200                  # stamp 与 bag_ts 偏差 → W_CLOCK_SKEW
+
+# ── 可观测性（设计 §6.11）─────────────────────────────────────────
+telemetry:
+  heartbeat_interval_s: 30
+  log_max_bytes: 52428800            # 50MB × 10
+  log_backup_count: 10
