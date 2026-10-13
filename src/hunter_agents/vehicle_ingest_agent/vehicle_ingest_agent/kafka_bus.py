@@ -132,9 +132,13 @@ class KafkaBus:
         # 触发、outbox 行不置 done、后续 flush 重试（at-least-once）。
         mto = int(pconf.get("message_timeout_ms", 600000))
         mto = max(0, min(mto, 2147483647))
+        # 幂等仅在 acks=all 时开启：librdkafka 要求 enable.idempotence=true 必须配 acks=all，
+        # 否则构造报 `_INVALID_ARG`。progress（heartbeat/parse.progress）走 acks=1 提吞吐、
+        # 关幂等；服务端靠 event_id 去重，at-least-once 不变（§6.8.1）。
+        idempotence = bool(pconf.get("enable_idempotence", True)) and acks == "all"
         extra = {
             "acks": acks,
-            "enable.idempotence": str(pconf.get("enable_idempotence", True)).lower(),
+            "enable.idempotence": str(idempotence).lower(),
             "compression.type": pconf.get("compression", "lz4"),
             "linger.ms": "50",
             "batch.size": "262144",
