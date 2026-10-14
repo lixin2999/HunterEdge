@@ -59,6 +59,7 @@
 #include "action_msgs/msg/goal_status_array.hpp"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
+#include "hunter_msgs/msg/chassis_command.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -154,6 +155,12 @@ public:
     declare_parameter<bool>("enable_map_fence", true);     // 边界监护开关
     declare_parameter<double>("map_edge_stop_dist", 0.5);  // 距未建图/界外栅格停车距离（m）
     declare_parameter<double>("map_edge_slow_dist", 1.5);  // 距未建图/界外栅格减速距离（m）
+    // V0.1.18 遥控执行桥：/remote/command 新鲜(control_mode=REMOTE)时把遥控指令经
+    //   阿克曼换算作为本闸输入，与 Nav2 共用碰撞/曲率/边界安全闸（遥控不再绕过安全层）
+    declare_parameter<bool>("enable_remote_bridge", true);
+    declare_parameter<std::string>("remote_topic", "/remote/command");
+    declare_parameter<double>("remote_timeout", 0.5);
+    declare_parameter<double>("remote_max_linear_vel", 2.0);  // 遥控纵向硬限（文档 13.4）
 
     wheelbase_ = get_parameter("wheelbase").as_double();
     min_turn_radius_ = get_parameter("min_turn_radius").as_double();
@@ -193,6 +200,10 @@ public:
     enable_map_fence_ = get_parameter("enable_map_fence").as_bool();
     map_edge_stop_dist_ = get_parameter("map_edge_stop_dist").as_double();
     map_edge_slow_dist_ = get_parameter("map_edge_slow_dist").as_double();
+    enable_remote_bridge_ = get_parameter("enable_remote_bridge").as_bool();
+    remote_topic_ = get_parameter("remote_topic").as_string();
+    remote_timeout_ = get_parameter("remote_timeout").as_double();
+    remote_max_linear_vel_ = get_parameter("remote_max_linear_vel").as_double();
 
     if (min_turn_radius_ <= wheelbase_ * 0.2) {
       RCLCPP_WARN(get_logger(),
@@ -265,6 +276,17 @@ public:
         last_cmd_ = *msg;
         last_cmd_time_ = now();
         cmd_received_ = true;
+      });
+
+    // V0.1.18 遥控指令输入（remote_agent 20Hz 下发；仅 control_mode=REMOTE 帧作遥控输入，
+    //   command_agent 的交还帧 control_mode=AUTO 不触发本桥）
+    remote_sub_ = create_subscription<hunter_msgs::msg::ChassisCommand>(
+      remote_topic_, 10,
+      [this](const hunter_msgs::msg::ChassisCommand::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(data_mutex_);
+        remote_cmd_ = *msg;
+        remote_stamp_ = now();
+        remote_received_ = true;
       });
 
     // /scan：唯一防撞数据源（pointcloud_to_laserscan 直出，10Hz、min_height
@@ -727,29 +749,52 @@ private:
       return;
     }
 
-    // 3. 上游指令看门狗
-    const bool cmd_valid =
-      cmd_received_ && (now_t - last_cmd_time_).seconds() <= cmd_timeout_;
-    if (!cmd_valid) {
-      publishCmd(0.0, 0.0);
-      transition(State::CMD_TIMEOUT,
-        cmd_received_ ? "上游速度指令断流" : "上游速度指令未到达");
-      return;
+    // 2.5 V0.1.18 遥控执行桥：会话内 /remote/command 新鲜且 control_mode=REMOTE 时，
+    //     把遥控 target_velocity/target_steering 经阿克曼换算作为本闸输入 (v_in,w_in)，
+    //     与 Nav2 指令共用同一套碰撞/曲率/边界安全闸——遥控不再绕过安全层。
+    //     上游 Nav2 看门狗仅在非遥控输入时判（遥控新鲜度由 remote_timeout 自身把关）。
+    double v_in = 0.0, w_in = 0.0;
+    bool remote_active = false;
+    {
+      std::lock_guard<std::mutex> lk(data_mutex_);
+      remote_active = enable_remote_bridge_ && remote_received_ &&
+        remote_cmd_.control_mode == "REMOTE" &&
+        (now_t - remote_stamp_).seconds() <= remote_timeout_;
+      if (remote_active) {
+        if (remote_cmd_.emergency_stop) {
+          v_in = 0.0;
+          w_in = 0.0;
+        } else {
+          v_in = remote_cmd_.target_velocity;
+          // 前轮转角 δ → 横摆角速度 ω = v·tan(δ)/L（随后第 7 步曲率钳制兜底）
+          w_in = (wheelbase_ > 1e-3)
+            ? v_in * std::tan(remote_cmd_.target_steering) / wheelbase_ : 0.0;
+        }
+      } else {
+        v_in = last_cmd_.linear.x;
+        w_in = last_cmd_.angular.z;
+      }
     }
 
-    // 4. 按行进方向取最近障碍（指令快照在锁内取，避免回调并发撕裂）
+    // 3. 上游指令看门狗（仅非遥控输入时判）
+    if (!remote_active) {
+      const bool cmd_valid =
+        cmd_received_ && (now_t - last_cmd_time_).seconds() <= cmd_timeout_;
+      if (!cmd_valid) {
+        publishCmd(0.0, 0.0);
+        transition(State::CMD_TIMEOUT,
+          cmd_received_ ? "上游速度指令断流" : "上游速度指令未到达");
+        return;
+      }
+    }
+
+    // 4. 按行进方向取最近障碍（指令快照已在 2.5 锁内取得，避免回调并发撕裂）
     //    V0.0.98 双判据：静止/低速（|v|≤vel_trust_eps）用直线走廊净空；
     //    行驶中（见 4.7）改按实际指令 (v,w) 的轨迹扫掠弧净空【替换】直线走廊——
     //    不能取两者最小：绕障横移期间直线投影恒有障碍，取小等于回到
     //    V0.0.97 "车被自己的安全闸按停"的几何死锁。静止时保留直线判据防抖
     //    （避免"停着时弧净空=∞→放行→带舵起步撞上去"的极限环）；直线走廊的
     //    横向/点数诊断量 y_lat/cluster_pts 两种状态下都照常刷新。
-    double v_in = 0.0, w_in = 0.0;
-    {
-      std::lock_guard<std::mutex> lk(data_mutex_);
-      v_in = last_cmd_.linear.x;
-      w_in = last_cmd_.angular.z;
-    }
     const bool forward = v_in >= 0.0;
     const bool moving = std::fabs(v_in) > vel_trust_eps_;
     double dist = 0.0;
@@ -772,7 +817,8 @@ private:
     }
 
     // 4.5 V0.0.86 测试模式生效参数：0.1m/s 限速 + 更严碰撞阈值
-    const double v_lim = test_active ? test_max_linear_vel_ : max_linear_vel_;
+    const double v_lim = remote_active ? remote_max_linear_vel_ :
+      (test_active ? test_max_linear_vel_ : max_linear_vel_);
     double stop_d = test_active ? test_stop_dist_ : stop_dist_;
     double slow_d = test_active ? test_slow_dist_ : slow_dist_;
     const char * test_tag = test_active ? "【测试模式】" : "";
@@ -1173,6 +1219,11 @@ private:
   bool enable_map_fence_{true};
   double map_edge_stop_dist_{0.5};
   double map_edge_slow_dist_{1.5};
+  // V0.1.18 遥控执行桥参数
+  bool enable_remote_bridge_{true};
+  std::string remote_topic_{"/remote/command"};
+  double remote_timeout_{0.5};
+  double remote_max_linear_vel_{2.0};
   // 距离场与位姿缓存（data_mutex_ 保护；fence_dist_ 下标 = cy*w+cx）
   bool fence_ready_{false};
   bool fence_pose_received_{false};
@@ -1202,6 +1253,10 @@ private:
   bool cmd_received_{false};
   geometry_msgs::msg::Twist last_cmd_;
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
+  // V0.1.18 遥控执行桥输入（data_mutex_ 保护；仅 tick 读、回调写）
+  bool remote_received_{false};
+  hunter_msgs::msg::ChassisCommand remote_cmd_;
+  rclcpp::Time remote_stamp_{0, 0, RCL_ROS_TIME};
   bool scan_received_{false};
   sensor_msgs::msg::LaserScan last_scan_;
   rclcpp::Time last_scan_time_{0, 0, RCL_ROS_TIME};
@@ -1210,6 +1265,7 @@ private:
 
   // ROS 接口
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_in_sub_;
+  rclcpp::Subscription<hunter_msgs::msg::ChassisCommand>::SharedPtr remote_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;

@@ -29,6 +29,7 @@
   <depend>nav_msgs</depend>
   <depend>nav2_msgs</depend>
   <depend>action_msgs</depend>
+  <depend>hunter_msgs</depend>
 
   <exec_depend>ros2launch</exec_depend>
 

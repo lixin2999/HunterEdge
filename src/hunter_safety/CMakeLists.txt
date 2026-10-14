@@ -14,6 +14,7 @@ find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(action_msgs REQUIRED)
+find_package(hunter_msgs REQUIRED)
 
 add_executable(safety_guard src/safety_guard.cpp)
 target_include_directories(safety_guard PUBLIC
@@ -29,6 +30,7 @@ ament_target_dependencies(safety_guard
   nav_msgs
   nav2_msgs
   action_msgs
+  hunter_msgs
 )
 
 install(TARGETS safety_guard

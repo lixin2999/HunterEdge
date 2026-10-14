@@ -9,18 +9,22 @@
      stop 帧立即停推；非操控态不占编码器与带宽；
   2. 遥控指令双通道：WebSocket（备用，默认关闭）+ **Kafka hunter.<vid>.remote_control**
      （HunterCore 接入包契约通道，与平台其它业务同源同证书）；
-  3. 指令限幅、500ms 超时自动停车并**交还驾驶权**、断线重连；
+  3. 指令限幅；**会话内失联刹停保持**（V0.1.18）：会话存续期间控制帧断流 >500ms
+     持续下发零速刹停帧（车停在原地、不交还），仅收到 stop 帧/REMOTE_RELEASE 才让出；
   4. **逐帧回投 ``command_result``**（acks=all）：契约规定平台 >500ms 收不到回执即判
      链路异常并结束会话；remote_control.schema.json 无 command_id（pending #16 近似
      关联），故回执 command_id 用新生成 uuid，与平台参考实现（vehicle-simulator）一致；
   5. 遥控会话事件经 ``hunter.<vid>.event`` 上报（接入包 Topic 契约不含 remote_status，
      旧版自发该 Topic 已废弃）。
 
-⚠ 关键修复（旧版缺陷）：指令超时后不得继续 20Hz 发布 /remote/command。
-  decision_making 判定 REMOTE 是否生效只看该话题是否在 remote_timeout(0.5s) 内到过数据
-  （src/decision_making/src/decision_making.cpp:122），因此旧版"超时后一直发零速帧"
-  会让 REMOTE 模式永不失效、AUTO 无法恢复。现在超时后：先补一帧刹车停车，
-  随即停止发布 → 决策层判 remote_stale → 回 AUTO。
+⚠ 驾驶权交还语义（V0.1.18 修订，取代旧版“超时即停发→回 AUTO”）：
+  decision_making 判定 REMOTE 是否生效只看 /remote/command 是否在 remote_timeout(0.5s)
+  内到过数据（src/decision_making/src/decision_making.cpp:122）。旧版无会话概念，
+  任何超时都停发→回 AUTO，导致“遥控中短暂丢帧→车恢复跑自主航点”。现按会话区分：
+  • 会话内（boot 已起、未 stop）失联：持续发布刹停帧保持 REMOTE，车停在原地等恢复；
+  • 会话结束（stop 帧 / REMOTE_RELEASE 交还帧）：补一帧刹停后停止发布 → 回 AUTO。
+  ⚠ 代价：若平台异常崩溃且未发 stop 帧，车会保持刹停直至人工 REMOTE_RELEASE/急停；
+     这是“宁可停死不可失控”的有意取舍（与平台会话信令强绑定，需确保 stop 帧必发）。
 
 配置来源优先级：命令行 --config 指定的 YAML > /etc/hunter/remote_agent_params.yaml >
 内置默认值。Kafka 接入参数（Broker/SCRAM/mTLS 证书）不写在 YAML，统一来自
@@ -110,6 +114,8 @@ class RemoteAgent:
         self.cmd_source = ""                     # "WS" | "KAFKA"（事件上报定位用）
         self.remote_active = False               # 是否处于"正在向底盘下发遥控帧"状态
         self.release_requested = False           # 平台显式交还驾驶权
+        self.session_active = False              # 会话是否存续（boot 置真、stop/交还置假）
+        self.hold_logged = False                 # 会话内失联刹停日志只打一次
         self.spin_thread = None
 
         # RTMP 推流会话态（boot 帧起、stop 帧停；_video_lock 保护跨 Kafka/信号处理）
@@ -148,33 +154,51 @@ class RemoteAgent:
     def _on_handover_frame(self, msg):
         if getattr(msg, "control_mode", "REMOTE") != "REMOTE":
             self.release_requested = True
+            self.session_active = False
             self.last_cmd_time = 0.0
             logger.info("收到交还驾驶权帧（control_mode=%s）→ 停止遥控发布", msg.control_mode)
 
     def timer_callback(self):
-        """20Hz：仅在遥控数据新鲜时下发遥控帧；超时立即停车并交还（见模块 docstring）"""
+        """20Hz 发布 /remote/command（V0.1.18：会话内失联刹停保持）
+        - 会话内（session_active 且未交还）：有新鲜控制帧→下发该帧；帧断流→持续
+          下发刹停帧（保持 /remote/command 新鲜 → decision_making 维持 REMOTE、
+          safety_guard 遥控输入零速），车停在原地，直到收到 stop/交还才让出。
+        - 非会话（未 boot / 已 stop / 已交还）：若之前在发→补一帧刹停后停止发布，
+          decision_making 判超时回 AUTO。
+        """
         timeout = float(self.config["cmd_timeout"])
         fresh = (time.time() - self.last_cmd_time) <= timeout if self.last_cmd_time else False
 
-        if fresh and not self.release_requested:
+        if self.session_active and not self.release_requested:
             if not self.remote_active:
                 # 遥控接管**开始**：契约受控词表里的 manual_takeover（info）
                 self.report_event("manual_takeover", extra={"source": self.cmd_source})
-            self.remote_active = True
-            self.publish_command(self.latest_velocity, self.latest_steering, self.latest_brake)
+                self.remote_active = True
+            if fresh:
+                self.hold_logged = False
+                self.publish_command(self.latest_velocity, self.latest_steering, self.latest_brake)
+            else:
+                # 会话内帧断流：刹停保持（不下线、不交还），限频提示避免刷屏
+                self.publish_command(0.0, 0.0, brake=True)
+                if not self.hold_logged:
+                    self.hold_logged = True
+                    logger.warning("遥控会话内指令断流（>%.0fms）：刹停保持，等待恢复或 stop",
+                                   timeout * 1000)
             return
 
         if self.remote_active:
-            # 超时/交还的**一次性**收尾：先刹停，再停止发布，让 decision_making 回 AUTO
+            # 会话结束/交还的**一次性**收尾：先刹停，再停止发布，让 decision_making 回 AUTO
             self.publish_command(0.0, 0.0, brake=True)
             self.remote_active = False
-            reason = "release" if self.release_requested else "cmd_timeout"
+            self.hold_logged = False
+            reason = "release" if self.release_requested else "session_inactive"
             logger.warning("遥控链路结束（%s）：已下发停车帧并停止发布 /remote/command", reason)
             # 契约没有「遥控结束」事件类型 → 只落本地日志（report_event 会过滤掉自造类型）
-            self.report_event("remote_%s" % ("released" if reason == "release" else "timeout"),
-                              "warning" if reason == "release" else "critical",
+            self.report_event("remote_%s" % ("released" if self.release_requested else "timeout"),
+                              "warning" if self.release_requested else "critical",
                               {"source": self.cmd_source,
-                               "last_cmd_age_ms": int((time.time() - self.last_cmd_time) * 1000)})
+                               "last_cmd_age_ms": int((time.time() - self.last_cmd_time) * 1000)
+                               if self.last_cmd_time else -1})
 
     def publish_command(self, velocity, steering, brake=False):
         if not HAS_ROS or not self.cmd_publisher or not self.ros_node:
@@ -318,6 +342,8 @@ class RemoteAgent:
         if video is not None and video.get("recording") is True:
             if session_id:
                 self.session_id = str(session_id)
+            self.session_active = True
+            self.release_requested = False
             self.start_stream(self.session_id, video)
         # ② stop（recording=false）或旧版兼容帧（reason 非空且 heartbeat=false）：
         #    停推 + 交还驾驶权（兼容路径：部分平台版本 stop 帧不带 video 段）
@@ -325,6 +351,7 @@ class RemoteAgent:
                 or (cmd.get("reason") is not None and not heartbeat)):
             self.stop_stream(reason=cmd.get("reason"))
             self.session_id = None
+            self.session_active = False
             self.release_requested = True
             logger.info("平台会话结束（remote_control stop，reason=%s）→ 停推流并交还驾驶权",
                         cmd.get("reason"))
@@ -507,8 +534,15 @@ class RemoteAgent:
             try:
                 self.rtmp_proc = subprocess.Popen(
                     ["gst-launch-1.0", "-e", pipeline],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 self._stream_session = session_id
+                # V0.1.18 视频诊断修复：旧版 stderr=DEVNULL 导致相机被占用/
+                # GStreamer 元素缺失/SRS 不可达等失败全部无声无息，现场无从判断。
+                # 改 PIPE + 后台读取线程，错误实时转写到 journalctl。
+                threading.Thread(
+                    target=self._drain_gst_stderr,
+                    args=(self.rtmp_proc, session_id),
+                    daemon=True).start()
             except Exception as exc:  # noqa: BLE001
                 logger.error("GStreamer 推流启动失败：%s", exc)
                 self.rtmp_proc = None
@@ -522,6 +556,34 @@ class RemoteAgent:
             logger.info("停止 RTMP 推流（reason=%s，session=%s）",
                         reason, self._stream_session)
             self._shutdown_proc_locked()
+
+    def _drain_gst_stderr(self, proc, session_id):
+        """后台线程读取 GStreamer 子进程 stderr 并记入日志。
+
+        常见需要关注的错误关键字：
+          - 'Cannot open device'  / 'Device or resource busy' → 相机被 realsense-ros 占用
+          - 'No such element'     → 缺 gstreamer1.0-plugins-good
+          - 'Connection refused'  → SRS 1935 不可达
+        """
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                msg = raw.decode("utf-8", errors="replace").rstrip()
+                if msg:
+                    # 过滤掉 GStreamer INFO 级别噪声，只转写含关键字的行
+                    if any(kw in msg for kw in (
+                            "ERROR", "WARN", "Critical", "Cannot", "Failed",
+                            "refused", "busy", "No such", "not found",
+                            "Could not", "Unable")):
+                        logger.warning("[GStreamer session=%s] %s", session_id, msg)
+                    else:
+                        logger.debug("[GStreamer] %s", msg)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _shutdown_proc_locked(self):
         """终止推流子进程（调用方必须已持 _video_lock）"""
