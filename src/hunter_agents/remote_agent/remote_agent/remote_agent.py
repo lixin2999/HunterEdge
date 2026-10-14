@@ -2,12 +2,18 @@
 # -*- coding: utf-8 -*-
 """Remote Agent — 远程操控车载端（文档第 13 章，systemd 服务，非 ROS 节点）。
 
-功能：
-  1. GStreamer AGX 硬件 H264 编码 D435 视频 → WebRTC/SRS 传输；
-  2. 遥控指令双通道：WebSocket（低带宽临时联调）+ **Kafka hunter.<vid>.remote_control**
+功能（V0.1.15 起对齐 HunterCore V1.21.0《车端远程操控部署指南》）：
+  1. 视频**会话制 RTMP 推流**（V1.21.0 架构：车端 RTMP 推流(1935) → SRS → 浏览器 WHEP
+     拉流(9090)）：收到 boot 帧（heartbeat=true 且 video.recording=true）起 AGX 硬件
+     H.264 编码，推到 ``<srs_rtmp_base_url>/<prefix>_<vehicle_id>_<session_id>``，
+     stop 帧立即停推；非操控态不占编码器与带宽；
+  2. 遥控指令双通道：WebSocket（备用，默认关闭）+ **Kafka hunter.<vid>.remote_control**
      （HunterCore 接入包契约通道，与平台其它业务同源同证书）；
   3. 指令限幅、500ms 超时自动停车并**交还驾驶权**、断线重连；
-  4. 遥控会话事件经 ``hunter.<vid>.event`` 上报（接入包 Topic 契约不含 remote_status，
+  4. **逐帧回投 ``command_result``**（acks=all）：契约规定平台 >500ms 收不到回执即判
+     链路异常并结束会话；remote_control.schema.json 无 command_id（pending #16 近似
+     关联），故回执 command_id 用新生成 uuid，与平台参考实现（vehicle-simulator）一致；
+  5. 遥控会话事件经 ``hunter.<vid>.event`` 上报（接入包 Topic 契约不含 remote_status，
      旧版自发该 Topic 已废弃）。
 
 ⚠ 关键修复（旧版缺陷）：指令超时后不得继续 20Hz 发布 /remote/command。
@@ -27,6 +33,7 @@ import os
 import subprocess
 import threading
 import time
+import uuid
 
 try:
     import websocket  # websocket-client
@@ -78,7 +85,6 @@ def clamp(v, lo, hi):
 class RemoteAgent:
     def __init__(self, config):
         self.config = config
-        self.gst_proc = None
         self.ws = None
         self.running = False
         self.last_cmd_time = 0.0
@@ -86,9 +92,10 @@ class RemoteAgent:
         self.cmd_publisher = None
         self.kafka_producer = None
         self.kafka_consumer = None
+        self.rc_result_producer = None          # command_result 回执（acks=all，不可丢）
 
         self.vehicle_id = config["vehicle_id"]
-        self.ws_url = config["ws_url"]           # wss://platform/ws/remote
+        self.ws_url = config["ws_url"]           # ws://<SERVER_IP>/ws/remote（备用通道）
         self.cmd_topic = config.get("cmd_topic", "/remote/command")
 
         # 遥控指令缓存（由 WS/Kafka 任一通道写入，20Hz 定时器读出并发布）
@@ -99,6 +106,12 @@ class RemoteAgent:
         self.remote_active = False               # 是否处于"正在向底盘下发遥控帧"状态
         self.release_requested = False           # 平台显式交还驾驶权
         self.spin_thread = None
+
+        # RTMP 推流会话态（boot 帧起、stop 帧停；_video_lock 保护跨 Kafka/信号处理）
+        self.session_id = None
+        self.rtmp_proc = None
+        self._stream_session = None
+        self._video_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # ROS2 桥接（发布 /remote/command，文档 13.4）
@@ -189,11 +202,18 @@ class RemoteAgent:
                 self.vehicle_id, "event",
                 properties_path=self.config.get("kafka_properties", DEFAULT_PROPERTIES_PATH),
                 bundle_dir=self.config.get("kafka_bundle_dir", DEFAULT_BUNDLE_DIR))
+            # 操控回执专用 producer（契约 command_result 属 acks=all 关键链，与 event 同档
+            # 但分开建，便于高频 20Hz 回执不挤占事件队列）
+            self.rc_result_producer = make_producer(
+                self.vehicle_id, "command_result",
+                properties_path=self.config.get("kafka_properties", DEFAULT_PROPERTIES_PATH),
+                bundle_dir=self.config.get("kafka_bundle_dir", DEFAULT_BUNDLE_DIR))
         except KafkaConfigError as exc:
             logger.error("Kafka 接入失败：%s", exc)
             return False
-        logger.info("remote_control Kafka 通道就绪：%s",
-                    topic_name(self.vehicle_id, "remote_control"))
+        logger.info("remote_control Kafka 通道就绪：%s（回执：%s）",
+                    topic_name(self.vehicle_id, "remote_control"),
+                    topic_name(self.vehicle_id, "command_result"))
         threading.Thread(target=self.kafka_loop, daemon=True).start()
         return True
 
@@ -269,21 +289,37 @@ class RemoteAgent:
         if not isinstance(cmd, dict):
             logger.warning("指令报文不是 JSON 对象：%r", data)
             return
-
+    
         # ── 帧类别与字段名（HunterCore ``remote_control.schema.json``）──────────
         # 契约：{vehicle_id, timestamp, seq, control:{target_velocity,target_steer,brake,gear,mode},
         #        heartbeat, reason, session_id, video:{recording,...}}
-        # G-10：boot 帧 heartbeat=true / stop 帧 heartbeat=false 且带 reason，控制量恒零。
+        # G-10/V1.21.0：boot 帧 heartbeat=true + video.recording=true（控制量恒零）；
+        # stop 帧 heartbeat=false + video.recording=false，且带受控词表 reason。
         control = cmd.get("control") if isinstance(cmd.get("control"), dict) else {}
-
-        # 交还驾驶权：契约 stop 帧（reason 非空）→ 兼容旧字段 release / control_mode="AUTO"
-        if ((cmd.get("reason") is not None and cmd.get("heartbeat") is False)
-                or cmd.get("release") is True or cmd.get("control_mode") == "AUTO"):
+        heartbeat = bool(cmd.get("heartbeat", False))
+        video = cmd.get("video") if isinstance(cmd.get("video"), dict) else None
+        session_id = cmd.get("session_id") or self.session_id
+    
+        # 会话边界帧先于 TTL 判定处理：boot/stop 决定推拉流，迟到几帧也必须按序执行，
+        # 否则会留下野推流（stop 被丢）或拒绝接管（boot 被丢）的脏状态。
+        # ① boot（recording=true）：记 session_id → 起 RTMP 推流（幂等）
+        if video is not None and video.get("recording") is True:
+            if session_id:
+                self.session_id = str(session_id)
+            self.start_stream(self.session_id, video)
+        # ② stop（recording=false）或旧版兼容帧（reason 非空且 heartbeat=false）：
+        #    停推 + 交还驾驶权（兼容路径：部分平台版本 stop 帧不带 video 段）
+        if ((video is not None and video.get("recording") is False)
+                or (cmd.get("reason") is not None and not heartbeat)):
+            self.stop_stream(reason=cmd.get("reason"))
+            self.session_id = None
             self.release_requested = True
-            logger.info("平台请求交还驾驶权（remote_control，reason=%s）", cmd.get("reason"))
+            logger.info("平台会话结束（remote_control stop，reason=%s）→ 停推流并交还驾驶权",
+                        cmd.get("reason"))
+            self.ack_command_result(cmd)
             return
-
-        # 时效校验：断网重连/消费组重建时不得执行历史遥控帧
+    
+        # 时效校验（仅限控制/心跳帧）：断网重连/消费组重建时不得执行历史遥控帧
         # （契约字段 timestamp，兼容旧名 issued_at/ts；秒级 epoch）
         issued = cmd.get("timestamp")
         if not isinstance(issued, (int, float)) or issued <= 0:
@@ -295,7 +331,7 @@ class RemoteAgent:
             if time.time() - float(issued) > ttl:
                 logger.warning("丢弃过期遥控指令（%.2fs 前下发）", time.time() - float(issued))
                 return
-
+    
         # 安全限幅（文档 13.4：远程模式最高 2.0 m/s，转向 ±0.4 rad）
         # 契约字段 control.target_velocity / control.target_steer（兼容旧平铺 velocity/steering_angle）
         raw_velocity = control.get("target_velocity", cmd.get("velocity", 0.0))
@@ -304,10 +340,57 @@ class RemoteAgent:
             float(raw_velocity), -float(self.config["max_velocity"]), float(self.config["max_velocity"]))
         self.latest_steering = clamp(
             float(raw_steering), -float(self.config["max_steering"]), float(self.config["max_steering"]))
-        self.latest_brake = bool(control.get("brake", cmd.get("brake", False)))
+        # 契约 brake 为归一化 0~1（G-10 可选；estop 零速帧固定 1.0）；底盘只有布尔
+        # 急停 → 仅 brake>=1.0 视为急停（旧版 bool(0.5)=True 会把比例制动误判成急停）
+        brake_raw = control.get("brake", cmd.get("brake", 0.0))
+        if isinstance(brake_raw, bool):
+            self.latest_brake = brake_raw
+        else:
+            try:
+                self.latest_brake = float(brake_raw) >= 1.0
+            except (TypeError, ValueError):
+                self.latest_brake = False
         self.last_cmd_time = time.time()
         self.release_requested = False
         self.cmd_source = source
+        # 逐帧回执（含 boot/心跳帧：平台据此计 commands_acked 与链路健康）
+        self.ack_command_result(cmd)
+    
+    def ack_command_result(self, cmd):
+        """回投 ``hunter.<vid>.command_result``（契约 required：command_id/vehicle_id/
+        timestamp/success；additionalProperties=false）。
+    
+        remote_control 帧不携带 command_id（契约无此字段，pending #16 平台按
+        (session_id, seq, 时序窗口) 近似关联计数），故幂等键用**新生成 uuid**；
+        >500ms 无回执平台会判链路异常结束会话，因此**每帧都回**，失败只记日志
+        不影响控制应用（回执丢失的后续帧会补上链路健康信号）。
+        """
+        if not self.config.get("ack_command_result", True):
+            return
+        if self.rc_result_producer is None:
+            return
+        control = cmd.get("control") if isinstance(cmd.get("control"), dict) else {}
+        payload = {
+            "command_id": str(uuid.uuid4()),
+            "vehicle_id": self.vehicle_id,
+            "timestamp": round(time.time(), 3),
+            "success": True,
+            "result_code": "0",
+            "message": "applied v=%s steer=%s seq=%s" % (
+                control.get("target_velocity", 0.0),
+                control.get("target_steer", 0.0),
+                cmd.get("seq"))[:512],
+        }
+        if cmd.get("session_id"):
+            payload["data"] = {"session_id": str(cmd["session_id"])}
+        try:
+            self.rc_result_producer.produce(
+                topic_name(self.vehicle_id, "command_result"),
+                value=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                key=self.vehicle_id.encode("utf-8"))
+            self.rc_result_producer.poll(0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("command_result 回执投递失败（不影响控制应用）：%s", exc)
 
     # ------------------------------------------------------------------
     # WebSocket 循环（SRS 信令 + 控制指令，断线重连）
@@ -353,37 +436,90 @@ class RemoteAgent:
                     self.ws = None
 
     # ------------------------------------------------------------------
-    # 视频链路（文档 13.2.2：AGX 硬件 H264 编码）
+    # 视频链路（V1.21.0：会话制 RTMP 推流，boot 起 / stop 停，AGX 硬件 H.264 编码）
     # ------------------------------------------------------------------
-    def build_pipeline(self):
-        """构建 GStreamer 编码流水线（1280x720@30fps，3Mbps CBR）"""
+    def _rtmp_url_for(self, session_id):
+        """拼接完整推流地址：``<base>/<prefix>_<vehicle_id>_<session_id>``（契约命名）。
+
+        基址由车端静态配置（指南 §1：rtmp://<SERVER_IP>:1935/remote_control），
+        流名前缀默认 ``hunter``（= 平台 RC_SRS_STREAM_PREFIX，不可自创）。
+        """
+        base = (self.config.get("srs_rtmp_base_url") or "").strip().rstrip("/")
+        if not base or not session_id:
+            return ""
+        prefix = self.config.get("srs_stream_prefix", "hunter")
+        return f"{base}/{prefix}_{self.vehicle_id}_{session_id}"
+
+    def build_pipeline(self, session_id, video_cfg):
+        """构建 GStreamer 硬编→RTMP 流水线（契约：H.264/1280x720/≤30fps/2048-4096kbps/GOP 1s）。
+
+        编码参数以 boot 帧 ``video.*`` 为准（契约不可协商项，服务端已校验），
+        缺失时回落 YAML 配置；iframeinterval=fps 即每秒一个关键帧。
+        """
         c = self.config
+        fps = int(video_cfg.get("fps") or c.get("video_fps", 30))
+        fps = max(1, min(fps, 30))
+        kbps = int(video_cfg.get("bitrate_kbps") or c.get("video_bitrate_kbps", 3000))
+        kbps = max(2048, min(kbps, 4096))
+        url = self._rtmp_url_for(session_id)
         return (
             f"v4l2src device={c['camera_device']} ! "
-            "video/x-raw,width=1280,height=720,framerate=30/1 ! "
+            f"video/x-raw,width=1280,height=720,framerate={fps}/1 ! "
             "videoconvert ! nvvidconv ! 'video/x-raw(memory:NVMM),format=NV12' ! "
-            f"nvv4l2h264enc bitrate={c['bitrate']} iframeinterval=30 control-rate=1 "
+            f"nvv4l2h264enc bitrate={kbps * 1000} iframeinterval={fps} control-rate=1 "
             "profile=4 preset-level=1 ! "
-            "h264parse ! rtph264pay config-interval=1 pt=96 ! "
-            f"udpsink host={c['srs_host']} port={c['srs_rtp_port']}"
+            "h264parse ! flvmux streamable=true ! "
+            f'rtmpsink location="{url}"'
         )
 
-    def start_gstreamer(self):
+    def start_stream(self, session_id, video_cfg=None):
+        """boot 帧→启动 RTMP 推流（按 session_id 幂等；同会话重复 boot 不重启）"""
         if not self.config.get("enable_video", True):
-            logger.info("视频链路已按配置关闭（enable_video=false）")
+            logger.info("视频链路已按配置关闭（enable_video=false），boot 帧不起推流")
             return
-        pipeline = self.build_pipeline()
-        logger.info("启动 GStreamer 编码：%s", pipeline)
-        try:
-            self.gst_proc = subprocess.Popen(
-                ["gst-launch-1.0", pipeline],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("GStreamer 启动失败：%s", exc)
+        if not session_id:
+            logger.warning("boot 帧无 session_id，无法定位流名，不起推流")
+            return
+        url = self._rtmp_url_for(session_id)
+        if not url:
+            logger.error("srs_rtmp_base_url 未配置，无法推流（例："
+                         "rtmp://192.168.31.35:1935/remote_control）")
+            return
+        with self._video_lock:
+            if self.rtmp_proc and self.rtmp_proc.poll() is None \
+                    and self._stream_session == session_id:
+                return
+            self._shutdown_proc_locked()
+            pipeline = self.build_pipeline(session_id, video_cfg or {})
+            logger.info("boot 帧到，启动 RTMP 推流：%s", url)
+            try:
+                self.rtmp_proc = subprocess.Popen(
+                    ["gst-launch-1.0", "-e", pipeline],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._stream_session = session_id
+            except Exception as exc:  # noqa: BLE001
+                logger.error("GStreamer 推流启动失败：%s", exc)
+                self.rtmp_proc = None
+                self._stream_session = None
 
-    def stop_gstreamer(self):
-        if self.gst_proc and self.gst_proc.poll() is None:
-            self.gst_proc.terminate()
+    def stop_stream(self, reason=None):
+        """stop 帧/退出→停推流并释放编码器（幂等）"""
+        with self._video_lock:
+            if self.rtmp_proc is None and self._stream_session is None:
+                return
+            logger.info("停止 RTMP 推流（reason=%s，session=%s）",
+                        reason, self._stream_session)
+            self._shutdown_proc_locked()
+
+    def _shutdown_proc_locked(self):
+        """终止推流子进程（调用方必须已持 _video_lock）"""
+        proc, self.rtmp_proc, self._stream_session = self.rtmp_proc, None, None
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:  # noqa: BLE001
+                proc.kill()
 
     # ------------------------------------------------------------------
     # 主入口
@@ -393,16 +529,23 @@ class RemoteAgent:
         self.resolve_vehicle_id()
         self.init_ros()
         self.init_kafka()
-        self.start_gstreamer()
-        logger.info("Remote Agent 启动：vehicle_id=%s，遥控通道=WS(%s)+Kafka(%s)",
-                    self.vehicle_id, HAS_WS and "on" or "off",
-                    "on" if self.kafka_consumer else "off")
+        logger.info("Remote Agent 启动：vehicle_id=%s，遥控通道=Kafka(%s)+WS(%s)，"
+                    "视频=会话制 RTMP 推流（boot 帧起）",
+                    self.vehicle_id,
+                    "on" if self.kafka_consumer else "off",
+                    "on" if (HAS_WS and self.config.get("enable_ws", False)) else "off")
         try:
-            # WebSocket 主循环（含断线重连）阻塞在此；Kafka 通道在独立线程
-            self.websocket_loop()
+            # V0.1.15：推流不再开机即起，改由 remote_control boot 帧触发（会话制）；
+            # 主阻塞点：启用备用 WS 时跑 WS 循环（含断线重连），否则空转保活，
+            # Kafka 消费/20Hz 发布/超时看门狗均在独立线程。
+            if self.config.get("enable_ws", False):
+                self.websocket_loop()
+            else:
+                while self.running:
+                    time.sleep(1.0)
         finally:
             self.running = False
-            self.stop_gstreamer()
+            self.stop_stream(reason="agent_shutdown")
             self.shutdown()
 
     def shutdown(self):
@@ -416,6 +559,11 @@ class RemoteAgent:
                 self.kafka_producer.flush(3.0)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Kafka producer flush 异常：%s", exc)
+        try:
+            if self.rc_result_producer:
+                self.rc_result_producer.flush(3.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("command_result producer flush 异常：%s", exc)
         try:
             if self.ros_node and HAS_ROS and rclpy.ok():
                 self.ros_node.destroy_node()
@@ -446,11 +594,18 @@ DEFAULT_CONFIG = {
     "vehicle_id": "HUNTER-001",
     "camera_device": "/dev/video0",          # D435 RGB（文档 13.2.1）
     "enable_video": True,
-    "bitrate": 3000000,                       # 3Mbps CBR（文档 13.2.2）
-    "srs_host": "127.0.0.1",                  # SRS 媒体服务器
-    "srs_rtp_port": 8000,
-    "ws_url": "wss://platform.example.com/ws/remote",  # 文档 17.2
+    # ── 视频链路（V1.21.0：RTMP 推流 → SRS → 浏览器 WHEP 拉流）──
+    # 基址到 app 为止（rtmp://<SERVER_IP>:1935/remote_control），会话后缀由 boot 帧
+    # 拼出；属现场拓扑配置而非凭据，不写入 kafka.properties；留空 = boot 帧到达时
+    # 报错不推流（指令/回执链路不受影响）
+    "srs_rtmp_base_url": "",                  # 例 rtmp://192.168.31.35:1935/remote_control
+    "srs_stream_prefix": "hunter",            # = 平台 RC_SRS_STREAM_PREFIX（契约不可自创）
+    "video_fps": 30,                          # boot 帧未带 video.fps 时的回落（≤30 契约上限）
+    "video_bitrate_kbps": 3000,               # 回落码率（契约 2048~4096 kbps）
+    "ws_url": "",                             # 文档 17.2 备用通道（例 ws://<SERVER_IP>/ws/remote）
+    "enable_ws": False,                       # 主通道为 Kafka；备用 WS 需平台 JWT，默认关
     "cmd_topic": "/remote/command",           # 文档 13.4
+    "ack_command_result": True,               # 逐帧回投 command_result（平台 500ms 无回执判异常）
     # Kafka 接入只保留路径（凭据与 mTLS 证书在 /etc/hunter/kafka/kafka.properties）
     "kafka_properties": DEFAULT_PROPERTIES_PATH,
     "kafka_bundle_dir": DEFAULT_BUNDLE_DIR,

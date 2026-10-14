@@ -1,25 +1,35 @@
-# remote_agent_params.yaml — 遥控 Agent 参数（文档第 13 章 + HunterCore 接入包契约）
+# remote_agent_params.yaml — 遥控 Agent 参数（文档第 13 章 + HunterCore V1.21.0《车端远程操控部署指南》）
 #
 # ⚠ 安全约定：本文件**不写任何凭据**。Broker / SCRAM 口令 / mTLS 证书路径统一来自
 #   /etc/hunter/kafka/kafka.properties（目录 0750 / properties 0640 / 私钥 0600，不入版本库）。
 #   remote_agent 为 systemd 服务（非 ROS 节点），启动时按 --config / 本文件覆盖内置默认值。
+#
+# V0.1.15 视频链路改版（对齐平台 V1.21.0）：旧「rtph264pay → udpsink(8000) 常驻推流」
+#   作废，改为**会话制 RTMP 推流**：收到 remote_control boot 帧（video.recording=true）
+#   才起 AGX 硬编推到 `srs_rtmp_base_url/<prefix>_<vehicle_id>_<session_id>`（SRS 1935），
+#   stop 帧立即停推；浏览器侧经 WHEP(9090) 拉流，车端无需任何 WebRTC 信令。
 remote_agent:
   ros__parameters:
     vehicle_id: "HUNTER-001"                          # 留空或与接入包不一致时以 kafka.properties 为准
     kafka_properties: "/etc/hunter/kafka/kafka.properties"
     kafka_bundle_dir: "/etc/hunter/kafka"
 
-    # ── 视频链路（文档 13.2）──────────────────────────────────────
+    # ── 视频链路（V1.21.0：车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流）──
     camera_device: "/dev/video0"                      # D435 RGB
-    enable_video: true                                # 无相机/纯指令联调时可关闭
-    bitrate: 3000000                                  # 3Mbps CBR
-    srs_host: "127.0.0.1"                             # SRS 媒体服务器
-    srs_rtp_port: 8000
-    ws_url: "wss://platform.example.com/ws/remote"    # 文档 17.2（WebSocket 备用通道）
+    enable_video: true                                # 无相机/纯指令联调时可关闭（指令链路不受影响）
+    srs_rtmp_base_url: "rtmp://192.168.31.35:1935/remote_control"   # SRS RTMP 入口（平台服务器 IP；换平台只改本行）
+    srs_stream_prefix: "hunter"                       # = 平台 RC_SRS_STREAM_PREFIX，流名 hunter_HUNTER-001_{session_id}
+    video_fps: 30                                     # boot 帧未带 video.fps 时的回落（契约上限 30）
+    video_bitrate_kbps: 3000                          # 回落码率（契约 2048~4096 kbps，GOP 1s 固定）
 
-    # ── 遥控指令（文档 13.4；主通道为 Kafka hunter.<vid>.remote_control）──
+    # ── 遥控指令（主通道 Kafka hunter.<vid>.remote_control，20Hz/50ms）──
     cmd_topic: "/remote/command"
-    max_velocity: 2.0                                 # 远程限速 2.0 m/s
+    max_velocity: 2.0                                 # 远程限速 2.0 m/s（安全红线，不可上调）
     max_steering: 0.4                                 # 转向 ±0.4 rad
-    cmd_timeout: 0.5                                  # 500ms 无指令 → 停车并交还驾驶权
+    cmd_timeout: 0.5                                  # 500ms 无指令 → 停车并交还驾驶权（安全红线）
     remote_cmd_ttl: 1.0                               # remote_control 报文时效（秒），过期丢弃
+    ack_command_result: true                          # 逐帧回投 command_result（acks=all；平台 >500ms 无回执判链路异常结束会话）
+
+    # ── WebSocket 备用通道（文档 17.2；需平台 JWT，生产不启用，仅留联调口子）──
+    enable_ws: false
+    ws_url: "ws://192.168.31.35/ws/remote"            # 经 api-gateway 的备用控制通道
