@@ -521,6 +521,17 @@ class CommandAgent(Node):
             "REMOTE_RELEASE": self._do_remote_release,
             "STATUS_QUERY": lambda c, p: self._result(c, Status.SUCCEEDED, "状态快照"),
             "HEARTBEAT_ACK": lambda c, p: self._result(c, Status.SUCCEEDED, "车端在线"),
+            # ── HunterCore V1.21.0 远程操控会话信令（command 平面，HUNTER-001 实机 rc_probe 定位）──
+            # 平台在 command 平面下发 rc_session_start 作为会话握手，收到 success 回执后才进入
+            # 20Hz remote_control 控制帧阶段；真正的起流/接管与交还由 remote_agent 消费
+            # remote_control 的 boot/stop 帧完成，command_agent 只需确认信令（无副作用）。
+            # V0.1.15 未登记这两条 → _guard 判“不在白名单”返回 REJECTED(success=false) → 平台
+            # 立即结束会话，表现为“遥控秒断 + 视频黑屏 + 已发 N 回执 0”（并非平台未发控制帧）。
+            # key 用平台原始小写名：_command_type 无别名映射时原样返回 rc_session_start/end。
+            "rc_session_start": lambda c, p: self._result(
+                c, Status.SUCCEEDED, "远程会话信令已确认（起流/接管由 remote_control boot 帧驱动）"),
+            "rc_session_end": lambda c, p: self._result(
+                c, Status.SUCCEEDED, "远程会话结束信令已确认"),
         }
 
     def _do_estop_engage(self, cmd, _params) -> Dict[str, Any]:
@@ -637,8 +648,12 @@ class CommandAgent(Node):
             self._publish_result(self._retry_results.popleft())
 
     def _commit(self, msg) -> None:
+        # commit(offsets=...) 只接受 TopicPartition 且 offset 需 +1（直传 Message 必报
+        # "expected cimpl.TopicPartition"，offset 永不落盘；与 kafka_bus.commit_cmd 同口径）
         try:
-            self._consumer.commit(offsets=[msg], asynchronous=False)
+            from confluent_kafka import TopicPartition
+            tp = TopicPartition(msg.topic(), msg.partition(), msg.offset() + 1)
+            self._consumer.commit(offsets=[tp], asynchronous=False)
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error('offset 提交失败：%s' % (exc,))
 

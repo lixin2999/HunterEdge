@@ -156,8 +156,13 @@ class OtaAgent:
     def _commit(self, msg):
         if not (self.consumer and msg is not None):
             return
+        # commit(offsets=...) 只接受 TopicPartition 且 offset 需 +1（直传 Message 必报
+        # "expected cimpl.TopicPartition"，offset 永不落盘 → 重启后 earliest 会重复消费
+        # ota_notify；与 vehicle_ingest_agent.kafka_bus.commit_cmd 同口径）
         try:
-            self.consumer.commit(offsets=[msg], asynchronous=False)
+            from confluent_kafka import TopicPartition
+            tp = TopicPartition(msg.topic(), msg.partition(), msg.offset() + 1)
+            self.consumer.commit(offsets=[tp], asynchronous=False)
         except Exception as exc:  # noqa: BLE001
             logger.error("ota_notify offset 提交失败：%s", exc)
 

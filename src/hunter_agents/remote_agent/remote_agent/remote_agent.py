@@ -56,6 +56,11 @@ except ImportError:
     HAS_YAML = False
 
 try:
+    from confluent_kafka import TopicPartition  # 手动提交需构造（V0.1.16）
+except ImportError:
+    TopicPartition = None
+
+try:
     from hunter_kafka.client import make_consumer, make_producer, topic_name
     from hunter_kafka.config import (DEFAULT_BUNDLE_DIR, DEFAULT_PROPERTIES_PATH,
                                      KafkaConfigError, load_properties, resolve_vehicle_id)
@@ -234,9 +239,16 @@ class RemoteAgent:
             try:
                 self.on_command(msg.value(), source="KAFKA")
             finally:
-                # 逐条手动提交（契约：enable.auto.commit=false）
+                # 逐条手动提交（契约：enable.auto.commit=false）。
+                # ⚠ commit(offsets=...) 只接受 TopicPartition 列表且 offset 需 +1（下一条）；
+                # 直传 Message 必报 "expected cimpl.TopicPartition"（V0.1.05~V0.1.15 每帧
+                # ERROR、offset 从未落盘；不阻断消费但破坏重启后续点语义）
                 try:
-                    self.kafka_consumer.commit(offsets=[msg], asynchronous=False)
+                    if TopicPartition is not None:
+                        tp = TopicPartition(msg.topic(), msg.partition(), msg.offset() + 1)
+                        self.kafka_consumer.commit(offsets=[tp], asynchronous=False)
+                    else:
+                        self.kafka_consumer.commit(asynchronous=False)
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Kafka offset 提交失败：%s", exc)
 
