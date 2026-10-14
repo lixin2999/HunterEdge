@@ -164,6 +164,16 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
     std::chrono::milliseconds(static_cast<int64_t>(1000.0 / std::max(1.0, cruise_cmd_rate_))),
     std::bind(&AutoMissionNode::cruiseControlStep, this));
 
+  // ---- V0.1.19 任务授权门控服务（nav 模式专用，上电后等待平台明确启动） ----
+  arm_srv_ = create_service<std_srvs::srv::Trigger>(
+    "/auto_mission/arm",
+    std::bind(&AutoMissionNode::armCallback, this,
+      std::placeholders::_1, std::placeholders::_2));
+  disarm_srv_ = create_service<std_srvs::srv::Trigger>(
+    "/auto_mission/disarm",
+    std::bind(&AutoMissionNode::disarmCallback, this,
+      std::placeholders::_1, std::placeholders::_2));
+
   // ---- 初始化时间戳（防止启动时误判感知超时） ----
   last_perception_stamp_ = this->now();
 
@@ -173,10 +183,11 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
     std::bind(&AutoMissionNode::mainLoop, this));
 
   RCLCPP_INFO(get_logger(),
-    "auto_mission_node 启动：模式=%s，航点数=%zu，循环=%s\n"
+    "auto_mission_node 启动：模式=%s，航点数=%zu，循环=%s，上电自启=%s\n"
     "  V0.1.00 任务自愈：逐点隔离=%s(冷却%.0fs/单点上限%d次/任务上限%d次)，"
     "近身假障碍诊断=%s，地图可达性=%s，FAULT 自愈=%s(静置%.0fs/重试%.0fs~%.0fs)",
     mission_mode_.c_str(), waypoints_.size(), loop_waypoints_ ? "是" : "否",
+    require_explicit_start_ ? "否（等待 /auto_mission/arm）" : "是",
     "开", wp_isolation_cooldown_, max_wp_failures_, max_consec_failures_,
     self_check_enable_ ? "开" : "关",
     reachability_enable_ ? "开" : "关",
@@ -191,6 +202,9 @@ void AutoMissionNode::declareParameters()
 {
   // 运行模式
   declare_parameter("mission_mode", "waypoint_loop");   // waypoint_loop | external
+
+  // V0.1.19 任务授权门控：nav 模式下上电不自动启动导航，等待平台明确指令
+  declare_parameter("require_explicit_start", true);
 
   // 安全距离
   declare_parameter("warn_obstacle_dist", 2.0);
@@ -295,6 +309,7 @@ void AutoMissionNode::declareParameters()
 
   // 读取
   mission_mode_           = get_parameter("mission_mode").as_string();
+  require_explicit_start_ = get_parameter("require_explicit_start").as_bool();
   warn_obstacle_dist_     = get_parameter("warn_obstacle_dist").as_double();
   stop_obstacle_dist_     = get_parameter("stop_obstacle_dist").as_double();
   obstacle_fov_deg_       = get_parameter("obstacle_fov_deg").as_double();
@@ -898,6 +913,57 @@ void AutoMissionNode::stopCruiseCallback(
 }
 
 // ==========================================================================
+// V0.1.19 任务授权服务回调（nav 模式专用）
+// ==========================================================================
+void AutoMissionNode::armCallback(
+  const std_srvs::srv::Trigger::Request::SharedPtr,
+  std_srvs::srv::Trigger::Response::SharedPtr resp)
+{
+  if (mission_mode_ == "mapping") {
+    // 建图模式：转发到 startCruiseCallback（保持旧版 MISSION_START 对建图模式的兼容）
+    startCruiseCallback(nullptr, resp);
+    return;
+  }
+  if (mission_armed_.load()) {
+    resp->success = true;
+    resp->message = "任务已授权（幂等，无需重复调用）";
+    return;
+  }
+  mission_armed_.store(true);
+  resp->success = true;
+  resp->message = "任务已授权，AUTO 条件满足时将自动启动导航";
+  RCLCPP_INFO(get_logger(), "[授权] ✓ %s", resp->message.c_str());
+}
+
+void AutoMissionNode::disarmCallback(
+  const std_srvs::srv::Trigger::Request::SharedPtr,
+  std_srvs::srv::Trigger::Response::SharedPtr resp)
+{
+  if (mission_mode_ == "mapping") {
+    // 建图模式：转发到 stopCruiseCallback
+    stopCruiseCallback(nullptr, resp);
+    return;
+  }
+  if (!mission_armed_.load()) {
+    resp->success = true;
+    resp->message = "任务未授权（幂等）";
+    return;
+  }
+  mission_armed_.store(false);
+  // 如果当前正在导航，取消并回到 IDLE
+  if (state_ == MissionState::NAVIGATING || state_ == MissionState::WAITING_LOCALIZE ||
+      state_ == MissionState::OBSTACLE_AVOID)
+  {
+    cancelCurrentGoal();
+    state_ = MissionState::IDLE;
+    RCLCPP_WARN(get_logger(), "[解除授权] 导航已中止，回到 IDLE（等待重新 arm）");
+  }
+  resp->success = true;
+  resp->message = "任务授权已解除，导航停止（如正在执行）";
+  RCLCPP_INFO(get_logger(), "[解除授权] %s", resp->message.c_str());
+}
+
+// ==========================================================================
 // 主循环（10Hz）
 // ==========================================================================
 void AutoMissionNode::mainLoop()
@@ -1014,6 +1080,12 @@ void AutoMissionNode::mainLoop()
           health.overall_status.c_str(),
           isLocalizationValid() ? "是" : "否",
           isPerceptionAlive() ? "是" : "否");
+        break;
+      }
+      // V0.1.19 任务授权门控：上电后不自动启动导航，等待平台 MISSION_START 明确授权
+      if (require_explicit_start_ && !mission_armed_.load()) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+          "[IDLE] AUTO 条件已满足，但等待平台授权启动（调用 /auto_mission/arm 或发送 MISSION_START）");
         break;
       }
       if (waypoints_.empty()) {

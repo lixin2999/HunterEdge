@@ -224,6 +224,16 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_cruise_srv_;
   rclcpp::TimerBase::SharedPtr cruise_timer_;
 
+  // ---- V0.1.19 任务授权门控（nav 模式上电不自动启动，等待平台明确指令） ----
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr arm_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr disarm_srv_;
+  void armCallback(
+    const std_srvs::srv::Trigger::Request::SharedPtr req,
+    std_srvs::srv::Trigger::Response::SharedPtr resp);
+  void disarmCallback(
+    const std_srvs::srv::Trigger::Request::SharedPtr req,
+    std_srvs::srv::Trigger::Response::SharedPtr resp);
+
   rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr nav_action_client_;
 
   // ---- Nav2 就绪门控状态 ----
@@ -380,6 +390,9 @@ private:
   // ---- 参数 ----
   // 模式
   std::string mission_mode_;           // "mapping"（建图）| "nav"（自主导航）
+  // V0.1.19 任务授权门控
+  bool require_explicit_start_{true};  // true=上电后不自动启动导航，需平台 MISSION_START
+  std::atomic<bool> mission_armed_{false};  // 平台已授权启动标志
   // 安全距离
   double warn_obstacle_dist_{2.0};     // 减速阈值（m）
   double stop_obstacle_dist_{0.8};     // 急停阈值（m）

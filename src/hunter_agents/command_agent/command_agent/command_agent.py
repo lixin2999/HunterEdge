@@ -9,8 +9,8 @@ r"""command_agent — HunterCore 平台下行指令接入（文档 14/16 章 + �
 
 | 指令 type        | 车端动作                                                          |
 |------------------|-------------------------------------------------------------------|
-| MISSION_START    | 服务 /auto_mission/start_mapping_cruise（建图自动巡航，含航点热重载） |
-| MISSION_STOP     | 服务 /auto_mission/stop_mapping_cruise                              |
+| MISSION_START    | 服务 /auto_mission/arm（nav 模式授权启动 / mapping 模式启动巡航） |
+| MISSION_STOP     | 服务 /auto_mission/disarm（nav 模式解除授权 / mapping 模式停止巡航） |
 | MAP_CONVERT      | 服务 /pcd_to_map/convert（建图产物 → .pgm/.yaml）                   |
 | WAYPOINT_SAVE    | 服务 /waypoint_recorder/save                                        |
 | WAYPOINT_CLEAR   | 服务 /waypoint_recorder/clear（需 params.confirm=true）            |
@@ -206,8 +206,8 @@ class CommandAgent(Node):
         # command_agent 每次 spin 一进回调分发就必崩（HUNTER-001 实机 10:26:38 定位）。
         # 改名 `_srv_clients` 后与 rclpy 内部不再撞名。
         self._srv_clients: Dict[str, Any] = {
-            "MISSION_START": self.create_client(Trigger, "/auto_mission/start_mapping_cruise"),
-            "MISSION_STOP": self.create_client(Trigger, "/auto_mission/stop_mapping_cruise"),
+            "MISSION_START": self.create_client(Trigger, "/auto_mission/arm"),
+            "MISSION_STOP": self.create_client(Trigger, "/auto_mission/disarm"),
             "MAP_CONVERT": self.create_client(Trigger, "/pcd_to_map/convert"),
             "WAYPOINT_SAVE": self.create_client(Trigger, "/waypoint_recorder/save"),
             "WAYPOINT_CLEAR": self.create_client(Trigger, "/waypoint_recorder/clear"),

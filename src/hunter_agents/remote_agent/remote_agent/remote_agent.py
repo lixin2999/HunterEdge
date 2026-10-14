@@ -336,6 +336,12 @@ class RemoteAgent:
         video = cmd.get("video") if isinstance(cmd.get("video"), dict) else None
         session_id = cmd.get("session_id") or self.session_id
     
+        # V0.1.19 视频诊断：记录首帧的 video 字段状态，帮助确认平台是否发了 boot 帧
+        if not getattr(self, '_frame_logged', False):
+            self._frame_logged = True
+            logger.info("[遥控帧] video=%s heartbeat=%s session_id=%s cmd_keys=%s",
+                        video, heartbeat, session_id, list(cmd.keys())[:10])
+
         # 会话边界帧先于 TTL 判定处理：boot/stop 决定推拉流，迟到几帧也必须按序执行，
         # 否则会留下野推流（stop 被丢）或拒绝接管（boot 被丢）的脏状态。
         # ① boot（recording=true）：记 session_id → 起 RTMP 推流（幂等）
@@ -372,13 +378,23 @@ class RemoteAgent:
                 return
     
         # 安全限幅（文档 13.4：远程模式最高 2.0 m/s，转向 ±0.4 rad）
-        # 契约字段 control.target_velocity / control.target_steer（兼容旧平铺 velocity/steering_angle）
-        raw_velocity = control.get("target_velocity", cmd.get("velocity", 0.0))
-        raw_steering = control.get("target_steer", cmd.get("steering_angle", 0.0))
+        # 契约字段 control.target_velocity / control.target_steer
+        # V0.1.19 兼容：部分平台版本发 target_steering（带 ing），增加多字段 fallback
+        raw_velocity = control.get("target_velocity",
+                       control.get("velocity",
+                         cmd.get("velocity", 0.0)))
+        raw_steering = control.get("target_steer",
+                        control.get("target_steering",
+                          cmd.get("steering_angle", 0.0)))
         self.latest_velocity = clamp(
             float(raw_velocity), -float(self.config["max_velocity"]), float(self.config["max_velocity"]))
         self.latest_steering = clamp(
             float(raw_steering), -float(self.config["max_steering"]), float(self.config["max_steering"]))
+        # V0.1.19 诊断日志：首次收到非零转向或每 100 帧记录一次，帮助确认字段映射
+        if self.latest_steering != 0.0 and not getattr(self, '_steer_logged', False):
+            self._steer_logged = True
+            logger.info("[遥控] 首次收到非零转向 steer=%.3f rad (v=%.2f m/s) control_keys=%s",
+                        self.latest_steering, self.latest_velocity, list(control.keys()))
         # 契约 brake 为归一化 0~1（G-10 可选；estop 零速帧固定 1.0）；底盘只有布尔
         # 急停 → 仅 brake>=1.0 视为急停（旧版 bool(0.5)=True 会把比例制动误判成急停）
         brake_raw = control.get("brake", cmd.get("brake", 0.0))
