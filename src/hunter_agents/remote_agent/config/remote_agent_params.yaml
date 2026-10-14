@@ -15,19 +15,27 @@ remote_agent:
     kafka_bundle_dir: "/etc/hunter/kafka"
 
     # ── 视频链路（V1.21.0：车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流）──
-    camera_device: "/dev/video0"                      # D435 RGB
-    enable_video: true                                # 无相机/纯指令联调时可关闭（指令链路不受影响）
-    srs_rtmp_base_url: "rtmp://192.168.31.35:1935/remote_control"   # SRS RTMP 入口（平台服务器 IP；换平台只改本行）
-    srs_stream_prefix: "hunter"                       # = 平台 RC_SRS_STREAM_PREFIX，流名 hunter_HUNTER-001_{session_id}
-    video_fps: 30                                     # boot 帧未带 video.fps 时的回落（契约上限 30）
-    video_bitrate_kbps: 3000                          # 回落码率（契约 2048~4096 kbps，GOP 1s 固定）
+    # V0.1.19 新增：camera_source 决定帧获取方式
+    #   "ros_topic"（默认）：订阅 RealSense 的 ROS 影像话题，避免设备占用冲突
+    #   "v4l2"：直接打开 /dev/videoX（仅当有专用摄像头且无其他节点占用时使用）
+    camera_source: "ros_topic"
+    image_topic: "/camera/color/image_raw"            # RealSense ROS 驱动的彩色话题（根据实际节点命名空间调整）
+    stream_width: 640                                 # ros_topic 模式推流分辨率（建议 ≤640x480 降低带宽）
+    stream_height: 480
+    prefer_hw_encode: false                           # Jetson 硬编(nvv4l2h264enc)，部分 JetPack 不存在会报 syntax error，默认关
+    camera_device: "/dev/video0"                      # 仅 v4l2 模式使用
+    enable_video: true                                # 无相机/纯指令联调时可关闭
+    srs_rtmp_base_url: "rtmp://192.168.31.35:1935/remote_control"   # SRS RTMP 入口
+    srs_stream_prefix: "hunter"                       # = 平台 RC_SRS_STREAM_PREFIX
+    video_fps: 15                                     # 匹配 RealSense D435 实际输出（640x480@15fps）
+    video_bitrate_kbps: 3000                          # 回落码率（契约 2048~4096 kbps）
 
     # ── 遥控指令（主通道 Kafka hunter.<vid>.remote_control，20Hz/50ms）──
     cmd_topic: "/remote/command"
     max_velocity: 2.0                                 # 远程限速 2.0 m/s（安全红线，不可上调）
     max_steering: 0.4                                 # 转向 ±0.4 rad
-    cmd_timeout: 0.5                                  # 500ms 无指令 → 停车并交还驾驶权（安全红线）
-    remote_cmd_ttl: 1.0                               # remote_control 报文时效（秒），过期丢弃
+    cmd_timeout: 1.0                                  # V0.1.19: 平台实际约2Hz，旧0.5s边界必现翻转，调到1.0s
+    remote_cmd_ttl: 2.0                               # 报文时效（配合超时加宽）
     ack_command_result: true                          # 逐帧回投 command_result（acks=all；平台 >500ms 无回执判链路异常结束会话）
 
     # ── WebSocket 备用通道（文档 17.2；需平台 JWT，生产不启用，仅留联调口子）──

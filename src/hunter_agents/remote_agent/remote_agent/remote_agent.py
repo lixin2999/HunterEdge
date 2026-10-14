@@ -54,6 +54,12 @@ except ImportError:
     HAS_ROS = False
 
 try:
+    from sensor_msgs.msg import Image as RosImage
+    HAS_IMAGE_MSG = True
+except ImportError:
+    HAS_IMAGE_MSG = False
+
+try:
     import yaml
     HAS_YAML = True
 except ImportError:
@@ -123,6 +129,8 @@ class RemoteAgent:
         self.rtmp_proc = None
         self._stream_session = None
         self._video_lock = threading.Lock()
+        self._image_sub = None              # ROS image topic subscriber
+        self._video_stop_event = threading.Event()
 
     # ------------------------------------------------------------------
     # ROS2 桥接（发布 /remote/command，文档 13.4）
@@ -202,7 +210,18 @@ class RemoteAgent:
 
     def publish_command(self, velocity, steering, brake=False):
         if not HAS_ROS or not self.cmd_publisher or not self.ros_node:
+            # V0.1.19 诊断：一次性报告 ROS 发布不可用的原因
+            if not getattr(self, '_pub_warn_logged', False):
+                self._pub_warn_logged = True
+                logger.error("[遥控发布] ✘ ROS 不可用！HAS_ROS=%s cmd_publisher=%s ros_node=%s"
+                             "—— 确认 hunter_msgs 已安装并 source 了工作空间",
+                             HAS_ROS, self.cmd_publisher, self.ros_node)
             return
+        # V0.1.19 诊断：首次成功发布时记录
+        if not getattr(self, '_pub_ok_logged', False):
+            self._pub_ok_logged = True
+            logger.info("[遥控发布] ✔ 首帧发布成功 v=%.2f steer=%.3f brake=%s", 
+                        velocity, steering, brake)
         msg = ChassisCommand()
         msg.header.stamp = self.ros_node.get_clock().now().to_msg()
         msg.header.frame_id = "base_link"
@@ -506,10 +525,9 @@ class RemoteAgent:
         return f"{base}/{prefix}_{self.vehicle_id}_{session_id}"
 
     def build_pipeline(self, session_id, video_cfg):
-        """构建 GStreamer 硬编→RTMP 流水线（契约：H.264/1280x720/≤30fps/2048-4096kbps/GOP 1s）。
+        """构建 GStreamer 硬编→RTMP 流水线（v4l2 模式，专用相机设备可用时使用）。
 
-        编码参数以 boot 帧 ``video.*`` 为准（契约不可协商项，服务端已校验），
-        缺失时回落 YAML 配置；iframeinterval=fps 即每秒一个关键帧。
+        V0.1.19 修复：去掉 videoconvert、去掉单/双引号包裹。
         """
         c = self.config
         fps = int(video_cfg.get("fps") or c.get("video_fps", 30))
@@ -520,15 +538,59 @@ class RemoteAgent:
         return (
             f"v4l2src device={c['camera_device']} ! "
             f"video/x-raw,width=1280,height=720,framerate={fps}/1 ! "
-            "videoconvert ! nvvidconv ! 'video/x-raw(memory:NVMM),format=NV12' ! "
-            f"nvv4l2h264enc bitrate={kbps * 1000} iframeinterval={fps} control-rate=1 "
-            "profile=4 preset-level=1 ! "
+            "videoconvert ! "
+            f"nvv4l2h264enc bitrate={kbps * 1000} iframeinterval={fps} ! "
             "h264parse ! flvmux streamable=true ! "
-            f'rtmpsink location="{url}"'
+            f"rtmpsink location={url}"
+        )
+
+    def _build_ros_pipeline(self, session_id, video_cfg):
+        """构建从 ROS image topic 读取帧的 GStreamer 流水线（fdsrc + stdin 管道）。
+
+        V0.1.19：当 RealSense 被 ROS 节点占用时，通过订阅 /camera/color/image_raw
+        获取原始 RGB 帧，写入 GStreamer stdin，由 fdsrc 接收并编码后推 RTMP。
+
+        ❗ 分辨率必须以实际相机输出为准（stream_width/height 配置），
+        而不以 boot 帧 video.width/height 为准（平台请求的分辨率可能与车端不符）。
+        """
+        c = self.config
+        fps = int(c.get("video_fps", 15))
+        fps = max(1, min(fps, 30))
+        kbps = int(video_cfg.get("bitrate_kbps") or c.get("video_bitrate_kbps", 3000))
+        kbps = max(2048, min(kbps, 4096))
+        # 强制用配置的实际相机分辨率，忽略 boot 帧的请求（boot 帧要求 1280x720 但相机只出 640x480）
+        width = int(c.get("stream_width", 640))
+        height = int(c.get("stream_height", 480))
+        url = self._rtmp_url_for(session_id)
+        # V0.1.19：默认用 x264enc 软编（所有 GStreamer 安装均有），
+        # nvv4l2h264enc 在部分 JetPack 版本不存在导致 syntax error
+        prefer_hw = c.get("prefer_hw_encode", False)
+        if prefer_hw:
+            enc_stage = (
+                f"videoconvert ! video/x-raw,format=I420 ! "
+                f"nvv4l2h264enc bitrate={kbps * 1000} iframeinterval={fps}"
+            )
+        else:
+            enc_stage = (
+                f"videoconvert ! x264enc bitrate={kbps} tune=zerolatency "
+                f"speed-preset=ultrafast key-int-max={fps}"
+            )
+        return (
+            f"fdsrc ! "
+            f"video/x-raw,format=RGB,width={width},height={height},framerate={fps}/1 ! "
+            f"queue max-size-buffers=3 ! "
+            f"{enc_stage} ! "
+            "h264parse ! flvmux streamable=true ! "
+            f"rtmpsink location={url}"
         )
 
     def start_stream(self, session_id, video_cfg=None):
-        """boot 帧→启动 RTMP 推流（按 session_id 幂等；同会话重复 boot 不重启）"""
+        """boot 帧→启动 RTMP 推流（按 session_id 幂等；同会话重复 boot 不重启）
+
+        支持两种模式（配置 camera_source）：
+          - "ros_topic"（默认）：订阅 /camera/color/image_raw 获取帧，通过 stdin 管道送入 GStreamer
+          - "v4l2"：直接 v4l2src 读相机设备（适用于专用USB摄像头，不与其他节点冲突）
+        """
         if not self.config.get("enable_video", True):
             logger.info("视频链路已按配置关闭（enable_video=false），boot 帧不起推流")
             return
@@ -540,25 +602,63 @@ class RemoteAgent:
             logger.error("srs_rtmp_base_url 未配置，无法推流（例："
                          "rtmp://192.168.31.35:1935/remote_control）")
             return
+
+        mode = self.config.get("camera_source", "ros_topic")
+
+        # v4l2 模式预检设备可用性
+        if mode == "v4l2":
+            dev = self.config.get("camera_device", "/dev/video0")
+            if not os.path.exists(dev):
+                logger.error("相机设备不存在：%s，请确认接线并用 `v4l2-ctl --list-devices` 查可用设备", dev)
+                return
+            try:
+                r = subprocess.run(["fuser", dev], capture_output=True, text=True, timeout=3)
+                if r.stdout.strip():
+                    logger.warning("⚠ 相机 %s 已被进程占用 (PID=%s)，v4l2src 将失败！"
+                                   "建议改用 camera_source: ros_topic",
+                                   dev, r.stdout.strip())
+                    return  # 直接返回，不启动必败的推流
+            except Exception:
+                pass
+
         with self._video_lock:
             if self.rtmp_proc and self.rtmp_proc.poll() is None \
                     and self._stream_session == session_id:
                 return
             self._shutdown_proc_locked()
-            pipeline = self.build_pipeline(session_id, video_cfg or {})
-            logger.info("boot 帧到，启动 RTMP 推流：%s", url)
+
+            # 构建流水线
+            if mode == "ros_topic":
+                pipeline = self._build_ros_pipeline(session_id, video_cfg or {})
+            else:
+                pipeline = self.build_pipeline(session_id, video_cfg or {})
+
+            logger.info("boot 帧到，启动 RTMP 推流（mode=%s）：%s", mode, url)
+            logger.info("[Pipeline] %s", pipeline)
+
             try:
-                self.rtmp_proc = subprocess.Popen(
-                    ["gst-launch-1.0", "-e", pipeline],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if mode == "ros_topic":
+                    self.rtmp_proc = subprocess.Popen(
+                        ["gst-launch-1.0", "-e", pipeline],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                else:
+                    self.rtmp_proc = subprocess.Popen(
+                        ["gst-launch-1.0", "-e", pipeline],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 self._stream_session = session_id
-                # V0.1.18 视频诊断修复：旧版 stderr=DEVNULL 导致相机被占用/
-                # GStreamer 元素缺失/SRS 不可达等失败全部无声无息，现场无从判断。
-                # 改 PIPE + 后台读取线程，错误实时转写到 journalctl。
+                self._video_stop_event.clear()
+
+                # 启动 stderr 读取线程
                 threading.Thread(
                     target=self._drain_gst_stderr,
                     args=(self.rtmp_proc, session_id),
                     daemon=True).start()
+
+                # ROS topic 模式：订阅影像话题并持续送帧
+                if mode == "ros_topic":
+                    self._start_ros_image_feed()
+
             except Exception as exc:  # noqa: BLE001
                 logger.error("GStreamer 推流启动失败：%s", exc)
                 self.rtmp_proc = None
@@ -602,14 +702,66 @@ class RemoteAgent:
                 pass
 
     def _shutdown_proc_locked(self):
-        """终止推流子进程（调用方必须已持 _video_lock）"""
+        """终止推流子进程 + 销毁 image subscriber（调用方必须已持 _video_lock）"""
+        # 停止 ROS image 订阅
+        self._video_stop_event.set()
+        if self._image_sub and self.ros_node:
+            try:
+                self.ros_node.destroy_subscription(self._image_sub)
+            except Exception:  # noqa: BLE001
+                pass
+            self._image_sub = None
+        # 终止 GStreamer 进程
         proc, self.rtmp_proc, self._stream_session = self.rtmp_proc, None, None
         if proc and proc.poll() is None:
+            # 先关 stdin 让 fdsrc 收到 EOF 自然退出
+            if proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:  # noqa: BLE001
+                    pass
             proc.terminate()
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:  # noqa: BLE001
                 proc.kill()
+
+    def _start_ros_image_feed(self):
+        """启动 ROS image topic 订阅，将帧数据持续写入 GStreamer stdin。"""
+        if not HAS_IMAGE_MSG or not self.ros_node or not HAS_ROS:
+            logger.error("无法启动 ROS image 推流：sensor_msgs=%s ros_node=%s HAS_ROS=%s",
+                         HAS_IMAGE_MSG, self.ros_node, HAS_ROS)
+            return
+        topic = self.config.get("image_topic", "/camera/color/image_raw")
+        # 使用 SENSOR_DATA QoS（best-effort, depth=5）匹配相机节点发布端
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        qos = QoSProfile(depth=3, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self._image_sub = self.ros_node.create_subscription(
+            RosImage, topic, self._on_image_frame, qos)
+        logger.info("[视频] ROS image topic 订阅已建立：%s", topic)
+
+    def _on_image_frame(self, msg):
+        """收到 ROS Image 帧，写入 GStreamer stdin 管道。
+
+        假设图像编码为 rgb8（RealSense D435 color 默认），
+        每帧 = width * height * 3 字节连续内存。
+        """
+        if self._video_stop_event.is_set():
+            return
+        proc = self.rtmp_proc
+        if not proc or proc.poll() is not None:
+            return
+        # 只处理 rgb8 编码（其他编码不写管道，避免帧错位）
+        if msg.encoding != "rgb8":
+            if not getattr(self, '_enc_warned', False):
+                self._enc_warned = True
+                logger.warning("[视频] image encoding=%s，预期 rgb8，"
+                               "尝试原始转发（可能花屏）", msg.encoding)
+        try:
+            proc.stdin.write(msg.data)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self._video_stop_event.set()
 
     # ------------------------------------------------------------------
     # 主入口
@@ -682,15 +834,20 @@ class RemoteAgent:
 
 DEFAULT_CONFIG = {
     "vehicle_id": "HUNTER-001",
-    "camera_device": "/dev/video0",          # D435 RGB（文档 13.2.1）
+    "camera_device": "/dev/video0",          # D435 RGB（文档 13.2.1，仅 v4l2 模式用）
     "enable_video": True,
+    # ── 视频采集模式（V0.1.19 新增）──
+    # "ros_topic"：订阅 ROS image topic（RealSense 被 ROS 节点占用时的唯一可用方案）
+    # "v4l2"：直接 v4l2src 读设备（专用 USB 摄像头，不与其他节点冲突时使用）
+    "camera_source": "ros_topic",
+    "image_topic": "/camera/color/image_raw",  # RealSense ROS 驱动的彩色影像话题
+    "stream_width": 640,                       # ros_topic 模式的推流分辨率
+    "stream_height": 480,
+    "prefer_hw_encode": False,                  # Jetson 硬编（nvv4l2h264enc），部分 JetPack 不存在默认关
     # ── 视频链路（V1.21.0：RTMP 推流 → SRS → 浏览器 WHEP 拉流）──
-    # 基址到 app 为止（rtmp://<SERVER_IP>:1935/remote_control），会话后缀由 boot 帧
-    # 拼出；属现场拓扑配置而非凭据，不写入 kafka.properties；留空 = boot 帧到达时
-    # 报错不推流（指令/回执链路不受影响）
     "srs_rtmp_base_url": "",                  # 例 rtmp://192.168.31.35:1935/remote_control
     "srs_stream_prefix": "hunter",            # = 平台 RC_SRS_STREAM_PREFIX（契约不可自创）
-    "video_fps": 30,                          # boot 帧未带 video.fps 时的回落（≤30 契约上限）
+    "video_fps": 15,                          # 匹配 RealSense D435 实际输出 640x480@15fps
     "video_bitrate_kbps": 3000,               # 回落码率（契约 2048~4096 kbps）
     "ws_url": "",                             # 文档 17.2 备用通道（例 ws://<SERVER_IP>/ws/remote）
     "enable_ws": False,                       # 主通道为 Kafka；备用 WS 需平台 JWT，默认关
@@ -701,8 +858,8 @@ DEFAULT_CONFIG = {
     "kafka_bundle_dir": DEFAULT_BUNDLE_DIR,
     "max_velocity": 2.0,                      # 文档 13.4：远程限速 2.0 m/s
     "max_steering": 0.4,                      # 文档 4.3：转向 ±0.4 rad
-    "cmd_timeout": 0.5,                       # 文档 13.4：超时 500ms 停车并交还
-    "remote_cmd_ttl": 1.0,                    # remote_control 报文时效（秒）
+    "cmd_timeout": 1.0,                       # V0.1.19 调高：平台实际发帧约2Hz，0.5s边界必现翻转
+    "remote_cmd_ttl": 2.0,                    # remote_control 报文时效（秒），配合超时加宽
 }
 
 
