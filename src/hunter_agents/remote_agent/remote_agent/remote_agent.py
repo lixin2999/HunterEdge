@@ -154,8 +154,18 @@ class RemoteAgent:
         logger.info("ROS2 桥接就绪，20Hz 定时发布 %s", self.cmd_topic)
 
     def ros_spin(self):
+        """V0.1.19 关键修复：用 MultiThreadedExecutor 避免 image 回调阻塞 timer。
+
+        旧实现用 rclpy.spin()（SingleThreadedExecutor），当 RTMP 连接失败时
+        _on_image_frame 的 proc.stdin.write() 会阻塞整个执行器线程，
+        导致 20Hz timer_callback 饥饿（实测只有 0.067Hz）。
+        MultiThreadedExecutor 让 image/timer 回调在不同线程并行。
+        """
         try:
-            rclpy.spin(self.ros_node)
+            from rclpy.executors import MultiThreadedExecutor
+            executor = MultiThreadedExecutor(num_threads=4)
+            executor.add_node(self.ros_node)
+            executor.spin()
         except Exception as exc:  # noqa: BLE001
             logger.error("ROS2 spin 退出：%s", exc)
 
@@ -637,14 +647,20 @@ class RemoteAgent:
             logger.info("[Pipeline] %s", pipeline)
 
             try:
+                # V0.1.19 关键修复：GStreamer 1.20.1 on Jetson aarch64
+                # 的 gst-launch-1.0 不能接受整个 pipeline 作为单参数（报 syntax error），
+                # 必须像命令行一样按空格拆分为多个 argv 元素。
+                # 实机证据：
+                #   命令行多参数 → ✅ 成功；命令行单引号包裹 → ❌ syntax error
+                gst_args = ["gst-launch-1.0", "-e"] + pipeline.split()
                 if mode == "ros_topic":
                     self.rtmp_proc = subprocess.Popen(
-                        ["gst-launch-1.0", "-e", pipeline],
+                        gst_args,
                         stdin=subprocess.PIPE,
                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 else:
                     self.rtmp_proc = subprocess.Popen(
-                        ["gst-launch-1.0", "-e", pipeline],
+                        gst_args,
                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 self._stream_session = session_id
                 self._video_stop_event.clear()
@@ -732,7 +748,7 @@ class RemoteAgent:
             logger.error("无法启动 ROS image 推流：sensor_msgs=%s ros_node=%s HAS_ROS=%s",
                          HAS_IMAGE_MSG, self.ros_node, HAS_ROS)
             return
-        topic = self.config.get("image_topic", "/camera/color/image_raw")
+        topic = self.config.get("image_topic", "/camera/camera/color/image_raw")
         # 使用 SENSOR_DATA QoS（best-effort, depth=5）匹配相机节点发布端
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         qos = QoSProfile(depth=3, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -743,8 +759,8 @@ class RemoteAgent:
     def _on_image_frame(self, msg):
         """收到 ROS Image 帧，写入 GStreamer stdin 管道。
 
-        假设图像编码为 rgb8（RealSense D435 color 默认），
-        每帧 = width * height * 3 字节连续内存。
+        V0.1.19 修复：非阻塞写入。如果管道满（RTMP 未连接/GStreamer 卡住），
+        直接丢帧而不是阻塞执行器线程。
         """
         if self._video_stop_event.is_set():
             return
@@ -757,7 +773,17 @@ class RemoteAgent:
                 self._enc_warned = True
                 logger.warning("[视频] image encoding=%s，预期 rgb8，"
                                "尝试原始转发（可能花屏）", msg.encoding)
+        # 非阻塞写：用 select 检查 fd 是否可写，避免 GStreamer 卡住时死等
+        import select
         try:
+            fd = proc.stdin.fileno()
+            # 等待最多 5ms 看管道是否可写，不可写则丢帧
+            _, writable, _ = select.select([], [fd], [], 0.005)
+            if not writable:
+                if not getattr(self, '_drop_warned', False):
+                    self._drop_warned = True
+                    logger.warning("[视频] GStreamer stdin 不可写（RTMP 未就绪？），丢帧")
+                return
             proc.stdin.write(msg.data)
             proc.stdin.flush()
         except (BrokenPipeError, OSError):
@@ -840,7 +866,7 @@ DEFAULT_CONFIG = {
     # "ros_topic"：订阅 ROS image topic（RealSense 被 ROS 节点占用时的唯一可用方案）
     # "v4l2"：直接 v4l2src 读设备（专用 USB 摄像头，不与其他节点冲突时使用）
     "camera_source": "ros_topic",
-    "image_topic": "/camera/color/image_raw",  # RealSense ROS 驱动的彩色影像话题
+    "image_topic": "/camera/camera/color/image_raw",  # V0.1.19 修正：RealSense 节点名 /camera/camera 带双层 namespace
     "stream_width": 640,                       # ros_topic 模式的推流分辨率
     "stream_height": 480,
     "prefer_hw_encode": False,                  # Jetson 硬编（nvv4l2h264enc），部分 JetPack 不存在默认关
@@ -858,8 +884,8 @@ DEFAULT_CONFIG = {
     "kafka_bundle_dir": DEFAULT_BUNDLE_DIR,
     "max_velocity": 2.0,                      # 文档 13.4：远程限速 2.0 m/s
     "max_steering": 0.4,                      # 文档 4.3：转向 ±0.4 rad
-    "cmd_timeout": 1.0,                       # V0.1.19 调高：平台实际发帧约2Hz，0.5s边界必现翻转
-    "remote_cmd_ttl": 2.0,                    # remote_control 报文时效（秒），配合超时加宽
+    "cmd_timeout": 3.0,                       # V0.1.19 调高：平台 Kafka 实际送达 ~2s/帧（UI 20Hz 但 acks=all 延迟），3s 容兆底
+    "remote_cmd_ttl": 4.0,                    # V0.1.19: 配合 cmd_timeout=3.0，避免 Kafka 延迟抖动误判过期
 }
 
 

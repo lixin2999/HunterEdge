@@ -19,7 +19,7 @@ remote_agent:
     #   "ros_topic"（默认）：订阅 RealSense 的 ROS 影像话题，避免设备占用冲突
     #   "v4l2"：直接打开 /dev/videoX（仅当有专用摄像头且无其他节点占用时使用）
     camera_source: "ros_topic"
-    image_topic: "/camera/color/image_raw"            # RealSense ROS 驱动的彩色话题（根据实际节点命名空间调整）
+    image_topic: "/camera/camera/color/image_raw"      # V0.1.19 修正：RealSense 节点 /camera/camera 带双层 namespace
     stream_width: 640                                 # ros_topic 模式推流分辨率（建议 ≤640x480 降低带宽）
     stream_height: 480
     prefer_hw_encode: false                           # Jetson 硬编(nvv4l2h264enc)，部分 JetPack 不存在会报 syntax error，默认关
@@ -34,8 +34,8 @@ remote_agent:
     cmd_topic: "/remote/command"
     max_velocity: 2.0                                 # 远程限速 2.0 m/s（安全红线，不可上调）
     max_steering: 0.4                                 # 转向 ±0.4 rad
-    cmd_timeout: 1.0                                  # V0.1.19: 平台实际约2Hz，旧0.5s边界必现翻转，调到1.0s
-    remote_cmd_ttl: 2.0                               # 报文时效（配合超时加宽）
+    cmd_timeout: 3.0                                  # V0.1.19: 平台 Kafka 实际 ~2s/帧（acks=all），3s 容兆底
+    remote_cmd_ttl: 4.0                               # 配合 cmd_timeout=3.0，避免 Kafka 延迟抖动误判过期
     ack_command_result: true                          # 逐帧回投 command_result（acks=all；平台 >500ms 无回执判链路异常结束会话）
 
     # ── WebSocket 备用通道（文档 17.2；需平台 JWT，生产不启用，仅留联调口子）──
