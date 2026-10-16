@@ -61,6 +61,24 @@ except ImportError:
     HAS_IMAGE_MSG = False
 
 try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+try:
+    from cv_bridge import CvBridge
+    HAS_CV_BRIDGE = True
+except ImportError:
+    HAS_CV_BRIDGE = False
+
+try:
     import yaml
     HAS_YAML = True
 except ImportError:
@@ -133,8 +151,13 @@ class RemoteAgent:
         self._image_sub = None              # ROS image topic subscriber
         self._video_stop_event = threading.Event()
         # V0.1.19 关键修复：独立写线程 + 有界队列，彻底解耦 ROS 执行器与 GStreamer 管道写入
-        self._frame_queue = queue.Queue(maxsize=1)  # 只保留最新一帧，满则丢
+        self._frame_queue = queue.Queue(maxsize=1)  # 只保留最新一帧，满则丢旧留新（见 _on_image_frame）
         self._frame_writer_thread = None
+        # 推流分辨率（fdsrc caps 固定值），由 _build_ros_pipeline 写入，供 _convert_frame 对齐尺寸
+        self._stream_size = (int(config.get("stream_width", 640)),
+                              int(config.get("stream_height", 480)))
+        self._cv_bridge = CvBridge() if HAS_CV_BRIDGE else None
+        self._convert_logged = False
 
     # ------------------------------------------------------------------
     # ROS2 桥接（发布 /remote/command，文档 13.4）
@@ -575,6 +598,8 @@ class RemoteAgent:
         # 强制用配置的实际相机分辨率，忽略 boot 帧的请求（boot 帧要求 1280x720 但相机只出 640x480）
         width = int(c.get("stream_width", 640))
         height = int(c.get("stream_height", 480))
+        # 记录到实例，供 _on_image_frame/_convert_frame 把 ROS 图像严格对齐到这个尺寸
+        self._stream_size = (width, height)
         url = self._rtmp_url_for(session_id)
         # V0.1.19：默认用 x264enc 软编（所有 GStreamer 安装均有），
         # nvv4l2h264enc 在部分 JetPack 版本不存在导致 syntax error
@@ -763,36 +788,143 @@ class RemoteAgent:
             RosImage, topic, self._on_image_frame, qos)
         # 启动独立写线程（daemon，随进程退出）
         self._drop_warned = False
+        self._convert_logged = False
+        # 清空上一会话可能残留的旧帧，避免新会话首帧写到过期内容
+        try:
+            while True:
+                self._frame_queue.get_nowait()
+        except queue.Empty:
+            pass
         self._frame_writer_thread = threading.Thread(
             target=self._frame_writer_loop, daemon=True, name="gst-writer")
         self._frame_writer_thread.start()
         logger.info("[视频] ROS image topic 订阅已建立：%s（写线程已启动）", topic)
 
     def _on_image_frame(self, msg):
-        """收到 ROS Image 帧，非阻塞入队（由 _frame_writer_loop 线程实际写入管道）。
+        """收到 ROS Image 帧，转成与推流 caps 完全一致的 rgb8 字节后非阻塞入队。
 
         V0.1.19 关键修复：旧版直接在 ROS 执行器线程写 proc.stdin，当 RTMP 未就绪时
         921KB 大帧写满 64KB 管道缓冲区后阻塞，导致 20Hz timer 饥饿。
-        现在回调只做 queue.put_nowait()，微秒级完成，不阻塞执行器。
+        现在回调只做转换 + queue.put_nowait()，微秒级完成，不阻塞执行器。
+
+        V0.1.20 关键修复（“灰→绿”根因）：旧版对 encoding != rgb8 只做警告就
+        把原始字节直接透传给 fdsrc（“尝试原始转发，可能花屏”），一旦 RealSense 实际
+        输出非 rgb8（如 bgr8/rgba8/mono8/bayer）或行距 msg.step 带填充字节，固定
+        RGB24 caps 会把错位的字节当成像素内容误读，典型表现就是整体偏绿/偏品红。现
+        在强制走 _convert_frame：要么产出与 caps 字节数完全一致的 rgb8，要么直接丢帧
+        （绝不写入半成品/未知内容）。同时队列满时改为“丢旧留新”，避免卡住时反复
+        写同一帧旧数据。
         """
         if self._video_stop_event.is_set():
             return
         proc = self.rtmp_proc
         if not proc or proc.poll() is not None:
             return
-        if msg.encoding != "rgb8":
-            if not getattr(self, '_enc_warned', False):
-                self._enc_warned = True
-                logger.warning("[视频] image encoding=%s，预期 rgb8，"
-                               "尝试原始转发（可能花屏）", msg.encoding)
-        # 非阻塞入队：必须拷贝为 bytes！msg.data 可能是 memoryview 指向 DDS 内部缓冲区，
-        # 回调返回后消息被 GC，memoryview 悬挂 → writer 写入全零 → 编码器输出绿屏
+        rgb_bytes = self._convert_frame(msg)
+        if rgb_bytes is None:
+            return  # _convert_frame 内部已限频记录原因，不阻断后续帧
         try:
-            self._frame_queue.put_nowait(bytes(msg.data))
+            self._frame_queue.put_nowait(rgb_bytes)
         except queue.Full:
+            # 队列里还压着上一帧未写完：丢旧留新，保证画面不卡在过期内容上
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frame_queue.put_nowait(rgb_bytes)
+            except queue.Full:
+                pass
             if not getattr(self, '_drop_warned', False):
                 self._drop_warned = True
-                logger.warning("[视频] 帧队列满（RTMP 未就绪？），开始丢帧")
+                logger.warning("[视频] 帧队列满（RTMP 未就绪？），开始丢旧帧留新帧")
+
+    def _convert_frame(self, msg):
+        """把 ROS Image 帧转成与推流 caps 字节数完全一致的 rgb8 字节串。
+
+        必须同时处理三件事，缺一就会把画面“写坏”（历史上表现为整体偏绿）：
+          1. encoding：非 rgb8 时必须真正转换通道顺序/位数，不能只警告就透传；
+          2. step（行距）：部分驱动每行末尾有填充字节，必须按 step 取行、截掉
+             src_w*channels 之后的填充，不能假定 len(data)==width*height*channels；
+          3. 分辨率：源图尺寸与推流 caps 不一致时缩放对齐，否则 fdsrc 会把一帧
+             拆成多帧或把多帧内容错位合并。
+
+        任一步骤失败（数据截断/未知编码且 cv_bridge 不可用/依赖缺失）都返回 None，
+        由调用方直接丢帧——绝不往 fdsrc 写不确定内容。
+        """
+        width, height = self._stream_size
+        src_w, src_h = int(msg.width), int(msg.height)
+        enc = (msg.encoding or "").lower()
+        step = int(msg.step) or (src_w * 3)
+        if not HAS_NUMPY:
+            if not getattr(self, '_dep_warned', False):
+                self._dep_warned = True
+                logger.error("[视频] numpy 不可用，无法安全转换 ROS 图像，已停止写帧")
+            return None
+
+        raw = bytes(msg.data)  # 必须拷贝：msg.data 可能是 memoryview，回调返回后 DDS 缓冲区会被回收
+
+        known_channels = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1, "8uc1": 1}
+        arr = None
+        if enc in known_channels:
+            ch = known_channels[enc]
+            if step < src_w * ch:
+                logger.warning("[视频] step=%d < width*channels=%d，数据异常，丢帧", step, src_w * ch)
+                return None
+            need = step * src_h
+            if len(raw) < need:
+                logger.warning("[视频] 数据截断：len=%d < step*height=%d，丢帧", len(raw), need)
+                return None
+            buf = np.frombuffer(raw[:need], dtype=np.uint8).reshape(src_h, step)
+            buf = buf[:, :src_w * ch].reshape(src_h, src_w, ch)
+            if enc == "rgb8":
+                arr = buf
+            elif enc == "bgr8":
+                arr = buf[:, :, ::-1]
+            elif enc == "rgba8":
+                arr = buf[:, :, :3]
+            elif enc == "bgra8":
+                arr = buf[:, :, (2, 1, 0)]
+            else:  # mono8 / 8uc1
+                arr = np.repeat(buf, 3, axis=2)
+        elif self._cv_bridge is not None:
+            try:
+                img = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+                arr = np.asarray(img, dtype=np.uint8)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[视频] cv_bridge 转换 encoding=%s 失败，丢帧：%s", enc, exc)
+                return None
+        else:
+            if not getattr(self, '_enc_warned', False):
+                self._enc_warned = True
+                logger.error("[视频] encoding=%s 不在已知通道表且 cv_bridge 不可用，"
+                             "不再透传原始字节（避免写坏颜色），已丢帧", enc)
+            return None
+
+        if arr is None or arr.ndim != 3 or arr.shape[2] != 3:
+            logger.warning("[视频] 转换结果形状异常：%s，丢帧", getattr(arr, "shape", None))
+            return None
+
+        if (src_w, src_h) != (width, height):
+            if not HAS_CV2:
+                logger.error("[视频] 源尺寸(%dx%d)≠推流尺寸(%dx%d) 且 opencv 不可用，无法缩放，丢帧",
+                             src_w, src_h, width, height)
+                return None
+            # cv2.resize 要求内存连续（bgr8 翻转等分支得到的是非连续视图），先拷贝再缩放
+            arr = cv2.resize(np.ascontiguousarray(arr), (width, height),
+                             interpolation=cv2.INTER_AREA)
+
+        rgb_bytes = np.ascontiguousarray(arr, dtype=np.uint8).tobytes()
+        if not self._convert_logged:
+            self._convert_logged = True
+            logger.info(
+                "[视频] 首帧转换: encoding=%s src=%dx%d step=%d → rgb8 %dx%d len=%d "
+                "raw[0:3]=%s rgb[0:3]=%s（raw 与 rgb 不一致说明确实做了通道/尺寸修正；"
+                "若 raw[0:3] 本身就是绿色系，则问题在相机/驱动侧而非本节点）",
+                enc, src_w, src_h, step, width, height, len(rgb_bytes),
+                list(raw[:3]), list(rgb_bytes[:3]))
+
+        return rgb_bytes
 
     def _frame_writer_loop(self):
         """独立写线程：从 _frame_queue 取帧写入 GStreamer stdin。
