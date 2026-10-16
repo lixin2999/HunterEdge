@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import queue
+import select
 import subprocess
 import threading
 import time
@@ -749,6 +750,28 @@ class RemoteAgent:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _kill_stream_proc(self, proc):
+        """不持锁的写线程专用：强制终止卡死的 GStreamer 子进程。
+
+        不能直接调 `_shutdown_proc_locked`（那个要求调用方已持 `_video_lock`，而写
+        线程本身不持锁，强拿锁会与 `start_stream`/`stop_stream` 的锁使用产生不确定
+        的时序依赖）。这里只负责杀进程 + 关管道，不修改 `self.rtmp_proc`/`self._stream_session`
+        本身（那些字段留给下一次持锁的 `start_stream`/`stop_stream` 在 `proc.poll()`
+        已非 None 后自行清理）。
+        """
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:  # noqa: BLE001
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
     def _shutdown_proc_locked(self):
         """终止推流子进程 + 销毁 image subscriber（调用方必须已持 _video_lock）"""
         # 停止 ROS image 订阅
@@ -928,8 +951,19 @@ class RemoteAgent:
 
     def _frame_writer_loop(self):
         """独立写线程：从 _frame_queue 取帧写入 GStreamer stdin。
-        阻塞在 queue.get() 上不影响任何 ROS 回调。"""
+        阻塞在 queue.get() 上不影响任何 ROS 回调。
+
+        V0.1.21 关键修复（“首帧后断供”根因）：旧版直接 `proc.stdin.write(data)`，
+        一旦 GStreamer 子进程因 RTMP 握手/连接卡住而尚未进入 PLAYING（`fdsrc` 不
+        从管道读数据），Linux 默认 64KB 管道缓冲写满后 `write()` 会永久阻塞——
+        本线程从此卡死在首帧，队列堆满后 ROS 回调只能不断“丢旧留新”，浏览器
+        因长时间收不到新帧而显示绿色兜底（与内容对不对色无关，是“没数据”时的
+        通用占位色）。现在写前用 `select` 探测管道是否可写，超时则判定推流失败：
+        杀进程 + 置停止位，下一次 boot 帧可重新起流（不靠本线程无限重试）。
+        """
         first_frame = True
+        frames_written = 0
+        write_timeout = float(self.config.get("fdsrc_write_timeout_s", 5.0))
         while not self._video_stop_event.is_set():
             try:
                 data = self._frame_queue.get(timeout=0.5)
@@ -941,15 +975,57 @@ class RemoteAgent:
             # 首帧诊断日志：确认数据长度和内容有效性
             if first_frame:
                 first_frame = False
-                logger.info("[视频] 首帧写入: type=%s len=%d bytes[0:3]=%s",
+                logger.info("[视频] 首帧待写入: type=%s len=%d bytes[0:3]=%s",
                             type(data).__name__, len(data),
                             list(data[:3]) if len(data) >= 3 else 'N/A')
-            try:
-                proc.stdin.write(data)
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
+            # 带超时的分块写入：单次 select() 只能保证“当下管道有空位”，不能
+            # 保证写完整个 921KB 不阻塞（写一半时管道重新写满仍会卡住），因此必须
+            # 逐块 select + os.write，并在整帧维度上把总耗时限制在 write_timeout 内。
+            ok = self._write_with_timeout(proc.stdin, data, write_timeout)
+            if not ok:
+                logger.error(
+                    "[视频] fdsrc 管道 %0.1fs 内未能写完一帧（GStreamer 未进入 PLAYING？"
+                    "RTMP 握手/连接可能卡住），判定推流失败，终止子进程等待下次 boot 帧重试",
+                    write_timeout)
+                self._kill_stream_proc(proc)
                 self._video_stop_event.set()
                 return
+            frames_written += 1
+            # 心跳日志：每 150 帧（约 10s@15fps）确认写线程仍在推进，不只在首帧打日志
+            if frames_written % 150 == 0:
+                logger.info("[视频] 推流写入心跳：累计已写 %d 帧", frames_written)
+
+    @staticmethod
+    def _write_with_timeout(fh, data, timeout):
+        """向 fh（子进程 stdin）写满 data，整帧总耗时不超过 timeout 秒。
+
+        返回 True=写完，False=超时或管道已断（调用方应视为推流失败并重启子进程）。
+        不能用 `fh.write(data)` 一步到位：Linux 默认管道缓冲约 64KB，远小于单帧
+        921KB，一旦下游 `fdsrc` 不消费，`write()` 会在写完管道容量后永久阻塞。
+        """
+        deadline = time.monotonic() + timeout
+        fd = fh.fileno()
+        view = memoryview(data)
+        offset = 0
+        total = len(view)
+        while offset < total:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                _, writable, _ = select.select([fd], [fd], [fd], remaining)
+            except (OSError, ValueError):  # noqa: BLE001
+                return False
+            if not writable:
+                return False
+            try:
+                n = os.write(fd, view[offset:])
+            except (BrokenPipeError, OSError):  # noqa: BLE001
+                return False
+            if n <= 0:
+                return False
+            offset += n
+        return True
 
     # ------------------------------------------------------------------
     # 主入口
@@ -1037,6 +1113,7 @@ DEFAULT_CONFIG = {
     "srs_stream_prefix": "hunter",            # = 平台 RC_SRS_STREAM_PREFIX（契约不可自创）
     "video_fps": 15,                          # 匹配 RealSense D435 实际输出 640x480@15fps
     "video_bitrate_kbps": 3000,               # 回落码率（契约 2048~4096 kbps）
+    "fdsrc_write_timeout_s": 5.0,             # V0.1.21：写 fdsrc 管道前的 select 超时，超时判定推流失败并重启
     "ws_url": "",                             # 文档 17.2 备用通道（例 ws://<SERVER_IP>/ws/remote）
     "enable_ws": False,                       # 主通道为 Kafka；备用 WS 需平台 JWT，默认关
     "cmd_topic": "/remote/command",           # 文档 13.4

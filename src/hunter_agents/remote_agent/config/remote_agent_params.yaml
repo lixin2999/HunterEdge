@@ -29,6 +29,7 @@ remote_agent:
     srs_stream_prefix: "hunter"                       # = 平台 RC_SRS_STREAM_PREFIX
     video_fps: 15                                     # 匹配 RealSense D435 实际输出（640x480@15fps）
     video_bitrate_kbps: 3000                          # 回落码率（契约 2048~4096 kbps）
+    fdsrc_write_timeout_s: 5.0                        # V0.1.21：写 fdsrc 管道时的整帧超时，超时判定推流失败并终止子进程等下次 boot 帧重试
 
     # ── 遥控指令（主通道 Kafka hunter.<vid>.remote_control，20Hz/50ms）──
     cmd_topic: "/remote/command"
