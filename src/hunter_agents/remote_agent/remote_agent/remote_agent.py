@@ -585,11 +585,12 @@ class RemoteAgent:
                 f"nvv4l2h264enc bitrate={kbps * 1000} iframeinterval={fps}"
             )
         else:
-            # WebRTC 强制要求 Constrained Baseline profile，否则浏览器解码显示绿色
+            # WebRTC 强制要求 Constrained Baseline profile：
+            #   x264enc 无 profile 属性（GStreamer 1.20），用 cabac=false + bframes=0 等效
             enc_stage = (
                 f"videoconvert ! x264enc bitrate={kbps} tune=zerolatency "
                 f"speed-preset=ultrafast key-int-max={fps} "
-                f"profile=baseline bframes=0"
+                f"bframes=0 cabac=false"
             )
         return (
             f"fdsrc ! "
