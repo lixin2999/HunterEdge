@@ -34,6 +34,7 @@ import argparse
 import json
 import logging
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -131,6 +132,9 @@ class RemoteAgent:
         self._video_lock = threading.Lock()
         self._image_sub = None              # ROS image topic subscriber
         self._video_stop_event = threading.Event()
+        # V0.1.19 关键修复：独立写线程 + 有界队列，彻底解耦 ROS 执行器与 GStreamer 管道写入
+        self._frame_queue = queue.Queue(maxsize=1)  # 只保留最新一帧，满则丢
+        self._frame_writer_thread = None
 
     # ------------------------------------------------------------------
     # ROS2 桥接（发布 /remote/command，文档 13.4）
@@ -581,9 +585,11 @@ class RemoteAgent:
                 f"nvv4l2h264enc bitrate={kbps * 1000} iframeinterval={fps}"
             )
         else:
+            # WebRTC 强制要求 Constrained Baseline profile，否则浏览器解码显示绿色
             enc_stage = (
                 f"videoconvert ! x264enc bitrate={kbps} tune=zerolatency "
-                f"speed-preset=ultrafast key-int-max={fps}"
+                f"speed-preset=ultrafast key-int-max={fps} "
+                f"profile=baseline bframes=0"
             )
         return (
             f"fdsrc ! "
@@ -743,7 +749,7 @@ class RemoteAgent:
                 proc.kill()
 
     def _start_ros_image_feed(self):
-        """启动 ROS image topic 订阅，将帧数据持续写入 GStreamer stdin。"""
+        """启动 ROS image topic 订阅 + 独立写线程，将帧数据持续写入 GStreamer stdin。"""
         if not HAS_IMAGE_MSG or not self.ros_node or not HAS_ROS:
             logger.error("无法启动 ROS image 推流：sensor_msgs=%s ros_node=%s HAS_ROS=%s",
                          HAS_IMAGE_MSG, self.ros_node, HAS_ROS)
@@ -754,40 +760,63 @@ class RemoteAgent:
         qos = QoSProfile(depth=3, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._image_sub = self.ros_node.create_subscription(
             RosImage, topic, self._on_image_frame, qos)
-        logger.info("[视频] ROS image topic 订阅已建立：%s", topic)
+        # 启动独立写线程（daemon，随进程退出）
+        self._drop_warned = False
+        self._frame_writer_thread = threading.Thread(
+            target=self._frame_writer_loop, daemon=True, name="gst-writer")
+        self._frame_writer_thread.start()
+        logger.info("[视频] ROS image topic 订阅已建立：%s（写线程已启动）", topic)
 
     def _on_image_frame(self, msg):
-        """收到 ROS Image 帧，写入 GStreamer stdin 管道。
+        """收到 ROS Image 帧，非阻塞入队（由 _frame_writer_loop 线程实际写入管道）。
 
-        V0.1.19 修复：非阻塞写入。如果管道满（RTMP 未连接/GStreamer 卡住），
-        直接丢帧而不是阻塞执行器线程。
+        V0.1.19 关键修复：旧版直接在 ROS 执行器线程写 proc.stdin，当 RTMP 未就绪时
+        921KB 大帧写满 64KB 管道缓冲区后阻塞，导致 20Hz timer 饥饿。
+        现在回调只做 queue.put_nowait()，微秒级完成，不阻塞执行器。
         """
         if self._video_stop_event.is_set():
             return
         proc = self.rtmp_proc
         if not proc or proc.poll() is not None:
             return
-        # 只处理 rgb8 编码（其他编码不写管道，避免帧错位）
         if msg.encoding != "rgb8":
             if not getattr(self, '_enc_warned', False):
                 self._enc_warned = True
                 logger.warning("[视频] image encoding=%s，预期 rgb8，"
                                "尝试原始转发（可能花屏）", msg.encoding)
-        # 非阻塞写：用 select 检查 fd 是否可写，避免 GStreamer 卡住时死等
-        import select
+        # 非阻塞入队：必须拷贝为 bytes！msg.data 可能是 memoryview 指向 DDS 内部缓冲区，
+        # 回调返回后消息被 GC，memoryview 悬挂 → writer 写入全零 → 编码器输出绿屏
         try:
-            fd = proc.stdin.fileno()
-            # 等待最多 5ms 看管道是否可写，不可写则丢帧
-            _, writable, _ = select.select([], [fd], [], 0.005)
-            if not writable:
-                if not getattr(self, '_drop_warned', False):
-                    self._drop_warned = True
-                    logger.warning("[视频] GStreamer stdin 不可写（RTMP 未就绪？），丢帧")
+            self._frame_queue.put_nowait(bytes(msg.data))
+        except queue.Full:
+            if not getattr(self, '_drop_warned', False):
+                self._drop_warned = True
+                logger.warning("[视频] 帧队列满（RTMP 未就绪？），开始丢帧")
+
+    def _frame_writer_loop(self):
+        """独立写线程：从 _frame_queue 取帧写入 GStreamer stdin。
+        阻塞在 queue.get() 上不影响任何 ROS 回调。"""
+        first_frame = True
+        while not self._video_stop_event.is_set():
+            try:
+                data = self._frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            proc = self.rtmp_proc
+            if not proc or proc.poll() is not None:
+                continue
+            # 首帧诊断日志：确认数据长度和内容有效性
+            if first_frame:
+                first_frame = False
+                logger.info("[视频] 首帧写入: type=%s len=%d bytes[0:3]=%s",
+                            type(data).__name__, len(data),
+                            list(data[:3]) if len(data) >= 3 else 'N/A')
+            try:
+                proc.stdin.write(data)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self._video_stop_event.set()
                 return
-            proc.stdin.write(msg.data)
-            proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            self._video_stop_event.set()
 
     # ------------------------------------------------------------------
     # 主入口
