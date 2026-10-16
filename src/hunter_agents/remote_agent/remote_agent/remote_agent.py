@@ -686,22 +686,32 @@ class RemoteAgent:
                 # 实机证据：
                 #   命令行多参数 → ✅ 成功；命令行单引号包裹 → ❌ syntax error
                 gst_args = ["gst-launch-1.0", "-e"] + pipeline.split()
+                # V0.1.21：现场排查“RTMP 已建立 TCP 连接但管道不进入 PLAYING”类问题时，
+                # 默认关键字过滤会掉掉大量 GStreamer 自身的握手/状态日志（logger.debug
+                # 不展示），需现场把 `gst_debug` 设为 "2"~"4" 开启详细日志才能定位卡在哪一步。
+                gst_debug = str(self.config.get("gst_debug", "") or "").strip()
+                gst_env = None
+                if gst_debug:
+                    gst_env = os.environ.copy()
+                    gst_env["GST_DEBUG"] = gst_debug
                 if mode == "ros_topic":
                     self.rtmp_proc = subprocess.Popen(
                         gst_args,
                         stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        env=gst_env)
                 else:
                     self.rtmp_proc = subprocess.Popen(
                         gst_args,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        env=gst_env)
                 self._stream_session = session_id
                 self._video_stop_event.clear()
 
                 # 启动 stderr 读取线程
                 threading.Thread(
                     target=self._drain_gst_stderr,
-                    args=(self.rtmp_proc, session_id),
+                    args=(self.rtmp_proc, session_id, bool(gst_debug)),
                     daemon=True).start()
 
                 # ROS topic 模式：订阅影像话题并持续送帧
@@ -722,26 +732,35 @@ class RemoteAgent:
                         reason, self._stream_session)
             self._shutdown_proc_locked()
 
-    def _drain_gst_stderr(self, proc, session_id):
+    def _drain_gst_stderr(self, proc, session_id, verbose=False):
         """后台线程读取 GStreamer 子进程 stderr 并记入日志。
 
         常见需要关注的错误关键字：
           - 'Cannot open device'  / 'Device or resource busy' → 相机被 realsense-ros 占用
           - 'No such element'     → 缺 gstreamer1.0-plugins-good
           - 'Connection refused'  → SRS 1935 不可达
+
+        V0.1.21：`verbose=True`（现场把 `gst_debug` 设为非空以开启 GST_DEBUG）时，
+        不再做关键字过滤，所有行直接以 INFO 落日志——排查“RTMP 已建立 TCP 连接
+        但管道不进入 PLAYING”这类无显式报错的静默卡住时，必须靠 GStreamer 自己
+        的状态变化日志才能定位卡在哪一步。
         """
         try:
             for raw in iter(proc.stderr.readline, b""):
                 msg = raw.decode("utf-8", errors="replace").rstrip()
-                if msg:
-                    # 过滤掉 GStreamer INFO 级别噪声，只转写含关键字的行
-                    if any(kw in msg for kw in (
-                            "ERROR", "WARN", "Critical", "Cannot", "Failed",
-                            "refused", "busy", "No such", "not found",
-                            "Could not", "Unable")):
-                        logger.warning("[GStreamer session=%s] %s", session_id, msg)
-                    else:
-                        logger.debug("[GStreamer] %s", msg)
+                if not msg:
+                    continue
+                if verbose:
+                    logger.info("[GStreamer session=%s] %s", session_id, msg)
+                    continue
+                # 过滤掉 GStreamer INFO 级别噪声，只转写含关键字的行
+                if any(kw in msg for kw in (
+                        "ERROR", "WARN", "Critical", "Cannot", "Failed",
+                        "refused", "busy", "No such", "not found",
+                        "Could not", "Unable")):
+                    logger.warning("[GStreamer session=%s] %s", session_id, msg)
+                else:
+                    logger.debug("[GStreamer] %s", msg)
         except Exception:  # noqa: BLE001
             pass
         finally:
@@ -1113,7 +1132,8 @@ DEFAULT_CONFIG = {
     "srs_stream_prefix": "hunter",            # = 平台 RC_SRS_STREAM_PREFIX（契约不可自创）
     "video_fps": 15,                          # 匹配 RealSense D435 实际输出 640x480@15fps
     "video_bitrate_kbps": 3000,               # 回落码率（契约 2048~4096 kbps）
-    "fdsrc_write_timeout_s": 5.0,             # V0.1.21：写 fdsrc 管道前的 select 超时，超时判定推流失败并重启
+    "fdsrc_write_timeout_s": 5.0,             # V0.1.21：写 fdsrc 管道时的整帧 select+os.write 超时，超时判定推流失败并重启
+    "gst_debug": "",                          # V0.1.21：非空（如 "2"~"4"）时传给子进程 GST_DEBUG 并把 stderr 全量转 INFO，排查 RTMP 握手卡住用
     "ws_url": "",                             # 文档 17.2 备用通道（例 ws://<SERVER_IP>/ws/remote）
     "enable_ws": False,                       # 主通道为 Kafka；备用 WS 需平台 JWT，默认关
     "cmd_topic": "/remote/command",           # 文档 13.4
