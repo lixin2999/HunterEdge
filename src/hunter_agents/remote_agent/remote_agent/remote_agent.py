@@ -590,6 +590,12 @@ class RemoteAgent:
 
         ❗ 分辨率必须以实际相机输出为准（stream_width/height 配置），
         而不以 boot 帧 video.width/height 为准（平台请求的分辨率可能与车端不符）。
+
+        V0.1.22：必须显式设置 fdsrc 的 blocksize=width*height*3（见下），否则
+        fdsrc 会按默认 4096 字节分块读 stdin，与一帧实际字节数不匹配，导致
+        每一帧都被下游判定为非法 buffer 而丢弃（真实现象：整条链路一直在报
+        `invalid buffer size 4096 < 921600`，但画面层看起来只是“绿屏”，容易被
+        误判成颜色转换问题）。
         """
         c = self.config
         fps = int(c.get("video_fps", 15))
@@ -618,8 +624,19 @@ class RemoteAgent:
                 f"speed-preset=ultrafast key-int-max={fps} "
                 f"bframes=0 cabac=false"
             )
+        # V0.1.22 根因修复：fdsrc 继承 GstBaseSrc，默认 blocksize=4096 字节——
+        # 从 stdin 每次只读 4096 字节就当作一个完整 buffer 推给下游，不管下游
+        # capsfilter 要求的是 640x480x3=921600 字节/帧，导致每个 buffer 都被
+        # videoconvert 判定为非法大小（`invalid buffer size 4096 < 921600`），
+        # 整条管道从未成功编码出一帧真实画面，浏览器收不到有效 H.264 数据而
+        # 显示解码器默认绿色——这才是本次绿屏问题的根因（非相机、非颜色转换、
+        # 非 RTMP 握手，之前所有假设均被 GST_DEBUG=3 全量日志排除）。
+        # 修复：显式把 blocksize 设为完整一帧的字节数（RGB24 = width*height*3），
+        # fdsrc 会精确读满一帧才输出，与 _frame_writer_loop 的整帧原子写入
+        #（V0.1.21）天然对齐——管道里永远不会有半帧，也不会错位。
+        frame_bytes = width * height * 3
         return (
-            f"fdsrc ! "
+            f"fdsrc blocksize={frame_bytes} ! "
             f"video/x-raw,format=RGB,width={width},height={height},framerate={fps}/1 ! "
             f"queue max-size-buffers=3 ! "
             f"{enc_stage} ! "
