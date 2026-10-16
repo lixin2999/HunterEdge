@@ -629,16 +629,22 @@ class RemoteAgent:
         # capsfilter 要求的是 640x480x3=921600 字节/帧，导致每个 buffer 都被
         # videoconvert 判定为非法大小（`invalid buffer size 4096 < 921600`），
         # 整条管道从未成功编码出一帧真实画面，浏览器收不到有效 H.264 数据而
-        # 显示解码器默认绿色——这才是本次绿屏问题的根因（非相机、非颜色转换、
-        # 非 RTMP 握手，之前所有假设均被 GST_DEBUG=3 全量日志排除）。
+        # 显示解码器默认绿色。这不是唯一问题（见下方 V0.1.23 补充：修好
+        # blocksize 后仍观察到写入超时，说明管道进入 PLAYING/RTMP 推流这一环
+        # 节确实也可能存在问题，V0.1.21 的“RTMP 卡住”假设当时被本 bug 掩盖，
+        # 不是被推翻），但它是必须修的第一层。
         # 修复：显式把 blocksize 设为完整一帧的字节数（RGB24 = width*height*3），
         # fdsrc 会精确读满一帧才输出，与 _frame_writer_loop 的整帧原子写入
         #（V0.1.21）天然对齐——管道里永远不会有半帧，也不会错位。
         frame_bytes = width * height * 3
+        # V0.1.23：queue 从 3 提到 15（约 1s @15fps）——blocksize 修正后，fdsrc
+        # 会真正把完整帧喂给下游，一旦 RTMP/x264 瞬时比帧率慢（网络抖动、关键帧
+        # 峰值），3 个 buffer 的队列会立即填满并反压 fdsrc 停止读 stdin，导致
+        # 写线程误判为“卡死”而触发超时重启。适当加大队列能吸收瞬时抖动。
         return (
             f"fdsrc blocksize={frame_bytes} ! "
             f"video/x-raw,format=RGB,width={width},height={height},framerate={fps}/1 ! "
-            f"queue max-size-buffers=3 ! "
+            f"queue max-size-buffers=15 ! "
             f"{enc_stage} ! "
             "h264parse ! flvmux streamable=true ! "
             f"rtmpsink location={url}"
@@ -1036,32 +1042,50 @@ class RemoteAgent:
         """向 fh（子进程 stdin）写满 data，整帧总耗时不超过 timeout 秒。
 
         返回 True=写完，False=超时或管道已断（调用方应视为推流失败并重启子进程）。
-        不能用 `fh.write(data)` 一步到位：Linux 默认管道缓冲约 64KB，远小于单帧
-        921KB，一旦下游 `fdsrc` 不消费，`write()` 会在写完管道容量后永久阻塞。
+
+        必须先把 fd 设为非阻塞（`os.set_blocking(fd, False)`）：阻塞模式下
+        `os.write(fd, buf)` 会卡在内核里直到 buf 全部写完才返回，完全无视
+        `select` 只确认了“当下有空位”这个事实——只要下游消费得慢，这一句
+        `os.write()` 就能阻塞几十秒而不触发任何超时。非阻塞后 `os.write()` 会
+        立即返回实际写入的字节数（可能少于请求量），循环才能按 `deadline`
+        逐轮重新 `select`+写入，真正把整帧耗时限制在 timeout 内。
         """
         deadline = time.monotonic() + timeout
         fd = fh.fileno()
         view = memoryview(data)
         offset = 0
         total = len(view)
-        while offset < total:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
+        try:
+            os.set_blocking(fd, False)
+        except OSError:  # noqa: BLE001
+            pass
+        try:
+            while offset < total:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    _, writable, _ = select.select([], [fd], [], remaining)
+                except (OSError, ValueError):  # noqa: BLE001
+                    return False
+                if not writable:
+                    return False
+                try:
+                    n = os.write(fd, view[offset:])
+                except BlockingIOError:
+                    # 非阻塞下管道当前已满（极少见，select 刚说可写就被占满），重新循环等下一轮
+                    continue
+                except (BrokenPipeError, OSError):  # noqa: BLE001
+                    return False
+                if n <= 0:
+                    return False
+                offset += n
+            return True
+        finally:
             try:
-                _, writable, _ = select.select([fd], [fd], [fd], remaining)
-            except (OSError, ValueError):  # noqa: BLE001
-                return False
-            if not writable:
-                return False
-            try:
-                n = os.write(fd, view[offset:])
-            except (BrokenPipeError, OSError):  # noqa: BLE001
-                return False
-            if n <= 0:
-                return False
-            offset += n
-        return True
+                os.set_blocking(fd, True)
+            except OSError:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------
     # 主入口
