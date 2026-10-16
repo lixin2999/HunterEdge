@@ -31,6 +31,7 @@
 /etc/hunter/kafka/kafka.properties（HunterCore 接入包：目录 0750 / properties 0640 / 私钥 0600）。
 """
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -723,6 +724,18 @@ class RemoteAgent:
                         stdin=subprocess.PIPE,
                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                         env=gst_env)
+                    # V0.1.24 关键修复（真正的根因）：Linux 管道默认容量仅 65536 字节
+                    # （16 页 × 4KB），而一帧 RGB 数据 = width*height*3（640×480 下是
+                    # 921600 字节），远大于管道容量。`fdsrc` 的 `read()` 系统调用不会
+                    # 等待凑满请求字节数，只返回“当前管道里有多少就读多少”——即使
+                    # V0.1.22 已把 blocksize 设为 921600，`fdsrc` 每次实际只能读到
+                    # 65536 字节（管道装满即止），推给 `videoconvert` 的仍是半帧，
+                    # 报 `invalid buffer size 65536 < 921600`（V0.1.23 部署后实机日志
+                    # 首次暴露的真实数字）。
+                    # 解决：用 `F_SETPIPE_SZ` 把管道容量扩到至少 1 帧 + 余量，让 `fdsrc` 一次
+                    # `read(blocksize)` 能真正读到完整一帧。受 `/proc/sys/fs/pipe-max-size`
+                    # 限制（默认 1048576 字节），超过则失败降级为原默认容量并打日志。
+                    self._enlarge_pipe_buffer(self.rtmp_proc.stdin)
                 else:
                     self.rtmp_proc = subprocess.Popen(
                         gst_args,
@@ -1086,6 +1099,28 @@ class RemoteAgent:
                 os.set_blocking(fd, True)
             except OSError:  # noqa: BLE001
                 pass
+
+    def _enlarge_pipe_buffer(self, fh):
+        """V0.1.24：把子进程 stdin 管道容量扩到至少能装下 2 帧（默认 64KB 装不下
+        一帧完整的 RGB 数据，导致 fdsrc 每次 read() 只能读到半帧，见 start_stream
+        处注释）。失败不阻断启动，仅记录警告（降级为系统默认容量）。
+        """
+        size = getattr(self, "_stream_size", None)
+        if not size:
+            return
+        frame_bytes = size[0] * size[1] * 3
+        # 目标：至少能容纳 1 帧完整数据 + 一点余量，不必强求 2 帧——因为
+        # 2 帧（1843200 字节）已超过 /proc/sys/fs/pipe-max-size 默认值（1048576），
+        # 普通进程无权申请到那么大；1 帧 + 余量（987136 字节）刚好在默认上限内。
+        want = frame_bytes + 65536
+        F_SETPIPE_SZ = getattr(fcntl, "F_SETPIPE_SZ", 1031)  # Linux 专有，非 Linux 上不存在
+        try:
+            fcntl.fcntl(fh.fileno(), F_SETPIPE_SZ, want)
+            logger.info("[视频] 管道容量已扩至 %d 字节（>= 1 帧 = %d 字节），避免 fdsrc 短读", want, frame_bytes)
+        except OSError as exc:
+            # 超出 /proc/sys/fs/pipe-max-size（默认 1048576）时会报 EINVAL/EPERM
+            logger.warning("[视频] 无法扩大管道容量至 %d 字节（%s），将使用系统默认容量，"
+                           "若仍报 'invalid buffer size' 请提高 /proc/sys/fs/pipe-max-size", want, exc)
 
     # ------------------------------------------------------------------
     # 主入口
