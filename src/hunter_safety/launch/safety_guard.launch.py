@@ -53,6 +53,11 @@ def generate_launch_description():
                 'enable_map_fence': True,
                 'map_edge_stop_dist': 0.4,  # V0.0.89 窄场地（与生产一致，原 0.5）
                 'map_edge_slow_dist': 1.0,  # V0.0.89 距未建图/界外 <1.0m 限速（与生产一致，原 1.5）
+                # V0.1.28 遥控执行桥（与生产 hunter_autonomous_nav.launch.py 同源）：
+                #   remote_timeout 0.5→2.0，与 remote_agent cmd_timeout 对齐；调试与生产
+                #   必须一致，否则单独起本节点会复现「有时遥控指令车不动」的误判零速。
+                'enable_remote_bridge': True,
+                'remote_timeout': 2.0,
                 'use_sim_time': False,
             }],
         ),

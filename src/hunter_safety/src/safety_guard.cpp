@@ -159,7 +159,15 @@ public:
     //   阿克曼换算作为本闸输入，与 Nav2 共用碰撞/曲率/边界安全闸（遥控不再绕过安全层）
     declare_parameter<bool>("enable_remote_bridge", true);
     declare_parameter<std::string>("remote_topic", "/remote/command");
-    declare_parameter<double>("remote_timeout", 0.5);
+    // V0.1.28：remote_timeout 由 0.5s 放宽到 2.0s，与 remote_agent 的 cmd_timeout(3.0s)
+    //   口径对齐。原 0.5s 是照搬文档 13.4「遥控超时 500ms 停车」，但那是指底盘执行侧
+    //   对指令连续性的要求；本桥判定的是「/remote/command 是否仍代表有效遥控会话」。
+    //   平台 UI 虽 20Hz 发帧，但 Kafka acks=all 实际到车 ~2s/帧（见 remote_agent
+    //   cmd_timeout 注释），remote_agent 的 20Hz ROS 定时器虽持续补发，一旦其
+    //   timer 被 GStreamer/DDS 抖动短暂饿死，0.5s 窗口会误判遥控失效 → 回退 Nav2 输入
+    //   → 无活跃 goal → CMD_TIMEOUT 零速（表现为「有时遥控指令车不动」）。2.0s 既能
+    //   容忍该抖动，又仍 < 会话结束补发刹停帧后的让出时延，不影响交还驾驶权语义。
+    declare_parameter<double>("remote_timeout", 2.0);
     declare_parameter<double>("remote_max_linear_vel", 2.0);  // 遥控纵向硬限（文档 13.4）
 
     wheelbase_ = get_parameter("wheelbase").as_double();
@@ -1222,7 +1230,7 @@ private:
   // V0.1.18 遥控执行桥参数
   bool enable_remote_bridge_{true};
   std::string remote_topic_{"/remote/command"};
-  double remote_timeout_{0.5};
+  double remote_timeout_{2.0};   // V0.1.28：0.5 → 2.0，与 remote_agent cmd_timeout 对齐
   double remote_max_linear_vel_{2.0};
   // 距离场与位姿缓存（data_mutex_ 保护；fence_dist_ 下标 = cy*w+cx）
   bool fence_ready_{false};

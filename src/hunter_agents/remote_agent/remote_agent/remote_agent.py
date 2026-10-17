@@ -18,8 +18,9 @@
      旧版自发该 Topic 已废弃）。
 
 ⚠ 驾驶权交还语义（V0.1.18 修订，取代旧版“超时即停发→回 AUTO”）：
-  decision_making 判定 REMOTE 是否生效只看 /remote/command 是否在 remote_timeout(0.5s)
-  内到过数据（src/decision_making/src/decision_making.cpp:122）。旧版无会话概念，
+  decision_making 判定 REMOTE 是否生效只看 /remote/command 是否在 remote_timeout 内到过
+  数据（V0.1.28 起 0.5s→2.0s，与 safety_guard 遥控执行桥、本包 cmd_timeout 全链路对齐，
+  见 src/decision_making/src/decision_making.cpp）。旧版无会话概念，
   任何超时都停发→回 AUTO，导致“遥控中短暂丢帧→车恢复跑自主航点”。现按会话区分：
   • 会话内（boot 已起、未 stop）失联：持续发布刹停帧保持 REMOTE，车停在原地等恢复；
   • 会话结束（stop 帧 / REMOTE_RELEASE 交还帧）：补一帧刹停后停止发布 → 回 AUTO。

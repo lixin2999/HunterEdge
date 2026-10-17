@@ -21,7 +21,7 @@ DecisionMaking::DecisionMaking(const rclcpp::NodeOptions & options)
   declare_parameter("chassis_topic", "/chassis/state");
   declare_parameter("estop_topic", "/estop");
   declare_parameter("behavior_state_topic", "/planning/behavior_state");
-  declare_parameter("remote_timeout", 0.5);    // 文档 13.4：远程指令超时 500ms 停车
+  declare_parameter("remote_timeout", 2.0);    // V0.1.28：0.5→2.0，与 safety_guard/remote_agent 全链路对齐（Kafka 到车 ~2s/帧）
   declare_parameter("chassis_timeout", 0.1);   // 文档 10.5：CAN 丢失 100ms 制动
 }
 

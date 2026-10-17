@@ -276,6 +276,13 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'enable_map_fence': True,   # 行驶范围不得超出已采集地图区域（行驶中最后防线）
             'map_edge_stop_dist': 0.4,  # V0.0.89 窄场地略收紧（原 0.5）；距未建图/界外 <此值零速
             'map_edge_slow_dist': 1.0,  # V0.0.89 距未建图/界外 <1.0m 线性限速（原 1.5）
+            # V0.1.18 遥控执行桥：/remote/command 新鲜且 control_mode=REMOTE 时经阿克曼
+            #   换算作为本闸输入。V0.1.28：remote_timeout 0.5→2.0，与 remote_agent
+            #   cmd_timeout(3.0s) 对齐——Kafka acks=all 实际到车 ~2s/帧，原 0.5s 会因
+            #   remote_agent 定时补发短暂抖动误判遥控失效→回退 Nav2 输入→CMD_TIMEOUT 零速
+            #   （表现为「有时遥控指令车不动」）。显式落值，避免单独调试/生产参数漂移。
+            'enable_remote_bridge': True,
+            'remote_timeout': 2.0,
             'use_sim_time': use_sim_time == 'true',
         }],
     )
