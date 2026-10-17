@@ -3,9 +3,12 @@
 #include "health_monitor/health_monitor.hpp"
 
 #include <sys/statvfs.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -408,19 +411,26 @@ double HealthMonitor::readGpuUsage()
 {
   // Jetson AGX Orin: /sys/devices/platform/bus@0/17000000.gpu/load
   // 值域 0-1000（对应 0.0%–100.0%），需除以 10 得到百分比
-  // Xavier 备用路径: /sys/devices/platform/gpu.0/load
+  // 必须用 POSIX open/read/close：sysfs 虚拟文件不支持 stdio 缓冲读，
+  // std::ifstream 在 systemd 服务上下文中可能 open 成功但 read 返回空，
+  // 导致 raw 保持初始值 0 且通过范围检查，静默上报 0%。
   static const char * kGpuLoadPaths[] = {
     "/sys/devices/platform/bus@0/17000000.gpu/load",   // Orin
     "/sys/class/devfreq/17000000.gpu/load",             // Orin alt
     "/sys/devices/platform/gpu.0/load",                 // Xavier
   };
   for (const char * path : kGpuLoadPaths) {
-    std::ifstream file(path);
-    if (!file.good()) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
       continue;
     }
-    int raw = 0;
-    file >> raw;
+    char buf[16] = {};
+    const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+      continue;
+    }
+    const int raw = static_cast<int>(strtol(buf, nullptr, 10));
     if (raw >= 0 && raw <= 1000) {
       return static_cast<double>(raw) / 10.0;  // 0-1000 → 0.0-100.0%
     }
