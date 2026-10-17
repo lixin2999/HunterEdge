@@ -48,6 +48,7 @@ private:
 
   // 资源采集（Linux /proc、/sys）
   double readCpuUsage();
+  double readGpuUsage();
   double readMemoryUsage();
   double readDiskUsage();
   double readTemp(const std::string & zone);

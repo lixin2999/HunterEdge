@@ -192,6 +192,7 @@ void HealthMonitor::checkHealth()
 
   // 2. 资源采集
   const double cpu = readCpuUsage();
+  const double gpu = readGpuUsage();
   const double mem = readMemoryUsage();
   const double disk = readDiskUsage();
   const double cpu_temp = readTemp("/sys/class/thermal/thermal_zone0/temp");
@@ -244,7 +245,7 @@ void HealthMonitor::checkHealth()
   hunter_msgs::msg::SystemHealth msg;
   msg.header.stamp = now;
   msg.cpu_usage = static_cast<float>(cpu);
-  msg.gpu_usage = 0.0f;  // GPU 使用率（可用 nvml/tegrastats 扩展）
+  msg.gpu_usage = static_cast<float>(gpu);
   msg.memory_usage = static_cast<float>(mem);
   msg.disk_usage = static_cast<float>(disk);
   msg.cpu_temp = static_cast<float>(cpu_temp);
@@ -401,6 +402,37 @@ double HealthMonitor::readDiskUsage()
     return 0.0;
   }
   return (1.0 - free / total) * 100.0;
+}
+
+double HealthMonitor::readGpuUsage()
+{
+  // Jetson AGX Orin: /sys/devices/platform/bus@0/17000000.gpu/load
+  // 值域 0-1000（对应 0.0%–100.0%），需除以 10 得到百分比
+  // Xavier 备用路径: /sys/devices/platform/gpu.0/load
+  static const char * kGpuLoadPaths[] = {
+    "/sys/devices/platform/bus@0/17000000.gpu/load",   // Orin
+    "/sys/class/devfreq/17000000.gpu/load",             // Orin alt
+    "/sys/devices/platform/gpu.0/load",                 // Xavier
+  };
+  for (const char * path : kGpuLoadPaths) {
+    std::ifstream file(path);
+    if (!file.good()) {
+      continue;
+    }
+    int raw = 0;
+    file >> raw;
+    if (raw >= 0 && raw <= 1000) {
+      return static_cast<double>(raw) / 10.0;  // 0-1000 → 0.0-100.0%
+    }
+  }
+  // 无可读 sysfs 节点（非 Jetson 或路径变更），返回 0 并记录一次日志
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    RCLCPP_WARN(get_logger(),
+      "未找到 Jetson GPU load sysfs 节点，gpu_usage 将上报 0");
+  }
+  return 0.0;
 }
 
 double HealthMonitor::readTemp(const std::string & zone)
