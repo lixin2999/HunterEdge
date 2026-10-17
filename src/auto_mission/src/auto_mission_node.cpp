@@ -141,6 +141,18 @@ AutoMissionNode::AutoMissionNode(const rclcpp::NodeOptions & options)
   // hunter_base 订阅 /cmd_vel 并按 bicycle model 换算阿克曼转向角。
   cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
 
+  // V0.1.29 建图模式遥控执行桥：订阅 /remote/command（ChassisCommand）缓存最新帧。
+  //   仅在 mapping 模式且 mode==REMOTE 时被 cruiseControlStep 顶部读取并转发；
+  //   nav 模式本订阅闲置（其遥控桥在 safety_guard），不会产生第二家 /cmd_vel 写者。
+  remote_cmd_sub_ = create_subscription<hunter_msgs::msg::ChassisCommand>(
+    remote_cmd_topic_, 10,
+    [this](const hunter_msgs::msg::ChassisCommand::SharedPtr msg) {
+      std::lock_guard<std::mutex> lk(data_mutex_);
+      remote_cmd_ = *msg;
+      remote_stamp_ = this->now();
+      remote_received_ = true;
+    });
+
   // FAST-LIO2 里程计（odom 系，原 camera_init；V0.0.93 方案A 帧名已归一，10Hz）——与 rviz "Publish Point"
   // 点击航点严格同源，巡航反馈直接使用该位姿，避免 EKF 系折算偏差。
   lio_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -307,6 +319,16 @@ void AutoMissionNode::declareParameters()
   declare_parameter("cruise_cmd_rate", 20.0);
   declare_parameter("cruise_odom_timeout", 1.0);
 
+  // ---- V0.1.29 建图模式遥控执行桥（/remote/command → /cmd_vel）----
+  // 建图模式下 safety_guard 未启动（其遥控桥在 nav 模式），本节点作为 /cmd_vel 唯一
+  //   所有者接管遥控：decision_making 判 mode==REMOTE 且 /remote/command 新鲜时，
+  //   把 target_velocity/target_steering 经 ackermann 换算（ω=v·tanδ/L）转发到 /cmd_vel。
+  declare_parameter("enable_mapping_remote_bridge", true);
+  declare_parameter("remote_cmd_topic", "/remote/command");
+  declare_parameter("mapping_remote_timeout", 2.0);   // 与 safety_guard/decision_making 对齐（V0.1.28）
+  declare_parameter("mapping_wheelbase", 0.46);       // 与 safety_guard 遥控桥同值
+  declare_parameter("mapping_remote_max_vel", 2.0);   // 与 remote_agent max_velocity 同值
+
   // 读取
   mission_mode_           = get_parameter("mission_mode").as_string();
   require_explicit_start_ = get_parameter("require_explicit_start").as_bool();
@@ -372,6 +394,11 @@ void AutoMissionNode::declareParameters()
   cruise_min_turn_radius_ = get_parameter("cruise_min_turn_radius").as_double();
   cruise_cmd_rate_        = get_parameter("cruise_cmd_rate").as_double();
   cruise_odom_timeout_    = get_parameter("cruise_odom_timeout").as_double();
+  enable_mapping_remote_bridge_ = get_parameter("enable_mapping_remote_bridge").as_bool();
+  remote_cmd_topic_       = get_parameter("remote_cmd_topic").as_string();
+  mapping_remote_timeout_ = get_parameter("mapping_remote_timeout").as_double();
+  mapping_wheelbase_      = get_parameter("mapping_wheelbase").as_double();
+  mapping_remote_max_vel_ = get_parameter("mapping_remote_max_vel").as_double();
   nav_active_wait_timeout_ = get_parameter("nav_active_wait_timeout").as_double();
   nav_retry_backoff_       = get_parameter("nav_retry_backoff").as_double();
   goal_cancel_settle_time_ = get_parameter("goal_cancel_settle_time").as_double();
@@ -680,6 +707,14 @@ void AutoMissionNode::estopCallback(const std_msgs::msg::Bool::SharedPtr msg)
 // ==========================================================================
 void AutoMissionNode::cruiseControlStep()
 {
+  // ---- V0.1.29 建图模式遥控执行桥（优先于巡航）----
+  //   mapping 模式下本节点是 /cmd_vel 唯一所有者；REMOTE 接管时把遥控帧转发到
+  //   /cmd_vel（否则原逻辑只会因 mapping_paused_ 发零速 → 遥控指令落空、车不动）。
+  //   即便未启动巡航（纯人工遥控建图）也需接管，故置于巡航激活判定之前。
+  if (mission_mode_ == "mapping" && mappingRemoteBridgeStep()) {
+    return;   // 本拍 /cmd_vel 由遥控桥拥有
+  }
+
   // ---- 非巡航运行态：必要时补一帧零速后静默 ----
   if (mission_mode_ != "mapping" || !cruise_active_ || state_ != MissionState::MAPPING) {
     if (cruise_cmd_published_) {
@@ -833,6 +868,79 @@ void AutoMissionNode::publishCruiseCmd(double v, double w)
   cmd.angular.z = w;
   cmd_vel_pub_->publish(cmd);
   cruise_cmd_published_ = true;
+}
+
+// ==========================================================================
+// V0.1.29 建图模式遥控执行桥（/remote/command → /cmd_vel）
+//
+// 背景：建图模式下 safety_guard 不启动（避免与巡航双写 /cmd_vel），故其 nav 模式
+//   遥控桥在 mapping 不生效——人工遥控指令无处落地，车停在原地。本函数把本节点
+//   （mapping 模式 /cmd_vel 唯一所有者）变为遥控执行桥：
+//     接管条件：enable 开关开 + 无全局急停 + decision_making mode==REMOTE
+//               + 帧 control_mode==REMOTE + /remote/command 新鲜（≤timeout）。
+//     换算：与 safety_guard nav 模式口径一致，ω=v·tan(δ)/L，再按 |w|≤|v|/R_min 钳制。
+//   任一条件不满足则释放（若上一拍在接管则补一帧零速），交还巡航/停车逻辑。
+//   返回 true 表示本拍 /cmd_vel 已由遥控桥写，调用方应跳过巡航。
+// ==========================================================================
+bool AutoMissionNode::mappingRemoteBridgeStep()
+{
+  if (!enable_mapping_remote_bridge_) return false;
+
+  std::string mode;
+  hunter_msgs::msg::ChassisCommand rc;
+  bool estop = false;
+  bool remote_fresh = false;
+  const rclcpp::Time now_t = now();
+  {
+    std::lock_guard<std::mutex> lk(data_mutex_);
+    mode = latest_behavior_state_.mode;
+    estop = estop_signal_;
+    rc = remote_cmd_;
+    remote_fresh = remote_received_ &&
+      (now_t - remote_stamp_).seconds() <= mapping_remote_timeout_;
+  }
+
+  // 接管条件（与 safety_guard 一致额外校验帧 control_mode==REMOTE，避免误用交接帧）
+  const bool take = !estop && mode == "REMOTE" &&
+    rc.control_mode == "REMOTE" && remote_fresh;
+
+  if (!take) {
+    if (mapping_remote_active_) {
+      // 遥控刚结束：补一帧零速后交还巡航（巡航会在后续拍自行恢复/停车）
+      publishCruiseCmd(0.0, 0.0);
+      mapping_remote_active_ = false;
+      RCLCPP_INFO(get_logger(),
+        "[建图遥控桥] 遥控结束（mode=%s control_mode=%s 新鲜=%d），补零速交还巡航",
+        mode.c_str(), rc.control_mode.c_str(), remote_fresh ? 1 : 0);
+    }
+    return false;
+  }
+
+  mapping_remote_active_ = true;
+
+  // 遥控帧自带急停标志 → 零速（空格紧急停车）
+  if (rc.emergency_stop) {
+    publishCruiseCmd(0.0, 0.0);
+    return true;
+  }
+
+  // 限幅（remote_agent 已夹一次，此处二次兜底，与 nav 模式 safety_guard 口径一致）
+  const double v = std::clamp(
+    static_cast<double>(rc.target_velocity),
+    -mapping_remote_max_vel_, mapping_remote_max_vel_);
+  // 前轮转角 δ → 横摆角速度 ω = v·tan(δ)/L
+  double w = (mapping_wheelbase_ > 1e-3)
+    ? v * std::tan(static_cast<double>(rc.target_steering)) / mapping_wheelbase_ : 0.0;
+  // 阿克曼几何约束：|w| ≤ |v|/R_min（HUNTER-SE 无法原地转向）
+  const double w_lim = (cruise_min_turn_radius_ > 1e-3)
+    ? std::fabs(v) / cruise_min_turn_radius_ : 0.0;
+  w = std::clamp(w, -w_lim, w_lim);
+
+  publishCruiseCmd(v, w);
+  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+    "[建图遥控桥] 转发遥控 v=%.2f m/s δ=%.3f rad → ω=%.2f rad/s（L=%.2fm R_min=%.1fm）",
+    v, static_cast<double>(rc.target_steering), w, mapping_wheelbase_, cruise_min_turn_radius_);
+  return true;
 }
 
 double AutoMissionNode::wrapAngle(double a)

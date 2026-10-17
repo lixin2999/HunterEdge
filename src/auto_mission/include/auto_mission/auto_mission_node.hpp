@@ -36,6 +36,7 @@
 #include "lifecycle_msgs/srv/get_state.hpp"
 
 #include "hunter_msgs/msg/behavior_state.hpp"
+#include "hunter_msgs/msg/chassis_command.hpp"   // V0.1.29：建图模式遥控执行桥（/remote/command）
 #include "hunter_msgs/msg/detected_object_array.hpp"
 #include "hunter_msgs/msg/system_health.hpp"
 
@@ -177,6 +178,7 @@ private:
   bool parseWaypoint(const std::string & entry, Waypoint & wp);
   bool reloadWaypointsFromFile(std::string & msg);   // 重新读取 params_file 的 waypoints
   void cruiseControlStep();                          // 20Hz 巡航控制（含安全约束）
+  bool mappingRemoteBridgeStep();                    // V0.1.29：建图模式遥控执行桥（20Hz，优先于巡航）
   void publishCruiseCmd(double v, double w);
   static double wrapAngle(double a);                 // 归一化到 [-π, π]
 
@@ -223,6 +225,9 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_cruise_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_cruise_srv_;
   rclcpp::TimerBase::SharedPtr cruise_timer_;
+
+  // ---- V0.1.29 建图模式遥控执行桥（/remote/command → /cmd_vel，本模式 /cmd_vel 唯一所有者）----
+  rclcpp::Subscription<hunter_msgs::msg::ChassisCommand>::SharedPtr remote_cmd_sub_;
 
   // ---- V0.1.19 任务授权门控（nav 模式上电不自动启动，等待平台明确指令） ----
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr arm_srv_;
@@ -279,6 +284,12 @@ private:
   nav_msgs::msg::Odometry latest_lio_odom_;   // FAST-LIO2 /Odometry（odom 系，原 camera_init）
   rclcpp::Time last_lio_odom_arrive_{0, 0, RCL_SYSTEM_TIME};  // 最近一次到达时刻（本节点时钟）
   std::atomic<bool> mapping_paused_{false};   // 非 AUTO / CRITICAL → 暂停巡航（保持 MAPPING）
+
+  // ---- V0.1.29 建图模式遥控执行桥缓存（data_mutex_ 保护） ----
+  hunter_msgs::msg::ChassisCommand remote_cmd_;
+  rclcpp::Time remote_stamp_{0, 0, RCL_SYSTEM_TIME};   // 最近一帧 /remote/command 到达时刻
+  bool remote_received_{false};                        // 收到过至少一帧 /remote/command
+  bool mapping_remote_active_{false};                  // 上一拍是否由遥控桥接管 /cmd_vel
 
   rclcpp::Time last_perception_stamp_;   // 感知数据最后到达时间
 
@@ -469,6 +480,15 @@ private:
   double cruise_min_turn_radius_{1.9};   // HUNTER-SE 最小转弯半径（m），|w| ≤ v/R
   double cruise_cmd_rate_{20.0};         // /cmd_vel 发布频率（Hz），需 > 2×(1/cmd_vel_timeout)
   double cruise_odom_timeout_{1.0};      // /Odometry 超时（s），超时停车
+
+  // ---- V0.1.29 建图模式遥控执行桥参数 ----
+  // 建图模式下 safety_guard 未启动（避免与巡航双写 /cmd_vel），遥控执行桥下沉到
+  //   本节点（/cmd_vel 唯一所有者）：mode==REMOTE 且 /remote/command 新鲜时转发遥控。
+  bool enable_mapping_remote_bridge_{true};  // 建图遥控桥总开关
+  std::string remote_cmd_topic_{"/remote/command"};
+  double mapping_remote_timeout_{2.0};   // 遥控帧新鲜度阈值（s），与 safety_guard/decision_making remote_timeout 对齐
+  double mapping_wheelbase_{0.46};       // 轴距 L（m），δ→ω 换算，与 safety_guard 遥控桥口径一致
+  double mapping_remote_max_vel_{2.0};   // 遥控线速度限幅（m/s），与 remote_agent max_velocity 一致
 
   // ---- 建图模式自动巡航状态 ----
   bool cruise_active_{false};            // 巡航已启动（start 服务触发）

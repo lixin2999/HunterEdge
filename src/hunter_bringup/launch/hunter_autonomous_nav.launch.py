@@ -486,6 +486,15 @@ def _mapping_nodes(context, *args, **kwargs):
             # start_mapping_cruise 服务触发时从此文件热重载 waypoints
             # （waypoint_recorder 在建图过程中持续写入同一文件）
             {'params_file': auto_params_file},
+            # ---- V0.1.29 建图模式遥控执行桥 ----
+            # mapping 下 safety_guard 未启动，本节点作为 /cmd_vel 唯一所有者接管遥控：
+            #   mode==REMOTE 且 /remote/command 新鲜时把 target 经 ackermann 转发到 /cmd_vel。
+            #   remote_timeout 与 safety_guard/decision_making 对齐为 2.0s（V0.1.28）。
+            {'enable_mapping_remote_bridge': True},
+            {'remote_cmd_topic': '/remote/command'},
+            {'mapping_remote_timeout': 2.0},
+            {'mapping_wheelbase': 0.46},
+            {'mapping_remote_max_vel': 2.0},
             {'use_sim_time': use_sim_time == 'true'},
         ],
     )
