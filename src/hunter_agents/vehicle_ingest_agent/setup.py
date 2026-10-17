@@ -22,7 +22,7 @@ setup(
         #   抛 PackageNotFoundError；见 command_agent/remote_agent 同款修复）。
         (os.path.join('lib', package_name), ['scripts/vehicle_ingest_agent_node']),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'requests'],
     zip_safe=True,
     maintainer='HUNTER Development Team',
     maintainer_email='developer@hunter.ai',

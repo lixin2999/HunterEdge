@@ -14,6 +14,8 @@
   <!-- 核心链路不依赖 ROS 节点；仅复用 hunter_kafka 公共接入库。
        rclpy/hunter_msgs 为可选（录制通过外部 ros2 bag record 子进程，无需本包引入消息类型）。 -->
   <exec_depend>hunter_kafka</exec_depend>
+  <!-- presign 上传（V1.21.13）：mTLS REST + 预签名 URL 裸 PUT 仅需 requests（gateway 同源） -->
+  <exec_depend>python3-requests</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

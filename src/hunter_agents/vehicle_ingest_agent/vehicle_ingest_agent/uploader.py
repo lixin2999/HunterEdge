@@ -1,22 +1,28 @@
 # -*- coding: utf-8 -*-
-"""上传引擎（设计 §6.7）：S3/MinIO 分片上传（断点续传）或边缘网关 HTTP PUT。
+"""上传引擎（设计 §6.7 + 平台 V1.21.13 presign 契约）。
 
-- 通道：``upload.endpoint_type`` = s3（boto3，S3/MinIO 兼容）| gateway（requests PUT）；
-- 优先级队列：P0 manifest / P4 原始片段（降级模式）；跨对象并发 + 令牌桶限速 + 时间窗；
-- 断点续传：每个 >part_size 的对象写 ``part-state/{object_key}.json``（upload_id + 已完成
-  part 的 etag），进程重启续传；upload_id 过期(>7d) 由 S3 端 ListMultipartUploads 清理重传；
-- 完整性：上传完 HEAD 比对 content-length，并带 x-amz-meta-sha256/bag-id/agent-version；
-- 重试：指数退避 base→×2…max + jitter，超 max_attempts → 交回上层置 upload_failed。
+三种通道（``upload.endpoint_type``）：
+  - ``presign``（生产默认）：服务端 presign 生成 object_key + 车端 mTLS 走 REST + 裸 PUT
+    预签名 URL + 服务端 complete 校验三元组；上传单元 = **一个 bag 的单个 tar 归档**（一轮）；
+  - ``s3``：boto3 直连 MinIO，车端自拼 object_key + 逐文件上传（断点续传 part-state）；
+  - ``gateway``：边缘网关整对象 HTTP PUT。
+
+presign 模式要点（对照方案）：
+  - 打包+流式三元组（md5/sha256/size 对**归档字节**一次算出，口径不同于 manifest 跨文件 sha256）；
+  - 续传：part-state 键 ``bag_id``，命中且 ``now-presign_ts<deadline_s`` 且归档在 → 复用 object_key/
+    upload_id/已完成 parts；否则重新 presign；verified 才删 state + 删 staging 归档；
+  - 重试分流：按 presign 异常类型决定退避/重签/重传/不重试（见 :meth:`UploadEngine._handle_failure`）；
+  - retention：``seg.protected==1 → event``（永久保留），否则 ``regular``，presign 与 complete 都带且一致。
 
 boto3/requests 缺失或凭据不可用时抛 :class:`UploadUnavailable`，由 agent 归类为上传失败
-（保留现场、不删片段），而非崩溃。凭据：优先 STS/环境，落 /etc/hunter/oss（0600），
-不写进仓库 YAML。
+（保留现场、不删片段），而非崩溃。presign 走 mTLS 证书，不需 AK/SK。
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -24,6 +30,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .logging_util import get_logger
+from .pack import pack_and_hash
+from .presign import (FileUploadClient, PresignUnavailable, RateLimited,
+                      PermanentDeny, BadParams, TLSAuthFailed, NotFound,
+                      ServerBusy, IntegrityMismatch)
 
 logger = get_logger("uploader")
 
@@ -185,14 +195,21 @@ def _load_oss_credentials(cfg) -> Dict[str, str]:
 
 
 class UploadJob:
-    """单对象上传任务（优先级队列元素）。priority 越小越先（P0 manifest…P4 raw）。"""
+    """单对象上传任务（优先级队列元素）。priority 越小越先（P0 manifest…P4 raw）。
+
+    presign 模式下代表**一个 bag 的 tar 归档**：``local_path`` 为 staging 归档路径，
+    ``seg_dir``/``manifest_path`` 为打包源，``object_key`` 待 presign 回填，
+    ``md5``/``sha256``/``size`` 为归档三元组，``retention`` 为 ``regular``/``event``。
+    """
 
     __slots__ = ("priority", "seq", "bag_id", "local_path", "object_key",
-                 "artifact_class", "sha256", "size", "metadata", "attempt")
+                 "artifact_class", "sha256", "size", "metadata", "attempt",
+                 "retention", "md5", "seg_dir", "manifest_path")
 
     def __init__(self, priority: int, seq: int, bag_id: str, local_path: str,
                  object_key: str, artifact_class: str, sha256: str, size: int,
-                 metadata: Dict[str, str], attempt: int = 0):
+                 metadata: Dict[str, str], attempt: int = 0, retention: str = "regular",
+                 md5: str = "", seg_dir: str = "", manifest_path: Optional[str] = None):
         self.priority = priority
         self.seq = seq
         self.bag_id = bag_id
@@ -203,6 +220,10 @@ class UploadJob:
         self.size = size
         self.metadata = metadata
         self.attempt = attempt
+        self.retention = retention
+        self.md5 = md5
+        self.seg_dir = seg_dir
+        self.manifest_path = manifest_path
 
     def __lt__(self, other: "UploadJob") -> bool:
         if self.priority != other.priority:
@@ -217,6 +238,12 @@ class UploadEngine:
         self.bucket_version = bucket_version
         self.part_state_dir = cfg.part_state_dir
         os.makedirs(self.part_state_dir, exist_ok=True)
+        self.endpoint_type = cfg.get("upload.endpoint_type", "s3")
+        self.presign_mode = self.endpoint_type == "presign"
+        self.staging_dir = cfg.staging_dir
+        if self.presign_mode:
+            os.makedirs(self.staging_dir, exist_ok=True)
+        self.deadline_s = int(cfg.get("upload.presign.deadline_s", 3600))
         self.max_attempts = int(cfg.get("upload.max_attempts", 12))
         self.backoff_base = float(cfg.get("upload.retry_backoff_base_s", 1))
         self.backoff_max = float(cfg.get("upload.retry_backoff_max_s", 600))
@@ -224,6 +251,7 @@ class UploadEngine:
         self._queue: "asyncio.PriorityQueue[UploadJob]" = asyncio.PriorityQueue()
         self._seq = 0
         self._backend = None
+        self._presign_client: Optional[FileUploadClient] = None
         self._bucket = None
         self._workers: List[asyncio.Task] = []
         self._running = False
@@ -243,13 +271,17 @@ class UploadEngine:
         self._fail_cb = fail_cb
         endpoint_type = self.cfg.get("upload.endpoint_type", "s3")
         try:
-            if endpoint_type == "s3":
+            if endpoint_type == "presign":
+                self._presign_client = FileUploadClient(self.cfg)
+            elif endpoint_type == "s3":
                 self._backend = _S3Backend(self.cfg)
             else:
                 self._backend = _GatewayBackend(self.cfg)
         except ImportError as exc:
             raise UploadUnavailable(
-                f"上传依赖缺失（{endpoint_type}）：{exc}；s3 需 boto3，gateway 需 requests")
+                f"上传依赖缺失（{endpoint_type}）：{exc}；presign/gateway 需 requests，s3 需 boto3")
+        except PresignUnavailable as exc:
+            raise UploadUnavailable(f"presign 通道不可用：{exc}")
         self._bucket = self.cfg.get("upload.bucket")
         self._running = True
         import concurrent.futures
@@ -283,10 +315,15 @@ class UploadEngine:
     def enqueue_segment(self, seg: Dict[str, Any], manifest_path: Optional[str]) -> int:
         """把一个片段的可上传对象入队。返回入队对象数（用于 done 计数门控）。
 
-        降级模式：manifest(P0) + 原始片段内所有文件(P4)。
+        presign 模式：整个片段目录+manifest **打包成单个 tar 归档**，入队**一个** job（一轮），
+        打包/三元组延后到 worker 中在线程池执行；返回 1。
+        降级模式（s3/gateway）：manifest(P0) + 原始片段内所有文件(P4)，逐文件入队。
         """
         bag_id = seg["bag_id"]
         seg_dir = seg["path"]
+        retention = "event" if int(seg.get("protected", 0) or 0) == 1 else "regular"
+        if self.presign_mode:
+            return self._enqueue_presign_archive(seg, manifest_path, retention)
         date = datetime.utcfromtimestamp(seg.get("start_ns", 0) / 1e9 or time.time()
                                          ).strftime("%Y-%m-%d")
         meta_common = {"bag-id": bag_id, "agent-version": self.cfg.agent_version,
@@ -313,13 +350,32 @@ class UploadEngine:
             md = dict(meta_common)
             md["sha256"] = file_hash
             job = UploadJob(prio, self._seq, bag_id, local,
-                            self.object_key(bag_id, date, rel), cls, file_hash, size, md)
+                            self.object_key(bag_id, date, rel), cls, file_hash, size, md,
+                            retention=retention)
             self._inflight[bag_id] = self._inflight.get(bag_id, 0) + 1
             self._queue.put_nowait(job)
             count += 1
         logger.info("片段入队 %d 个对象 bag_id=%s", count, bag_id,
                     extra={"bag_id": bag_id, "component": "uploader"})
         return count
+
+    def _enqueue_presign_archive(self, seg: Dict[str, Any], manifest_path: Optional[str],
+                                 retention: str) -> int:
+        """presign 模式：为单袋归档入队一个 job（打包延后）；返回 1。"""
+        bag_id = seg["bag_id"]
+        self._seq += 1
+        archive_path = os.path.join(self.staging_dir, bag_id + ".tar")
+        job = UploadJob(
+            int(seg.get("priority", 4) or 4), self._seq, bag_id, archive_path,
+            "",  # object_key 待 presign 回填
+            "rosbag_archive", "", 0, {},
+            retention=retention, seg_dir=seg["path"],
+            manifest_path=manifest_path if manifest_path and os.path.isfile(manifest_path) else None)
+        self._inflight[bag_id] = self._inflight.get(bag_id, 0) + 1
+        self._queue.put_nowait(job)
+        logger.info("presign 归档入队 bag_id=%s retention=%s", bag_id, retention,
+                    extra={"bag_id": bag_id, "component": "uploader"})
+        return 1
 
     async def _worker(self, idx: int) -> None:
         loop = asyncio.get_running_loop()
@@ -342,6 +398,9 @@ class UploadEngine:
         self._bucket_rate.set_rate(self._current_rate_bps())   # 跨时间窗动态限速
 
     async def _upload_job(self, loop, job: UploadJob) -> None:
+        if self.presign_mode:
+            await self._upload_via_presign(loop, job)
+            return
         backend = self._backend
         # 断点：已存在且大小一致 → 视为完成（幂等，object_key 唯一，§8）
         remote = await loop.run_in_executor(self._exec, backend.head_size, job.object_key)
@@ -395,6 +454,115 @@ class UploadEngine:
         self._remove_part_state(state_path)
         return etag
 
+    # ── presign 模式：每 bag 一轮 presign → PUT → complete ──
+    async def _upload_via_presign(self, loop, job: UploadJob) -> None:
+        client = self._presign_client
+        archive = job.local_path
+        state_path = self._presign_state_path(job.bag_id)
+        state = self._load_presign_state(state_path)
+        t0 = time.monotonic()
+
+        # 1) 打包 + 三元组：命中续传（state 有三元组且归档在且尺寸一致）→ 复用，不重打包
+        reusable = (state.get("size") and state.get("md5") and state.get("sha256")
+                    and os.path.isfile(archive)
+                    and os.path.getsize(archive) == state.get("size"))
+        if reusable:
+            job.size, job.md5, job.sha256 = state["size"], state["md5"], state["sha256"]
+        else:
+            size, md5, sha = await loop.run_in_executor(
+                self._exec, pack_and_hash, job.seg_dir, job.manifest_path, archive)
+            job.size, job.md5, job.sha256 = size, md5, sha
+            state = {}   # 重打包 → 旧 presign/parts 作废
+
+        # 2) presign（命中且未过期 → 复用 object_key/method/upload_url/upload_id/parts）
+        presign_data = state.get("presign")
+        if not (presign_data and time.time() - state.get("presign_ts", 0) < self.deadline_s):
+            part_count = max(1, math.ceil(job.size / self.part_size))
+            file_name = "%s.tar" % job.bag_id
+            presign_data = await loop.run_in_executor(
+                self._exec, client.presign, file_name, job.size, part_count, job.retention)
+            state = {"presign": presign_data, "presign_ts": time.time(),
+                     "size": job.size, "md5": job.md5, "sha256": job.sha256,
+                     "done_parts": []}
+            self._save_presign_state(state_path, state)
+        job.object_key = presign_data.get("object_key", "") or job.object_key
+        method = presign_data.get("method")
+
+        # 3) PUT（单次带声明 Content-Type；分片逐片 PUT 收 ETag）
+        if method == "put" or presign_data.get("upload_url"):
+            await loop.run_in_executor(
+                self._exec, client.put_single, presign_data["upload_url"], archive)
+            is_multipart = False
+        else:
+            is_multipart = True
+            part_urls = presign_data.get("parts") or []
+            done = {p["part_number"] for p in state.get("done_parts", [])}
+            with open(archive, "rb") as fh:
+                for meta in part_urls:
+                    pno = meta["part_number"]
+                    if pno in done:
+                        continue
+                    fh.seek((pno - 1) * self.part_size)
+                    chunk = fh.read(self.part_size)
+                    if not chunk:
+                        continue
+                    await self._bucket_rate.acquire(len(chunk))
+                    etag = await loop.run_in_executor(
+                        self._exec, client.put_part, meta["upload_url"], chunk)
+                    state["done_parts"].append({"part_number": pno, "etag": etag})
+                    self._save_presign_state(state_path, state)
+
+        # 4) complete（回带三元组 + retention；multipart 另带 upload_id+parts）
+        if is_multipart:
+            await loop.run_in_executor(
+                self._exec, client.complete, job.object_key, job.size, job.md5, job.sha256,
+                job.retention, presign_data.get("upload_id"), state.get("done_parts") or [])
+        else:
+            await loop.run_in_executor(
+                self._exec, client.complete, job.object_key, job.size, job.md5, job.sha256,
+                job.retention)
+
+        # verified：删 part-state + 删 staging 归档 → 标记完成
+        self._remove_presign_state(state_path)
+        self._remove_archive(archive)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        self._mark_object_done(job, job.sha256, "verified", duration_ms)
+
+    # ── presign part-state 持久化（键 bag_id）──
+    def _presign_state_path(self, bag_id: str) -> str:
+        safe = bag_id.replace("/", "_")
+        return os.path.join(self.part_state_dir, "presign_%s.json" % safe)
+
+    def _load_presign_state(self, path: str) -> Dict[str, Any]:
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {}
+
+    def _save_presign_state(self, path: str, state: Dict[str, Any]) -> None:
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+        except OSError as exc:
+            logger.warning("presign part-state 写入失败 %s：%s", path, exc)
+
+    def _remove_presign_state(self, path: str) -> None:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def _remove_archive(self, path: str) -> None:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError as exc:
+            logger.warning("staging 归档删除失败 %s：%s", path, exc)
+
     def _mark_object_done(self, job: UploadJob, sha256: str, etag: str,
                           duration_ms: int) -> None:
         logger.info("对象上传完成 key=%s class=%s size=%d", job.object_key,
@@ -408,6 +576,9 @@ class UploadEngine:
                         extra={"bag_id": job.bag_id, "component": "uploader"})
 
     async def _handle_failure(self, loop, job: UploadJob, exc: Exception) -> None:
+        if self.presign_mode:
+            await self._handle_presign_failure(job, exc)
+            return
         job.attempt += 1
         if job.attempt > self.max_attempts:
             logger.error("对象上传超限 bag_id=%s key=%s：%s", job.bag_id,
@@ -423,6 +594,54 @@ class UploadEngine:
                        delay, exc, extra={"bag_id": job.bag_id, "component": "uploader"})
         await asyncio.sleep(delay)
         self._inflight[job.bag_id] = self._inflight.get(job.bag_id, 0) + 1  # 仍在途
+        self._queue.put_nowait(job)
+
+    async def _handle_presign_failure(self, job: UploadJob, exc: Exception) -> None:
+        """presign 重试矩阵（方案 §4 重试分流）。
+
+        - PermanentDeny(1002)/BadParams(2001)/TLSAuthFailed(1001) → 不重试，置 upload_failed（属配置/证书/平台侧）；
+        - RateLimited(429) → 按 Retry-After 退避重试，不占 attempt 预算；
+        - IntegrityMismatch(6001) → 作废重传：删 state + 删归档 → 重打包重算（attempt+1）；
+        - NotFound(3001) → 强制重新 presign（清 presign 保留归档，重传）；
+        - ServerBusy(5001) → 保留 state（对象已在），退避重试 complete；
+        - 网络/超时（其余 PresignError）→ 指数退避（retry_backoff_*）。
+        """
+        bag_id = job.bag_id
+        state_path = self._presign_state_path(bag_id)
+        if isinstance(exc, (PermanentDeny, BadParams, TLSAuthFailed)):
+            logger.error("presign 不可重试（配置/证书/平台侧）bag_id=%s：%s", bag_id, exc,
+                         extra={"bag_id": bag_id, "component": "uploader"})
+            self._inflight[bag_id] = max(0, self._inflight.get(bag_id, 0) - 1)
+            if self._fail_cb:
+                self._fail_cb(bag_id, exc)
+            return
+        if isinstance(exc, RateLimited):
+            logger.warning("presign 限流 429，%.0fs 后重试（不占 attempt）bag_id=%s",
+                           exc.retry_after, bag_id,
+                           extra={"bag_id": bag_id, "component": "uploader"})
+            await asyncio.sleep(exc.retry_after)
+            self._queue.put_nowait(job)      # inflight 不变（仍在途）
+            return
+        if isinstance(exc, IntegrityMismatch):
+            self._remove_presign_state(state_path)      # 作废 → 重打包重算
+            self._remove_archive(job.local_path)
+            job.object_key = ""
+        elif isinstance(exc, NotFound):
+            self._remove_presign_state(state_path)      # 强制重新 presign（保留归档）
+            job.object_key = ""
+        job.attempt += 1
+        if job.attempt > self.max_attempts:
+            logger.error("presign 上传超限 bag_id=%s key=%s：%s", bag_id, job.object_key, exc,
+                         extra={"bag_id": bag_id, "component": "uploader"})
+            self._inflight[bag_id] = max(0, self._inflight.get(bag_id, 0) - 1)
+            if self._fail_cb:
+                self._fail_cb(bag_id, exc)
+            return
+        delay = min(self.backoff_max, self.backoff_base * (2 ** (job.attempt - 1)))
+        delay += random.uniform(0, delay * 0.2)
+        logger.warning("presign 重试 %d/%d（%.1fs 后）：%s", job.attempt, self.max_attempts,
+                       delay, exc, extra={"bag_id": bag_id, "component": "uploader"})
+        await asyncio.sleep(delay)
         self._queue.put_nowait(job)
 
     # ── part-state 持久化（§6.7 断点续传）──

@@ -21,6 +21,7 @@ paths:
   spool_dir: spool                   # 解析产物暂存（降级模式仅缓存原始片段）
   state_dir: state                   # SQLite（状态机 + outbox + segments）
   part_state_dir: part-state         # 分片上传断点
+  staging_dir: upload-staging        # presign 模式：打包归档暂存（verified 后删除）
   logs_dir: logs                     # JSON lines
 
 # ── 分段录制 + 环形本地缓存（需求 2 核心）─────────────────────────
@@ -68,30 +69,36 @@ parse:
   pin_cores: [4, 5]
   throttle: {msg_per_sec: 20000, nice: 10}
 
-# ── 上传引擎（设计 §6.7）──────────────────────────────────────────
+# ── 上传引擎（设计 §6.7 + 平台 V1.21.13 presign 契约）─────────────────
 upload:
   enabled: true
-  endpoint_type: s3                  # s3 | gateway
-  endpoint: https://minio.internal:9000
+  endpoint_type: presign             # presign（生产）| s3 | gateway（开发机兜底）
+  endpoint: https://minio.internal:9000   # 仅 s3/gateway 兜底路径使用
   region: us-east-1
-  bucket: bags
-  bucket_version: v1                 # 对象路径版本段（设计 §7.2）
+  bucket: hunter-rosbag              # 契约固定桶（data_type=rosbag → hunter-rosbag）
+  bucket_version: v1                 # 对象路径版本段（仅 s3/gateway 自拼 key 时使用）
   use_tls: true
-  # 凭据：留空 = 走 /etc/hunter/oss/credentials（STS 优先）；仅开发机兜底内联
+  # 凭据：presign 走 mTLS 证书（bundle_dir），不需 AK/SK；s3/gateway 兜底才读 /etc/hunter/oss
   access_key: ""
   secret_key: ""
-  part_size_mb: 16                   # 分片大小（8~32 可配）
+  part_size_mb: 16                   # 分片大小（8~32 可配；契约推荐 16MiB）
   concurrency:
     per_object_parts: 4              # 单对象分片并发
     objects: 3                       # 跨对象并发
-  rate_limit_mbps: 160               # 令牌桶全局上限
+  rate_limit_mbps: 10                # 契约单车带宽上限（>10Mbps 触发 429）
   schedule:                          # 时间窗限速（弱网/白天降载）
-    - {window: "09:00-18:00", rate_mbps: 40}
+    - {window: "09:00-18:00", rate_mbps: 8}
   max_attempts: 12                   # 超过 → task=upload_failed 挂起，保留现场
   retry_backoff_base_s: 1
   retry_backoff_max_s: 600
   keep_raw: delete_on_uploaded     # 需求2默认：上传成功立即删除本地片段 | keep | after_confirmed
-  # 优先级：raw 片段本体在降级模式下按 P4 处理，manifest 走 P0
+  # presign 子块（V1.21.13）：车端 mTLS 直连设备 REST 入口，服务端生成 object_key
+  presign:
+    api_base: ""                     # https://<SERVER_IP>:8443（必填，留空启动即报错）
+    bundle_dir: /etc/hunter/kafka    # mTLS PEM 目录（ca-cert/client-cert/client-key.pem，与 Kafka 同源）
+    data_type: rosbag                # 契约枚举：rosbag
+    content_type: application/x-tar  # 单 PUT 必须与 presign 声明一致，否则 403
+    deadline_s: 3600                 # presign 预签名有效期（超期重新 presign）
 
 # ── Kafka（设计 §6.8）：Topic 沿用 HunterCore 接入包契约 hunter.<vid>.<type> ──
 kafka:

@@ -222,11 +222,14 @@ class VehicleIngestAgent:
         if self.machine:
             task = self.store.get_task(bag_id)
             seq = task["seq"] if task else 0
+            if self.cfg.get("upload.endpoint_type", "s3") == "presign":
+                endpoint = self.cfg.get("upload.presign.api_base", "")
+            else:
+                endpoint = self.cfg.get("upload.endpoint", "")
             self.machine.emit_artifact_uploaded(
                 bag_id, seq, artifact_class=job.artifact_class, object_key=job.object_key,
                 size_bytes=job.size, sha256=job.sha256, etag=etag,
-                upload_duration_ms=duration_ms,
-                endpoint=self.cfg.get("upload.endpoint", ""))
+                upload_duration_ms=duration_ms, endpoint=endpoint)
         self._done[bag_id] = self._done.get(bag_id, 0) + 1
         self._maybe_finalize(bag_id)
 

@@ -37,6 +37,7 @@ DEFAULTS: Dict[str, Any] = {
         "spool_dir": "spool",
         "state_dir": "state",
         "part_state_dir": "part-state",
+        "staging_dir": "upload-staging",
         "logs_dir": "logs",
     },
     "recording": {
@@ -73,22 +74,30 @@ DEFAULTS: Dict[str, Any] = {
     },
     "upload": {
         "enabled": True,
-        "endpoint_type": "s3",
+        "endpoint_type": "presign",
         "endpoint": "",
         "region": "us-east-1",
-        "bucket": "bags",
+        "bucket": "hunter-rosbag",
         "bucket_version": "v1",
         "use_tls": True,
         "access_key": "",
         "secret_key": "",
         "part_size_mb": 16,
         "concurrency": {"per_object_parts": 4, "objects": 3},
-        "rate_limit_mbps": 160,
+        "rate_limit_mbps": 10,
         "schedule": [],
         "max_attempts": 12,
         "retry_backoff_base_s": 1,
         "retry_backoff_max_s": 600,
         "keep_raw": "delete_on_uploaded",
+        # presign 契约（V1.21.13）：车端 mTLS 直连 :8443 申请 object_key + 裸 PUT 预签名 URL
+        "presign": {
+            "api_base": "",                 # https://<SERVER_IP>:8443（必填，留空启动即报错）
+            "bundle_dir": "/etc/hunter/kafka",  # mTLS PEM 目录（与 Kafka 接入包同源）
+            "data_type": "rosbag",
+            "content_type": "application/x-tar",  # 单 PUT 须与 presign 声明一致，否则 403
+            "deadline_s": 3600,             # presign 有效期（超期重签）
+        },
     },
     "kafka": {
         "properties_path": "/etc/hunter/kafka/kafka.properties",
@@ -226,6 +235,10 @@ class AgentConfig:
         return self.path("part_state_dir")
 
     @property
+    def staging_dir(self) -> str:
+        return self.path("staging_dir")
+
+    @property
     def logs_dir(self) -> str:
         return self.path("logs_dir")
 
@@ -281,8 +294,16 @@ def validate(cfg: AgentConfig) -> None:
     u = cfg.get("upload")
     if not (8 <= u["part_size_mb"] <= 32):
         raise ConfigError("upload.part_size_mb 需在 8~32 之间（设计 §6.7）")
-    if u["endpoint_type"] not in ("s3", "gateway"):
-        raise ConfigError("upload.endpoint_type ∈ {s3, gateway}")
+    if u["endpoint_type"] not in ("s3", "gateway", "presign"):
+        raise ConfigError("upload.endpoint_type ∈ {s3, gateway, presign}")
+    if u["endpoint_type"] == "presign":
+        ps = u.get("presign") or {}
+        if not str(ps.get("api_base", "")).strip():
+            raise ConfigError(
+                "upload.endpoint_type=presign 必须配置 upload.presign.api_base"
+                "（平台设备 REST 入口 https://<SERVER_IP>:8443）")
+        if not str(ps.get("data_type", "")).strip():
+            raise ConfigError("upload.presign.data_type 不能为空（rosbag 契约固定）")
     if u["max_attempts"] < 1:
         raise ConfigError("upload.max_attempts 至少为 1")
     if float(u["rate_limit_mbps"]) <= 0:
