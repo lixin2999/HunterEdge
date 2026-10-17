@@ -11,6 +11,8 @@
 #include <mutex>
 #include <string>
 
+#include <sys/types.h>  // pid_t
+
 #include <librdkafka/rdkafkacpp.h>
 #include <sqlite3.h>
 
@@ -176,6 +178,12 @@ private:
   // （实测已见 `ros2 bag record ... _communication_loss` 进程）→ 磁盘与平台双爆。
   std::map<std::string, rclcpp::Time> last_event_at_;
   double event_min_interval_{10.0};
+
+  // bag 录制时长截止（秒）：超时后自动 SIGINT 停止录制，防止无界写盘撑满磁盘
+  double bag_record_duration_s_{20.0};
+  std::string bag_output_dir_{"/data/rosbag"};  // bag 录制输出目录
+  // 当前录制子进程 PID（0 = 无活跃录制）
+  pid_t bag_record_pid_{0};
 
   // 事件检测状态
   double prev_velocity_;

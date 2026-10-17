@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cinttypes>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/statvfs.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace data_agent
@@ -239,6 +242,10 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   // 事件去重抑制期（秒）：同一 event_type 在此间隔内只上报一次（边沿触发）；
   // detectEvents 是 100ms 判定，无此门控会在低电/超速/急停持续期间每拍重复上报
   declare_parameter("event_min_interval", 10.0);
+  // bag 录制时长截止（秒）：事件触发后录制超过此值自动停止，防止无界写盘
+  declare_parameter("bag_record_duration_s", 20.0);
+  // bag 录制输出目录（实机可能为 /home/data/rosbag，取决于磁盘挂载）
+  declare_parameter("bag_output_dir", "/data/rosbag");
   declare_parameter("kafka_queue_limit", 50);         // 本地队列积压上限（条），超过转 SQLite 缓存
   declare_parameter("kafka_flush_timeout_ms", 5000);  // 退出时等待投递的超时（毫秒）
   declare_parameter("replay_batch_size", 50);         // 每轮回放条数（断点续传限流，防瞬时冲击链路）
@@ -262,6 +269,8 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   hard_turn_ = get_parameter("hard_turn").as_double();
   comm_loss_duration_ = get_parameter("comm_loss_duration").as_double();
   event_min_interval_ = get_parameter("event_min_interval").as_double();
+  bag_record_duration_s_ = get_parameter("bag_record_duration_s").as_double();
+  bag_output_dir_ = get_parameter("bag_output_dir").as_string();
   cache_max_hours_ = get_parameter("cache_max_hours").as_double();
   kafka_queue_limit_ = static_cast<int>(get_parameter("kafka_queue_limit").as_int());
   kafka_flush_timeout_ms_ = static_cast<int>(get_parameter("kafka_flush_timeout_ms").as_int());
@@ -369,6 +378,12 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
 
 DataAgent::~DataAgent()
 {
+  // 停止活跃的 rosbag 录制子进程（SIGTERM 给 timeout 进程，它会转发给 ros2 bag record）
+  if (bag_record_pid_ > 0) {
+    kill(bag_record_pid_, SIGTERM);
+    bag_record_pid_ = 0;
+  }
+
   // 退出前尽力投递残留消息（文档 14.6）；两个 producer 都要 flush
   for (RdKafka::Producer * p : {producer_, event_producer_}) {
     if (!p) {
@@ -921,13 +936,57 @@ void DataAgent::reportEvent(const std::string & event_type, const std::string & 
 
 void DataAgent::triggerBagRecord(const std::string & event_type)
 {
-  // 触发 rosbag 录制（文档 14.3.2：事件前后各 10 秒；14.4.2 录制话题）
+  // 若已有活跃录制进程，先停止旧的再开新的（同一时刻只保留一份 bag）
+  if (bag_record_pid_ > 0) {
+    // 检查旧进程是否已自然退出（timeout 截止）
+    int status = 0;
+    pid_t ret = waitpid(bag_record_pid_, &status, WNOHANG);
+    if (ret == 0) {
+      // 旧进程仍在运行，发送 SIGINT 让 rosbag2 收尾写 metadata.yaml
+      kill(bag_record_pid_, SIGINT);
+      RCLCPP_INFO(get_logger(), "停止上一次录制进程 PID=%d", bag_record_pid_);
+    }
+    bag_record_pid_ = 0;
+  }
+
+  // 磁盘水位硬保护：可用空间 < 2GB 时拒绝录制（避免撑满磁盘影响定位/导航）
+  struct statvfs vfs;
+  if (statvfs(bag_output_dir_.c_str(), &vfs) == 0) {
+    const uint64_t avail_mb = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize / (1024 * 1024);
+    if (avail_mb < 2048) {
+      RCLCPP_ERROR(get_logger(),
+        "磁盘可用空间不足（" PRIu64 "MB < 2048MB），跳过 rosbag 录制", avail_mb);
+      return;
+    }
+  }
+
+  // 使用 timeout 命令硬性截止录制时长（文档 14.3.2：事件前后各 10s → 默认 20s）
+  // 即使 timeout 进程本身异常退出，子进程也会被 kill（双保险）
+  const std::string output_dir = bag_output_dir_ + "/" +
+    std::to_string(static_cast<int>(this->now().seconds())) + "_" + event_type;
+  const int duration = static_cast<int>(bag_record_duration_s_);
+
   const std::string cmd =
-    "ros2 bag record -o /data/rosbag/" +
-    std::to_string(static_cast<int>(this->now().seconds())) + "_" + event_type +
-    " /lidar_points /camera/camera/color/image_raw /imu/data /chassis/state &";
-  std::system(cmd.c_str());
-  RCLCPP_INFO(get_logger(), "触发 rosbag 录制（事件：%s）", event_type.c_str());
+    "timeout --signal=INT " + std::to_string(duration) +
+    " ros2 bag record -o " + output_dir +
+    " /lidar_points /camera/camera/color/image_raw /imu/data /chassis/state";
+
+  // fork + exec 而非 std::system("cmd &")，以便获取精确 PID 用于停止和状态追踪
+  pid_t pid = fork();
+  if (pid == 0) {
+    // 子进程：exec shell 命令
+    execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
+    _exit(127);  // execl 失败
+  } else if (pid > 0) {
+    bag_record_pid_ = pid;
+    RCLCPP_INFO(get_logger(),
+      "触发 rosbag 录制（事件：%s，截止：%ds，PID：%d）", event_type.c_str(), duration, pid);
+  } else {
+    // fork 失败，降级为 std::system 方式（仍带 timeout 兜底）
+    const std::string fallback = cmd + " &";
+    std::system(fallback.c_str());
+    RCLCPP_WARN(get_logger(), "fork 失败，降级为 system(&) 方式启动录制");
+  }
 }
 
 bool DataAgent::kafkaInit()
