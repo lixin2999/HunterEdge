@@ -955,7 +955,7 @@ void DataAgent::triggerBagRecord(const std::string & event_type)
     const uint64_t avail_mb = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize / (1024 * 1024);
     if (avail_mb < 2048) {
       RCLCPP_ERROR(get_logger(),
-        "磁盘可用空间不足（" PRIu64 "MB < 2048MB），跳过 rosbag 录制", avail_mb);
+        "磁盘可用空间不足（%" PRIu64 "MB < 2048MB），跳过 rosbag 录制", avail_mb);
       return;
     }
   }
