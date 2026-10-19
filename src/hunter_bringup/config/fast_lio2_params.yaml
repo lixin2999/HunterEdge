@@ -13,7 +13,13 @@
 fast_lio2:
   ros__parameters:
     feature_extract_enable: false
-    point_filter_num: 1
+    # V0.1.30 防复发加固②：隔点降采样。旧值 1（不降采样）使每帧 ~27860 点
+    # 全量进入 IEKF + ikd-Tree 匹配，单帧计算量在车端 12 核上偏重；叠加
+    # CPU 超订（GUI 抢核）时 FAST-LIO2 起步即被饿到发散（实测 /Odometry
+    # 位姿冲到 1e12 m）。置 2：每 2 个点取 1 个（~27860→~14000 点/帧），
+    # 近似减半匹配开销、显著降低饥饿发散风险，对 16 线 Helios 的定位精度
+    # 影响可忽略。若后续仍需进一步降载可试 3；恢复全量则回 1。
+    point_filter_num: 2
     max_iteration: 3
     filter_size_surf: 0.5
     filter_size_map: 0.5

@@ -9,8 +9,13 @@
 //    绝不用 fitness 冻结位姿（否则车一动 fit 越过阈值即冻结→越走越偏→永不回弹的死亡螺旋）；
 //    fitness 只调节对外协方差（fit<=fitness_max 收敛；其间去抖；fit>ceiling 严重失准跳过去抖
 //    直接宣告未收敛），三种情形都照常刷新位姿。仅跳变(step_ok=false)才维持旧位姿不发新值。
+//  - 位姿量级 sanity（V0.1.30 防复发加固④）：跟踪条件除 step_ok 外再叠加 result 合理性
+//    （所有元素有限且平移范数 <= max_valid_translation）。FAST-LIO2 被 CPU 超订饿到发散时
+//    /Odometry/odom→base 可达 1e12m，若不拦截会把垃圾 T_map_odom 锁进首帧并放大下游误判。
+//    publishPose 里对 odom→base 同样做 sanity，发散巨值/非有限退化单位阵。
 //  - 大数据安全：全局 .pcd 体素降采样为 NDT target；滚动时间窗累积局部子图并降采样为 source。
 #include <chrono>
+#include <cmath>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -71,6 +76,10 @@ public:
     max_step_trans_     = declare_parameter<double>("max_step_translation", 0.5);  // m / 周期
     max_step_rot_       = declare_parameter<double>("max_step_rotation", 0.35);    // rad / 周期
     converged_cov_      = declare_parameter<double>("converged_covariance", 0.01); // 收敛时发布的小协方差
+    // V0.1.30 防复发加固④：位姿量级 sanity 门限（m）。拦截 FAST-LIO2 饥饿发散传导来的
+    // 非物理巨值（odom→base / NDT result 平移达 1e6~1e12m）。有限且平移范数 <= 此值才判
+    // 合理。默认 2000m 远大于真实作业场地，只滤除非物理垃圾值，不误伤正常大范围位姿。
+    max_valid_translation_ = declare_parameter<double>("max_valid_translation", 2000.0);
     // 连续失败去抖：允许连续 N 个周期 fit>fitness_max 仍对外保持“收敛”小协方差（位姿始终照常刷新），
     // 只有连续超限达 N 帧才真正发布大协方差告知门控未收敛，抑制单帧抖动导致的状态机反复启停。
     diverge_tolerance_cycles_ = declare_parameter<int>("diverge_tolerance_cycles", 5);
@@ -293,8 +302,12 @@ private:
     //    正是“fitness 阈值冻结位姿致运动发散锁死”的死亡螺旋。位姿更新只能由“跳变合理性”门控。
     //  - 置信度（对外协方差，供 auto_mission 门控）：fit<=fitness_max 收敛；fitness_max<fit<=ceiling
     //    运动畸变去抖；fit>ceiling 严重失准跳过去抖直接宣告未收敛。三者都照常刷新位姿以便回弹。
-    //  - 仅当发生跳变（step_ok=false，疑似瞬移/跟错）才拒绝刷新、维持旧位姿。
-    const bool tracking = step_ok;
+    //  - 仅当发生跳变（step_ok=false，疑似瞬移/跟错）或 result 量级不合理（发散巨值/非有限）
+    //    才拒绝刷新、维持旧位姿。
+    //  V0.1.30 加固④：叠加 result sanity——FAST-LIO2 发散时 odom→base 传进 NDT 会得到
+    //    非物理 result；首帧若无此门控会被无条件锁进垃圾 T_map_odom（本次假锁死的上游根因）。
+    const bool result_sane = matSane(result);
+    const bool tracking = step_ok && result_sane;
     if (tracking) {
       // 无条件接受位姿更新以持续跟踪（含 fit 偏高的运动畸变/轻度失准帧，令 NDT 能自动回弹重收敛）
       // 写共享状态时短暂持锁，且务必在调用 publishPose（内部会再加 t_mtx_）之前释放，避免自死锁。
@@ -333,15 +346,16 @@ private:
         }
       }
     } else {
-      // 跳变（单周平移/旋转超闸门，疑似瞬移/跟错）：拒绝刷新位姿，维持旧 TF，直接宣告不可信
+      // 拒绝刷新（step_ok=false 跳变 或 result_sane=false 量级不合理/非有限）：维持旧 TF，宣告不可信
       Eigen::Matrix4f keep;
       { std::lock_guard<std::mutex> lk(t_mtx_); keep = T_map_odom_; }
       sendTf(keep, stamp2);
       ++miss_streak_;
       publishPose(fitness, 100.0, stamp2);
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-        "[relocalization] ✗ 跳变拒绝刷新(step_ok=0，单周位移/转角超闸门 fit=%.3f)，维持旧位姿",
-        fitness);
+        "[relocalization] ✗ 拒绝刷新(step_ok=%d, sane=%d 平移=%.1fm/闸门%.0fm, fit=%.3f)，维持旧位姿",
+        step_ok ? 1 : 0, result_sane ? 1 : 0,
+        static_cast<double>(result.block<3, 1>(0, 3).norm()), max_valid_translation_, fitness);
     }
   }
 
@@ -378,7 +392,16 @@ private:
       auto ts = tf_buffer_->lookupTransform(odom_frame_, "base_link",
                                             tf2::TimePointZero, tf2::durationFromSec(0.05));
       tf2::Transform tb; tf2::fromMsg(ts.transform, tb);
-      T_odom_base = toMat4(tb);
+      const Eigen::Matrix4f m = toMat4(tb);
+      // V0.1.30 加固④：odom→base 若为发散巨值/非有限（FAST-LIO2 饥饿发散），退化
+      // 单位阵（仅用 T_map_odom 平移），避免把发散的 odom→base 乘进 map→base 放大成垃圾。
+      if (matSane(m)) {
+        T_odom_base = m;
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+          "[relocalization] odom→base 平移 %.1fm 超 sanity 门限/非有限（疑似里程计发散），退化单位阵",
+          static_cast<double>(m.block<3, 1>(0, 3).norm()));
+      }
     } catch (const tf2::TransformException &) { /* 保持单位，退化可用 */ }
 
     Eigen::Matrix4f T_map_base = T * T_odom_base;
@@ -398,6 +421,18 @@ private:
     (void)fitness;
   }
 
+  // V0.1.30 防复发加固④：4x4 齐次变换合理性校验——所有元素有限且平移范数
+  // <= max_valid_translation_。用于拦截 FAST-LIO2 饥饿发散传导来的非物理巨值
+  // （1e6~1e12m），避免垃圾位姿被当作收敛结果锁存/发布。
+  bool matSane(const Eigen::Matrix4f & M) const
+  {
+    for (int i = 0; i < 4; ++i)
+      for (int j = 0; j < 4; ++j)
+        if (!std::isfinite(M(i, j))) return false;
+    const double t = M.block<3, 1>(0, 3).norm();
+    return std::isfinite(t) && t <= max_valid_translation_;
+  }
+
   static Eigen::Matrix4f toMat4(const tf2::Transform & t)
   {
     tf2::Matrix3x3 R = t.getBasis();
@@ -415,6 +450,7 @@ private:
   double publish_rate_, accumulate_window_, target_voxel_, source_voxel_;
   double ndt_resolution_, ndt_step_size_, ndt_epsilon_, fitness_max_;
   double max_step_trans_, max_step_rot_, converged_cov_;
+  double max_valid_translation_;   // V0.1.30 位姿量级 sanity 门限（m）
   int ndt_max_iters_;
   int diverge_tolerance_cycles_;   // 连续失败去抖阈值（周期数）
   double fitness_hard_ceiling_;     // 硬失效 ceiling（超过立即判失效，不走_debounce）

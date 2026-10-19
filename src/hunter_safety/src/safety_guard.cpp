@@ -155,6 +155,9 @@ public:
     declare_parameter<bool>("enable_map_fence", true);     // 边界监护开关
     declare_parameter<double>("map_edge_stop_dist", 0.5);  // 距未建图/界外栅格停车距离（m）
     declare_parameter<double>("map_edge_slow_dist", 1.5);  // 距未建图/界外栅格减速距离（m）
+    // V0.1.30 防复发加固④：/relocalization/pose 协方差 >= 此值判“定位无效”（发散/未收敛），
+    // 边界监护不据此判越界（防把垃圾位姿锁成 MAP_EDGE_STOP）。收敛~0.01、未收敛>=100。
+    declare_parameter<double>("loc_cov_invalid", 1.0);
     // V0.1.18 遥控执行桥：/remote/command 新鲜(control_mode=REMOTE)时把遥控指令经
     //   阿克曼换算作为本闸输入，与 Nav2 共用碰撞/曲率/边界安全闸（遥控不再绕过安全层）
     declare_parameter<bool>("enable_remote_bridge", true);
@@ -208,6 +211,7 @@ public:
     enable_map_fence_ = get_parameter("enable_map_fence").as_bool();
     map_edge_stop_dist_ = get_parameter("map_edge_stop_dist").as_double();
     map_edge_slow_dist_ = get_parameter("map_edge_slow_dist").as_double();
+    loc_cov_invalid_ = get_parameter("loc_cov_invalid").as_double();
     enable_remote_bridge_ = get_parameter("enable_remote_bridge").as_bool();
     remote_topic_ = get_parameter("remote_topic").as_string();
     remote_timeout_ = get_parameter("remote_timeout").as_double();
@@ -339,6 +343,7 @@ public:
         std::lock_guard<std::mutex> lk(data_mutex_);
         fence_pose_x_ = msg->pose.pose.position.x;
         fence_pose_y_ = msg->pose.pose.position.y;
+        fence_pose_cov_ = msg->pose.covariance[0];   // V0.1.30 加固④：采集协方差供定位有效性判定
         fence_pose_received_ = true;
       });
 
@@ -923,7 +928,8 @@ private:
     // 中止锁存（越界即异常，人工确认后重开）。距离场/位姿未就绪（建图模式、
     // 启动早期、重定位未输出）时不介入，由规划层与航点校验兜底。
     if (enable_map_fence_) {
-      const double edge_d = mapEdgeDistance();
+      bool loc_invalid = false;
+      const double edge_d = mapEdgeDistance(loc_invalid);
       if (edge_d >= 0.0) {
         if (edge_d < map_edge_stop_dist_) {
           publishCmd(0.0, 0.0);
@@ -951,6 +957,15 @@ private:
               "m，限速 " + std::to_string(v_allow).substr(0, 5) + "m/s" + test_tag;
           }
         }
+      } else if (loc_invalid) {
+        // V0.1.30 防复发加固④：定位发散/未收敛（重定位 result 量级不合理或大协方差）时，
+        // 不拿垃圾位姿判越界——否则会把发散位姿落到栅格界外误锁 MAP_EDGE_STOP（本次遥控
+        // 车不动的假锁死机制）。此处监护不介入，行驶安全交由碰撞闸（/scan 扫掠弧）独立兜底，
+        // 定位恢复后边界监护自动回弹。
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+          "地图边界监护暂不介入：/relocalization/pose 判定位无效"
+          "（协方差>=%.2f 或非有限，疑似里程计/重定位发散），越界防护降级，由碰撞闸兜底",
+          loc_cov_invalid_);
       }
     }
 
@@ -1167,10 +1182,21 @@ private:
   // 查询机器人当前位置到最近未建图(unknown)/地图界外栅格的距离（m）。
   // 返回 -1.0 = 监护不可用（地图未就绪或 /relocalization/pose 未到达，调用方不介入）；
   // 位姿在栅格界外 → 0（直接视为越界）。
-  double mapEdgeDistance()
+  // V0.1.30 加固④：新增出参 loc_invalid——位姿非有限或协方差 >= loc_cov_invalid_ 时判
+  // “定位无效”（重定位发散/未收敛），此时返回 -1 且 loc_invalid=true，调用方据此不介入
+  // （不把垃圾位姿误判成界外→避免 MAP_EDGE_STOP 假锁死）。锁内赋值，出参安全。
+  double mapEdgeDistance(bool & loc_invalid)
   {
+    loc_invalid = false;
     std::lock_guard<std::mutex> lk(data_mutex_);
     if (!fence_ready_ || !fence_pose_received_) {
+      return -1.0;
+    }
+    // 定位有效性前置校验：非有限位姿或大协方差（收敛 ~0.01，未收敛/数据不足 >=100）
+    // 判定位无效，拒绝据此判越界。
+    if (!std::isfinite(fence_pose_x_) || !std::isfinite(fence_pose_y_) ||
+        fence_pose_cov_ >= loc_cov_invalid_) {
+      loc_invalid = true;
       return -1.0;
     }
     const int cx = static_cast<int>(std::floor(
@@ -1227,6 +1253,9 @@ private:
   bool enable_map_fence_{true};
   double map_edge_stop_dist_{0.5};
   double map_edge_slow_dist_{1.5};
+  // V0.1.30 防复发加固④：/relocalization/pose 协方差 >= 此值判定位无效（发散/未收敛），
+  // 边界监护不据此判越界（防 MAP_EDGE_STOP 假锁死）。收敛 ~0.01、未收敛/数据不足 >=100，取 1.0 清晰分离。
+  double loc_cov_invalid_{1.0};
   // V0.1.18 遥控执行桥参数
   bool enable_remote_bridge_{true};
   std::string remote_topic_{"/remote/command"};
@@ -1242,6 +1271,7 @@ private:
   double fence_res_{0.05};
   double fence_pose_x_{0.0};
   double fence_pose_y_{0.0};
+  double fence_pose_cov_{0.0};   // /relocalization/pose 协方差 cov[0]（V0.1.30 定位有效性判据）
   std::vector<float> fence_dist_;
 
   // 状态

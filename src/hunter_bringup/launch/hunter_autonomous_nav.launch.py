@@ -276,6 +276,10 @@ def _nav2_params_with_bt(context, *args, **kwargs):
             'enable_map_fence': True,   # 行驶范围不得超出已采集地图区域（行驶中最后防线）
             'map_edge_stop_dist': 0.4,  # V0.0.89 窄场地略收紧（原 0.5）；距未建图/界外 <此值零速
             'map_edge_slow_dist': 1.0,  # V0.0.89 距未建图/界外 <1.0m 线性限速（原 1.5）
+            # V0.1.30 防复发加固④：/relocalization/pose 协方差 >= 此值判定位无效（发散/未收敛），
+            #   边界监护不据此判越界（防把 FAST-LIO2 饥饿发散传来的垃圾位姿锁成 MAP_EDGE_STOP 假锁死）。
+            #   重定位收敛时 cov~0.01、未收敛/数据不足时 cov>=100，取 1.0 清晰分离；定位恢复后自动回弹。
+            'loc_cov_invalid': 1.0,
             # V0.1.18 遥控执行桥：/remote/command 新鲜且 control_mode=REMOTE 时经阿克曼
             #   换算作为本闸输入。V0.1.28：remote_timeout 0.5→2.0，与 remote_agent
             #   cmd_timeout(3.0s) 对齐——Kafka acks=all 实际到车 ~2s/帧，原 0.5s 会因

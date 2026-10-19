@@ -40,6 +40,16 @@ KillMode=control-group
 # 属保险起见的兑底；兼容 FastDDS 回退时同样有效。
 ExecStopPost=/bin/bash -c 'rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* /dev/shm/CycloneDDS.* /dev/shm/sem.CycloneDDS.* 2>/dev/null || true'
 LimitNOFILE=65536
+# V0.1.30 防复发加固③：提升自动驾驶整栈的 CPU 调度优先级，防 CPU 超订饿死 FAST-LIO2。
+# 根因：调试期手工起的 rviz2（另一个 user/xrdp cgroup）抢走 ~3 核，本服务整栈被挤到
+# CPU 不足 → FAST-LIO2 起步饥饿 → /Odometry 发散→ TF 断裂→重定位发散→MAP_EDGE_STOP 假锁死。
+#   • Nice=-10：服务及其 fork 出的所有 ROS 子进程（继承 nice）相对普通用户进程优先获得 CPU；
+#     对同 cgroup 内争抢有效（需特权，User=root 满足）。
+#   • CPUWeight=200：本服务 cgroup 相对其它 cgroup（如 GUI/xrdp 会话）拿到 ~2x CPU 带宽份额，
+#     解决跨 cgroup 争抢（Nice 无法跨 cgroup 生效时的补充）。默认 100，取 200 提权。
+# 与 launch 侧 OMP_NUM_THREADS=4 配合：既不让 fast_lio2 贪心开满核互相踩踏，又保证它优先拿到核。
+Nice=-10
+CPUWeight=200
 StandardOutput=journal
 StandardError=journal
 

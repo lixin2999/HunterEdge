@@ -33,6 +33,11 @@ hunter_relocalization:
     max_step_translation: 0.5   # m/周期：单周期平移跳变上限（防瞬移）——这才是唯一能拒绝位姿刷新的闸门
     max_step_rotation:    0.35  # rad/周期：单周期旋转跳变上限
     converged_covariance: 0.01  # 收敛时 /relocalization/pose 协方差（auto_mission 门控 <0.10 判收敛）
+    # V0.1.30 防复发加固④：位姿量级 sanity 门限（m）。跟踪条件除跳变闸门 step_ok 外，
+    # 再叠加 result 合理性（所有元素有限且平移范数 <= 此值）。FAST-LIO2 被 CPU 超订饿到
+    # 发散时 odom→base / NDT result 平移可达 1e6~1e12m（非物理），若不拦截会把垃圾
+    # T_map_odom 锁进首帧、放大下游误判。默认 2000m 远大于真实作业场地，只滤非物理巨值。
+    max_valid_translation: 2000.0
     # 连续失败去抖：连续 N 个周期 fit>fitness_max 才对外宣告“未收敛”（大协方差），其间仍保持收敛态；
     # 无论是否宣告未收敛，位姿都照常刷新（仅跳变 step_ok=false 才维持旧位姿）。2Hz 下 5 帧≈2.5s。
     diverge_tolerance_cycles: 5

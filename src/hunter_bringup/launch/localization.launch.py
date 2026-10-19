@@ -29,6 +29,13 @@ def generate_launch_description():
         name='fast_lio2',
         output='screen',
         parameters=[fast_lio2_params],
+        # V0.1.30 防复发加固③：限定 OpenMP 线程数。fast_lio2 的点云匹配用
+        # OpenMP 并行，默认会贪心开到 nproc（车端 12 核 → 12 线程），与 EKF/
+        # 感知/Nav2/GUI 等争抢同一批核时反而互相踩踏（实测 NLWP=11、load 20+）；
+        # CPU 超订下 FAST-LIO2 起步即被饿到里程计发散。显式夹到 4 线程，
+        # 把并行度约束在合理区间（单帧 10Hz 充用），剩余核给上下游节点，
+        # 降低饥饿发散概率。配合 hunter-edge.service 的 Nice 提优先级生效。
+        additional_env={'OMP_NUM_THREADS': '4'},
         # V0.0.90 退出宽限：建图模式下 FAST-LIO2 在收到 SIGINT 后才把累积
         # 点云写盘（main 中 spin 返回之后），launch 默认仅等 5s 就 SIGTERM
         # ——大地图必然被腰斩成截断 PCD，下游 pcd_to_map 拿不到完整文件。
