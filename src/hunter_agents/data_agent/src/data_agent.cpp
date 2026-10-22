@@ -38,6 +38,29 @@ namespace data_agent
 namespace
 {
 
+// 单调时钟纳秒（跨线程安全：dr_cb 记录投递证实时刻，定时器线程计算断链时长；
+// 不用系统时间，避免 NTP 校时/时钟回拨导致误判）
+std::int64_t steadyNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// 墙钟秒（缓存行 timestamp / 过期清理阈值）。这里刻意不用 this->now()：
+// dr_cb 在节点析构 flush 阶段仍可能触发缓存写入，此时 ROS 时钟不可依赖。
+double wallNowSeconds()
+{
+  return std::chrono::duration<double>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// 链路类事件（车端无法复现/修复的故障）：根因在运营商或平台侧网络，车端 bag 对定位
+// 它没有任何帮助，而断链瞬间恰恰是车端最该保持轻载的时候 → 不触发 rosbag 录制。
+bool isLinkOnlyEvent(const std::string & event_type)
+{
+  return event_type == "communication_loss";
+}
+
 // JSON 字符串转义（事件类型/节点名等含特殊字符时不破坏报文）
 std::string jsonEscape(const std::string & raw)
 {
@@ -369,6 +392,9 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   // 否则 rclcpp::Time 默认时钟源(RCL_SYSTEM_TIME)与 this->now()(RCL_ROS_TIME)不同，
   // detectEvents 里 now - prev_time_ 会抛 "can't subtract times with different time sources"。
   prev_time_ = this->now();
+  // 链路判活基准：从本节点启动开始计时（启动后 comm_loss_duration_ 秒内没有任何
+  // 投递被证实即视为“未上线/断链”，与断网启动场景一致）
+  last_delivery_ok_ns_.store(steadyNowNs(), std::memory_order_relaxed);
   // 感知 FPS 统计窗口起点（契约 perception.fps）
   perception_window_start_ = this->now();
 
@@ -393,8 +419,8 @@ DataAgent::~DataAgent()
     const int remaining = p->outq_len();
     if (remaining > 0) {
       RCLCPP_WARN(
-        get_logger(), "Kafka 退出时仍有 %d 条消息未送达（flush: %s），"
-        "该部分消息已在 SQLite 缓存中保留或丢失",
+        get_logger(), "Kafka 退出时仍有 %d 条消息未送达（flush: %s）；"
+        "已收到投递失败回调的已转入 SQLite 缓存，其余随进程退出丢弃",
         remaining, RdKafka::err2str(err).c_str());
     }
     delete p;
@@ -494,6 +520,10 @@ void DataAgent::packAndPublish()
   if (vehicle_id_.empty()) {
     return;   // Topic 主键未确定（启动时已打 FATAL 日志）
   }
+  // 链路判活放在高频定时器里（10Hz）：dr_cb 只更新“上次证实时刻”，
+  // 事件的上报/恢复在这里按阈值判定，避免在投递回调线程里做上报引发重入
+  checkLinkHealth();
+
   const std::string json = buildTelemetryJson();
 
   if (kafkaReady()) {
@@ -517,9 +547,14 @@ void DataAgent::publishHealth()
   }
   // 运营端链路时延采样（契约 system.network_latency_ms）：1Hz，与 health 同频。
   // 采样失败（不可达）保留上次有效值，避免看板出现 0 的假健康。
-  const double latency = tcpConnectLatencyMs(broker_host_, broker_port_);
-  if (latency >= 0.0) {
-    network_latency_ms_ = latency;
+  // 只在链路已被投递证实（kafka_connected_）时采样：断链期间每秒再向同一端口发起
+  // 一次 TCP 连接既是无效 SYN（现场每次都是 Connection refused），也会在 broker/
+  // 防火墙侧制造噪声；恢复后自然继续采样。
+  if (kafka_connected_.load(std::memory_order_relaxed)) {
+    const double latency = tcpConnectLatencyMs(broker_host_, broker_port_);
+    if (latency >= 0.0) {
+      network_latency_ms_ = latency;
+    }
   }
   // health Topic 是平台侧判活（last_online_time）的主要依据，接入包契约 1Hz
   const std::string json = buildHealthJson();
@@ -546,14 +581,71 @@ bool DataAgent::kafkaReady()
   // 却掩盖了该问题。
   // 修复：只要 producer 就绪且本地队列未积压即尝试 produce，连通性完全交由 dr_cb 异步
   // 证实/回退（成功置 kafka_connected_=true，失败置 false）。broker 真不可达时，消息在
-  // message.timeout.ms 后经 dr_cb 失败，本地队列积压超 kafka_queue_limit_ 自动回落 SQLite
-  // 缓存 + 触发 communication_loss——断网缓存与续传语义完整保留。
+  // message.timeout.ms 后经 dr_cb 失败并落 SQLite 缓存（dr_cb 内缓存，见下）；
+  // 断链事件由 checkLinkHealth() 按“连续 N 秒无成功投递”判定，与队列深度解耦。
   if (!producer_) {
     return false;
   }
   // 本地队列积压超过上限 → 视为链路不可用（消息滞留队列最终会被
   // message.timeout 丢弃，及时转 SQLite 缓存兜底）
   return producer_->outq_len() < kafka_queue_limit_;
+}
+
+// 车-云链路判活（契约 event_type=communication_loss）。
+// 旧实现的判据是 kafkaReady()==false（本地队列积压 >= kafka_queue_limit_=50），
+// 但 broker 不可达时消息会按 message.timeout.ms(60s) 逐条超时淘汰，队列根本堆不到
+// 50 条 → kafkaReconnect() 里的判定分支永不执行 → 断链期间车端零告警
+// （2026-10-22 现场：链路中断 1 小时，日志里一条 communication_loss 都没有）。
+// 新判据：距上一次“投递被 broker 证实”的时长 >= comm_loss_duration_（默认 10s）。
+void DataAgent::checkLinkHealth()
+{
+  const std::int64_t now_ns = steadyNowNs();
+  const double down_seconds =
+    static_cast<double>(now_ns - last_delivery_ok_ns_.load(std::memory_order_relaxed)) / 1e9;
+
+  if (down_seconds >= comm_loss_duration_) {
+    if (!link_down_) {
+      link_down_ = true;
+      link_down_at_ns_ = now_ns;
+      // 口径说明：cached_count_ 是“本进程累计写入”只增不减，不能代表剩余待回放数；
+      // 断链/恢复各查一次真实行数（一次 COUNT(*)，不在 10Hz 热路径上）
+      const std::uint64_t pending = sqliteRowCount();
+      const std::uint64_t cached_total =
+        static_cast<std::uint64_t>(cached_count_.load(std::memory_order_relaxed));
+      RCLCPP_WARN(get_logger(),
+        "Kafka 链路中断：已连续 %.1fs 无成功投递（累计失败 %" PRIu64 " 条，"
+        "本地缓存 %" PRIu64 " 条待回放，本进程累计写入 %" PRIu64 " 条）；恢复后按 id 顺序回放",
+        down_seconds,
+        static_cast<std::uint64_t>(dr_fail_count_.load(std::memory_order_relaxed)),
+        pending, cached_total);
+    }
+    if (!comm_loss_reported_) {
+      comm_loss_reported_ = true;   // 一次中断只报一条事件，恢复后重新武装
+      char data[320];
+      std::snprintf(data, sizeof(data),
+        "{\"duration_s\":%.1f,\"threshold_s\":%.1f,\"broker\":\"%s\","
+        "\"failed\":%" PRIu64 ",\"cached\":%" PRIu64 ",\"cached_total\":%" PRIu64 "}",
+        down_seconds, comm_loss_duration_, jsonEscape(broker_host_).c_str(),
+        static_cast<std::uint64_t>(dr_fail_count_.load(std::memory_order_relaxed)),
+        sqliteRowCount(),
+        static_cast<std::uint64_t>(cached_count_.load(std::memory_order_relaxed)));
+      reportEvent("communication_loss", "critical",
+        "车-云通信中断：Kafka 链路持续不可用", data);
+    }
+  } else if (link_down_) {
+    // dr_cb 成功已把 last_delivery_ok_ns_ 拉回当前时刻，走到这里说明链路恢复
+    link_down_ = false;
+    comm_loss_reported_ = false;
+    const double outage_s = link_down_at_ns_ > 0 ?
+      static_cast<double>(now_ns - link_down_at_ns_) / 1e9 : down_seconds;
+    RCLCPP_INFO(get_logger(),
+      "Kafka 链路恢复：中断约 %.1fs（累计送达 %" PRIu64 " 条，缓存 %" PRIu64
+      " 条待回放，本进程累计写入 %" PRIu64 " 条）",
+      outage_s,
+      static_cast<std::uint64_t>(dr_ok_count_.load(std::memory_order_relaxed)),
+      sqliteRowCount(),
+      static_cast<std::uint64_t>(cached_count_.load(std::memory_order_relaxed)));
+  }
 }
 
 // 投递报告回调（librdkafka 内部线程调用）：
@@ -567,28 +659,52 @@ void DataAgent::dr_cb(RdKafka::Message & msg)
     row_id = *static_cast<std::int64_t *>(opaque);
     delete static_cast<std::int64_t *>(opaque);
     replay_inflight_.fetch_sub(1, std::memory_order_relaxed);
+    // 无论送达还是失败都要放行该 id：成功→行会被删掉；失败→行留在库里，
+    // 下轮允许重新取到（这正是“至少一次”的来源）
+    std::lock_guard<std::mutex> guard(db_mutex_);
+    replay_inflight_ids_.erase(row_id);
   }
 
   if (msg.err() == RdKafka::ERR_NO_ERROR) {
     dr_ok_count_.fetch_add(1, std::memory_order_relaxed);
-    if (!kafka_connected_.load()) {
-      RCLCPP_INFO(get_logger(), "Kafka 投递恢复（累计送达 %lu 条）",
-        static_cast<unsigned long>(dr_ok_count_.load()));
+    // 链路判活的唯一正向信号（checkLinkHealth 读取）
+    last_delivery_ok_ns_.store(steadyNowNs(), std::memory_order_relaxed);
+    if (!ever_delivered_.exchange(true, std::memory_order_relaxed)) {
+      RCLCPP_INFO(get_logger(), "Kafka 首次投递成功（链路已证实可用，累计送达 1 条）");
     }
-    kafka_connected_.store(true);
-    // 链路已证实可用 → 重新武装 communication_loss 事件（下次中断可再触发）
-    link_down_ = false;
-    comm_loss_reported_ = false;
+    kafka_connected_.store(true, std::memory_order_relaxed);
     if (row_id >= 0) {
       sqliteDeleteRow(row_id);
     }
-  } else {
-    dr_fail_count_.fetch_add(1, std::memory_order_relaxed);
-    kafka_connected_.store(false);
+    return;
+  }
+
+  dr_fail_count_.fetch_add(1, std::memory_order_relaxed);
+  kafka_connected_.store(false, std::memory_order_relaxed);
+
+  // 回放消息：行仍在库里，保留待下轮重试（至少一次，平台侧幂等收敛）
+  if (row_id >= 0) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 10000,
-      "Kafka 投递失败：%s（转本地缓存）", msg.errstr().c_str());
-    // 回放失败的行保留在 SQLite 中，下轮重试（至少一次语义，靠平台侧幂等收敛）
+      "Kafka 回放失败：%s（该行保留在本地缓存，下轮重试）", msg.errstr().c_str());
+    return;
+  }
+
+  // 实时消息：必须真正落库。旧实现只打“转本地缓存”日志、消息随回调返回即丢失，
+  // 断链期间的数据事后无法补传（2026-10-22 现场：一小时数据全部蒸发）。
+  const std::string topic = msg.topic_name();
+  const void * payload = msg.payload();
+  if (!topic.empty() && payload && msg.len() > 0) {
+    sqliteCache(topic, std::string(static_cast<const char *>(payload), msg.len()));
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 10000,
+      "Kafka 投递失败：%s（已转本地缓存，累计 %" PRIu64 " 条，链路恢复后回放）",
+      msg.errstr().c_str(),
+      static_cast<std::uint64_t>(cached_count_.load(std::memory_order_relaxed)));
+  } else {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 10000,
+      "Kafka 投递失败：%s（报文为空，无法转存本地缓存）", msg.errstr().c_str());
   }
 }
 
@@ -885,7 +1001,8 @@ void DataAgent::reportEvent(const std::string & event_type, const std::string & 
   // ── 事件去重（边沿触发 + 抑制期）────────────────────────────────────────
   // detectEvents 是 100ms 无状态判定：低电/超速/急转弯/急停在持续期间会**每拍命中**，
   // 旧版于是每秒上报约 10 条重复事件，且 triggerBagRecord 每条都拉起一个
-  // `ros2 bag record`（实机已见 `..._communication_loss` 录制进程）→ 磁盘与平台双爆、
+  // `ros2 bag record`（实机已见 `..._communication_loss` 录制进程；该事件自 V0.1.32
+  // 起不再录包，见 reportEvent 末尾）→ 磁盘与平台双爆、
   // 平台侧还会把它们当重复事件反复入库。这里做统一门控：同一 event_type 在
   // event_min_interval_（默认 10s）内只放行一次，其余静默丢弃（连日志也不刷）。
   const rclcpp::Time now = this->now();
@@ -931,7 +1048,12 @@ void DataAgent::reportEvent(const std::string & event_type, const std::string & 
     sqliteCache(event_topic_, json);  // 断线时事件也缓存
   }
 
-  triggerBagRecord(event_type);
+  // 断链类事件不录包（2026-10-22 实测：一次 48.5s 断链白录 20s，
+  // 含 /camera/camera/color/image_raw、/imu/data、/lidar_points、/chassis/state 四路）；
+  // 其余车端事件（超速/急停/低电/急转…）仍按文档 14.3.2 前后各 10s 录包。
+  if (!isLinkOnlyEvent(event_type)) {
+    triggerBagRecord(event_type);
+  }
 }
 
 void DataAgent::triggerBagRecord(const std::string & event_type)
@@ -1156,25 +1278,9 @@ bool DataAgent::kafkaProduce(
 
 void DataAgent::kafkaReconnect()
 {
-  // 车-云链路中断事件（契约 event_type=communication_loss）：
-  // 链路不可用持续 >= comm_loss_duration_（默认 10s，文档 14.3）时上报一次；
-  // 恢复（dr_cb 成功）后重新武装，可再次触发。
-  const rclcpp::Time now = this->now();
-  if (!link_down_) {
-    link_down_ = true;
-    link_down_since_ = now;
-  }
-  const double down_seconds = (now - link_down_since_).seconds();
-  if (!comm_loss_reported_ && down_seconds >= comm_loss_duration_) {
-    comm_loss_reported_ = true;
-    char data[192];
-    std::snprintf(data, sizeof(data),
-      "{\"duration_s\":%.1f,\"threshold_s\":%.1f,\"broker\":\"%s\"}",
-      down_seconds, comm_loss_duration_, jsonEscape(broker_host_).c_str());
-    reportEvent("communication_loss", "critical",
-      "车-云通信中断：Kafka 链路持续不可用", data);
-  }
-
+  // 这里只做“生产者实例维护 + 驱动投递回调”。
+  // 断链判定/事件上报已移到 checkLinkHealth()（按“连续 N 秒无成功投递”），
+  // 不再依赖本地队列深度 —— 队列在 60s 超时淘汰下永远堆不到 kafka_queue_limit_。
   if (producer_ && event_producer_) {
     // librdkafka 内部自动重连（文档 14.6：指数退避 1s/2s/4s/8s，最大 30s），
     // 连通性由投递报告回调证实，此处不再直接置位 kafka_connected_
@@ -1182,7 +1288,7 @@ void DataAgent::kafkaReconnect()
     event_producer_->poll(0);
     return;
   }
-  // 指数退避重连（文档 14.6）
+  // 指数退避重建（仅在 producer 创建失败时才会走到）
   reconnect_backoff_ = std::min(reconnect_backoff_ * 2.0, 30.0);
   RCLCPP_INFO(get_logger(), "Kafka 重连尝试（当前退避 %.1fs）", reconnect_backoff_);
   if (kafkaInit()) {
@@ -1250,6 +1356,30 @@ bool DataAgent::sqliteInit()
     }
     RCLCPP_INFO(get_logger(), "SQLite 缓存表已升级为带 topic 列（支持多 Topic 断点续传）");
   }
+
+  // ── 高频写入优化（2026-10-22 现场：84MB 缓存库时 data_agent 常驻 D 状态、平均 CPU 28.7%）──
+  // 1) WAL：断网时每条约 10Hz 的写入不再逐条 fsync 到主库，先追加 WAL（读回放也不被写阻塞）
+  // 2) synchronous=NORMAL：WAL 下只在检查点刷盘，单条 INSERT 不再等 SD/eMMC 落盘
+  // 3) timestamp 索引：清理语句 DELETE ... WHERE timestamp < ? 不再全表扫描
+  //    （旧实现每次插入前都做一次无索引全表 DELETE，行数增长后是 O(n²)）
+  char * pragma_err = nullptr;
+  if (sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, &pragma_err) != SQLITE_OK) {
+    // 媒体不可写 WAL（如某些只读/网络挂载）不致命：退回默认 journal，仅降速
+    RCLCPP_WARN(get_logger(), "SQLite WAL 开启失败，退回默认 journal: %s",
+      pragma_err ? pragma_err : "unknown");
+    sqlite3_free(pragma_err);
+    pragma_err = nullptr;
+  }
+  sqlite3_exec(db_, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
+  if (sqlite3_exec(db_,
+    "CREATE INDEX IF NOT EXISTS idx_telemetry_cache_ts ON telemetry_cache(timestamp);",
+    nullptr, nullptr, &pragma_err) != SQLITE_OK)
+  {
+    RCLCPP_WARN(get_logger(), "SQLite 缓存表时间索引创建失败: %s",
+      pragma_err ? pragma_err : "unknown");
+    sqlite3_free(pragma_err);
+    pragma_err = nullptr;
+  }
   return true;
 }
 
@@ -1259,11 +1389,26 @@ void DataAgent::sqliteCache(const std::string & topic, const std::string & paylo
   if (!db_) {
     return;
   }
-  // 清理超过 cache_max_hours_ 的旧数据（文档 14.6：最多缓存 24 小时）
-  const std::string cleanup =
-    "DELETE FROM telemetry_cache WHERE timestamp < " +
-    std::to_string(this->now().seconds() - cache_max_hours_ * 3600.0);
-  sqlite3_exec(db_, cleanup.c_str(), nullptr, nullptr, nullptr);
+  // 清理超过 cache_max_hours_ 的旧数据（文档 14.6：最多缓存 24 小时）。
+  // 降频到 60s 一次：旧实现每次插入前都全表 DELETE，断网 10Hz 写入 + 行数增长
+  // 直接退化为 O(n²)（现场 84MB 库、进程长期 D 状态）。
+  const std::int64_t now_ns = steadyNowNs();
+  const double now_s = wallNowSeconds();
+  if (now_ns - last_cache_cleanup_ns_ >= 60LL * 1000 * 1000 * 1000) {
+    last_cache_cleanup_ns_ = now_ns;
+    const std::string cleanup =
+      "DELETE FROM telemetry_cache WHERE timestamp < " +
+      std::to_string(now_s - cache_max_hours_ * 3600.0);
+    if (sqlite3_exec(db_, cleanup.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK) {
+      // 时钟异常（RTC/NTP 未同步）时会把旧行整批判为过期，这里必须留痕，
+      // 否则“84MB 缓存突然没了”在现场无从解释
+      const int removed = sqlite3_changes(db_);
+      if (removed > 0) {
+        RCLCPP_INFO(get_logger(),
+          "SQLite 缓存清理：删除 %d 条超过 %.0f 小时的旧报文", removed, cache_max_hours_);
+      }
+    }
+  }
 
   // 插入缓存（预处理语句，避免注入）
   sqlite3_stmt * stmt = nullptr;
@@ -1271,10 +1416,22 @@ void DataAgent::sqliteCache(const std::string & topic, const std::string & paylo
     "INSERT INTO telemetry_cache (topic, timestamp, payload) VALUES (?, ?, ?);";
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
     sqlite3_bind_text(stmt, 1, topic.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_double(stmt, 2, this->now().seconds());
+    sqlite3_bind_double(stmt, 2, now_s);
     sqlite3_bind_text(stmt, 3, payload.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
+    const int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+      // 旧实现不检查结果：磁盘满/库损坏时“看起来已缓存”，实际一条没写进去
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "SQLite 缓存写入失败(%d): %s", rc, sqlite3_errmsg(db_));
+    } else {
+      cached_count_.fetch_add(1, std::memory_order_relaxed);
+    }
     sqlite3_finalize(stmt);
+  } else {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 10000,
+      "SQLite 缓存语句准备失败: %s", sqlite3_errmsg(db_));
   }
 }
 
@@ -1300,14 +1457,22 @@ void DataAgent::sqliteReplay()
   std::vector<Row> rows;
   {
     std::lock_guard<std::mutex> guard(db_mutex_);
+    // 快照在途 id（≤ replay_inflight_limit_ 个）：这些行已投递但尚未证实，
+    // 本轮必须跳过，否则慢链路下同一批会被反复 produce（平台幂等不脏数据，
+    // 但 8 万条存量回放时会成倍浪费上行带宽）。
+    const std::set<std::int64_t> inflight_ids = replay_inflight_ids_;
     sqlite3_stmt * stmt = nullptr;
     const char * sql =
       "SELECT id, topic, payload FROM telemetry_cache ORDER BY id ASC LIMIT ?;";
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-      sqlite3_bind_int(stmt, 1, want);
-      while (sqlite3_step(stmt) == SQLITE_ROW) {
+      // 多取 |在途| 行，补偿被跳过的行
+      sqlite3_bind_int(stmt, 1, want + static_cast<int>(inflight_ids.size()));
+      while (sqlite3_step(stmt) == SQLITE_ROW && static_cast<int>(rows.size()) < want) {
         Row row;
         row.id = sqlite3_column_int64(stmt, 0);
+        if (inflight_ids.count(row.id) > 0) {
+          continue;   // 已投递未证实 → 跳过，等 dr_cb 回来再放行
+        }
         const auto topic = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
         const auto payload = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
         row.topic = topic ? topic : "telemetry";
@@ -1328,9 +1493,17 @@ void DataAgent::sqliteReplay()
     if (!producer) {
       break;  // 对应通道不可用，该行留在库里等下轮
     }
+    // 先登记再 produce：dr_cb 可能在任何一次 poll() 里回来并 erase 它，
+    // 反过来（先 produce 再登记）会留下永远不被回收的 id，使该行再也不能回放
+    {
+      std::lock_guard<std::mutex> guard(db_mutex_);
+      replay_inflight_ids_.insert(row.id);
+    }
     if (kafkaProduce(producer, row.topic, row.payload, row.id)) {
       ++queued;
     } else {
+      std::lock_guard<std::mutex> guard(db_mutex_);
+      replay_inflight_ids_.erase(row.id);
       break;  // 本地队列又满了 → 停止本轮，避免无效刷屏
     }
   }
@@ -1353,6 +1526,27 @@ void DataAgent::sqliteDeleteRow(std::int64_t row_id)
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
   }
+}
+
+std::uint64_t DataAgent::sqliteRowCount()
+{
+  // 只用于断链/恢复两条日志与 communication_loss 事件（每次中断各 1–2 次），
+  // 不进 10Hz 热路径：COUNT(*) 在 8 万行级别也要几毫秒，不能每拍都查。
+  std::lock_guard<std::mutex> guard(db_mutex_);
+  if (!db_) {
+    return 0;
+  }
+  std::uint64_t rows = 0;
+  sqlite3_stmt * stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM telemetry_cache;", -1, &stmt, nullptr) ==
+    SQLITE_OK)
+  {
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+      rows = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+  }
+  return rows;
 }
 
 }  // namespace data_agent

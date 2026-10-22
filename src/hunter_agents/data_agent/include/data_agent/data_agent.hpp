@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 
 #include <sys/types.h>  // pid_t
@@ -56,8 +57,13 @@ private:
   bool kafkaProduce(RdKafka::Producer * producer, const std::string & topic,
     const std::string & payload, std::int64_t cache_row_id = -1);
   void kafkaReconnect();   // 指数退避重连（文档 14.6）
-  // 链路可用判定：producer 存在 + 投递已被证实可用 + 本地队列未积压。
-  // 注意：produce() 成功只代表消息进入本地队列，不等于送达 broker
+  // 车-云链路判活（契约 event_type=communication_loss）：判据是“连续 N 秒没有一条
+  // 投递被 broker 证实”，与本地队列积压无关（积压判据在 message.timeout.ms=60s
+  // 逐条超时淘汰下永远到不了 kafka_queue_limit_）。由 packAndPublish 10Hz 驱动。
+  void checkLinkHealth();
+  // 生产前提判定：producer 存在 + 本地队列未积压。
+  // 注意：produce() 成功只代表消息进入本地队列，不等于送达 broker；
+  // 是否送达只由 dr_cb 证实（kafka_connected_ 仅用于展示/探测，不能反过来门控 produce）
   bool kafkaReady();
   // 按 Topic 选择 producer（.event → acks=all 通道）
   RdKafka::Producer * producerFor(const std::string & topic);
@@ -69,6 +75,8 @@ private:
   void sqliteCache(const std::string & topic, const std::string & payload);
   void sqliteReplay();                        // 断点续传：投递证实后才删行
   void sqliteDeleteRow(std::int64_t row_id);
+  // 库中当前待回放行数（仅断链/恢复时各取一次，不进 10Hz 热路径）
+  std::uint64_t sqliteRowCount();
 
   // 事件（契约 event.schema.json：event_type 19 种 / event_level 3 级）
   void reportEvent(const std::string & event_type, const std::string & event_level,
@@ -119,6 +127,10 @@ private:
   std::atomic<uint64_t> dr_ok_count_{0};    // 投递成功计数
   std::atomic<uint64_t> dr_fail_count_{0};  // 投递失败计数
   std::atomic<int> replay_inflight_{0};     // 已投递未证实的缓存回放条数
+  // 已投递未证实的回放行 id（与 replay_inflight_ 同步维护，db_mutex_ 保护）。
+  // 作用：sqliteReplay 按 id ASC 取批时跳过这些行，避免慢链路下同一批被反复
+  // produce（平台按 seq 幂等不会脏数据，但 8 万条存量回放时会成倍浪费带宽）。
+  std::set<std::int64_t> replay_inflight_ids_;
   int replay_batch_size_;                   // 每轮回放上限（条）
   int replay_inflight_limit_;               // 在途回放上限（条）
   sqlite3 * db_;
@@ -168,9 +180,14 @@ private:
   int broker_port_{0};                          // 对应端口（用于 network_latency_ms 采样）
 
   // 车-云链路中断检测（契约 event_type=communication_loss）
-  bool link_down_{false};
-  bool comm_loss_reported_{false};
-  rclcpp::Time link_down_since_;
+  // 判据：last_delivery_ok_ns_ 距今超过 comm_loss_duration_ 秒（dr_cb 成功即刷新）。
+  std::atomic<std::int64_t> last_delivery_ok_ns_{0};  // 上次“投递被证实”的 steady 时刻
+  std::atomic<bool> ever_delivered_{false};           // 本进程是否已成功投递过
+  std::atomic<bool> link_down_{false};                // 已判定中断（仅定时器线程维护）
+  bool comm_loss_reported_{false};                    // 本次中断是否已上报事件
+  std::int64_t link_down_at_ns_{0};                   // 进入中断时刻（算恢复日志时长）
+  std::atomic<std::uint64_t> cached_count_{0};        // 累计写入本地缓存的报文数
+  std::int64_t last_cache_cleanup_ns_{0};             // 上次清理过期缓存时刻
 
   // 事件去重（边沿触发）：同一 event_type 在 event_min_interval_ 秒内只上报一次。
   // 依据：detectEvents 是 100ms 无状态判定，低电/超速/急转弯/急停在持续期间会每拍

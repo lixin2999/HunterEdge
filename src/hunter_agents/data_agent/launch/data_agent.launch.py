@@ -28,5 +28,10 @@ def generate_launch_description():
             name='data_agent',
             output='screen',
             parameters=[params_file],
+            # 崩溃自愈：ros2 launch 不会因子节点退出而退出，而 hunter-edge.service 的
+            # Restart=on-failure 只覆盖 launch 父进程 → 旧配置下 data_agent 崩了以后
+            # 服务仍是 active (running)，平台却永久 `offline`（2026-10-22 事故的另一半风险）。
+            respawn=True,
+            respawn_delay=2.0,
         ),
     ])
