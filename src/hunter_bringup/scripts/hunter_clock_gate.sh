@@ -65,7 +65,26 @@ if ! command -v timedatectl >/dev/null 2>&1; then
   exit 0
 fi
 
-read_sync() { timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown; }
+read_sync() {
+  local s=""
+  # V0.1.37：单次上限 5s——timedatectl 走 D-Bus，开机初期若卡住会把整条链拖到
+  # TimeoutStartSec 之外（此时 systemd 会杀服务并重启，看着像“启动失败”）。
+  if command -v timeout >/dev/null 2>&1; then
+    s="$(timeout 5 timedatectl show -p NTPSynchronized --value 2>/dev/null)" || s=""
+  else
+    s="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" || s=""
+  fi
+  printf '%s' "${s:-unknown}"
+}
+
+# V0.1.37：等待上限必须用单调时钟（CLOCK_BOOTTIME）计，不能用循环次数——
+#   · 循环次数在 read_sync 偶发变慢时会低估真实耗时，而外面 TimeoutStartSec 是按真实时间算的；
+#   · /proc/uptime 不随时钟跳变，正好用来算 delta（跳变量）。
+mono() {
+  local up=""
+  read -r up _ < /proc/uptime 2>/dev/null || true
+  if [ -n "$up" ]; then printf '%s' "${up%%.*}"; else date +%s; fi
+}
 
 # ---- RTC 硬件体检（V0.1.36）：无条件执行，与“本次是否已同步”无关 ----
 # 判据① 内核启动时从 /dev/rtc0 读到的时间；判据② hwclock -r 能否读到设备。
@@ -93,6 +112,7 @@ rtc_hw_check() {
 rtc_hw_check
 
 t0="$(date +%s)"
+t0_mono="$(mono)"
 before="$(date '+%Y-%m-%d %H:%M:%S')"
 status="$(read_sync)"
 
@@ -114,16 +134,18 @@ fi
 
 log "等待 NTP 首同步，上限 ${TIMEOUT}s（超时只告警、不阻断启动）"
 elapsed=0
-while [ "$elapsed" -lt "$TIMEOUT" ]; do
-  sleep 1
-  elapsed=$(( elapsed + 1 ))
+while : ; do
   status="$(read_sync)"
   [ "$status" = "yes" ] && break
+  elapsed=$(( $(mono) - t0_mono ))
+  [ "$elapsed" -ge "$TIMEOUT" ] && break
+  sleep 1
 done
 
 t1="$(date +%s)"
 after="$(date '+%Y-%m-%d %H:%M:%S')"
-# 修正量 = 两读数的钟面差 − 真实流逝（sleep 计数），跳变时为数千秒级
+# 跳变量 = 墙钟差 − 单调钟流逝（后者不是循环次数，而是真实秒数）
+elapsed=$(( $(mono) - t0_mono ))
 delta=$(( t1 - t0 - elapsed ))
 
 if [ "$status" = "yes" ]; then

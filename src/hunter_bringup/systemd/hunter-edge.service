@@ -31,8 +31,11 @@ ExecStartPre=/bin/bash -c 'S="${HUNTER_CLOCK_GATE_SCRIPT:-}"; if [ -z "$S" ]; th
 ExecStartPre=/bin/bash -c 'S="${HUNTER_CAN_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_can_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_can_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; exec /bin/bash "$S" --quick'
 ExecStart=/bin/bash -c 'S="${HUNTER_EDGE_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_edge_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_edge_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; [ -f "$S" ] || { echo "[hunter-edge] 未找到 hunter_edge_up.sh（用 HUNTER_EDGE_UP_SCRIPT 指定绝对路径）" >&2; exit 1; }; exec /bin/bash "$S"'
 # 整栈启动含相机硬件复位（initial_reset）与 Nav2 lifecycle，给足启动时间
-# V0.1.34：180 → 240，为时钟闸门（最长 60s 等待 NTP 同步）预留余量
-TimeoutStartSec=240
+# V0.1.34：180 → 240，为时钟闸门预留余量
+# V0.1.37：240 → 360。最坏情况是闸门跑满超时（60s）+ 整栈慢启动（~180s），
+# 240s 恰好卡在线上——一旦超时 systemd 会杀服务并 Restart，现场看着像“启动失败”。
+# 实测冷启动闸门只用 23s（同步快），但网络差时不能靠运气。
+TimeoutStartSec=360
 Restart=on-failure
 RestartSec=10
 # 退出宽限（V0.1.12 下调）：fast_lio2 建图模式写 PCD + data_agent flush 残留消息一般 < 30s；
