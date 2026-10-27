@@ -49,6 +49,23 @@ die()  { echo "[edge] × $*" >&2; exit "${2:-1}"; }
 
 log "════════ HunterEdge 启动序列（上电自启路径）════════"
 
+# ---- ⓪ 时钟闸门（与 hunter-edge.service 的 ExecStartPre 同源、幂等）----
+# RTC 掉电不保持时，若栈在 NTP 首同步前起来，十几秒后时钟被拨 15h+ 会让全栈时间轴断裂：
+# 消息时间戳落进“过去”→ MessageFilter 整帧丢弃 → 代价地图空 → FAST-LIO2 发散后段错误
+# （release.md V0.1.33 §8）。有界等待（默认 60s，HUNTER_CLOCK_GATE_TIMEOUT 可覆盖、0 跳过），
+# 超时只告警不阻断——车不能因为对不上时就永远进不了待命态。
+#
+# 去重（V0.1.36）：systemd 路径下本脚本是 ExecStart、闸门已在 ExecStartPre 跑过一次，
+# 再跑一遍只多两条相同日志（现场会误以为是重复启动）。所以 systemd 拉起时跳过；
+# 手工 `bash hunter_edge_up.sh` 时照常跑（那才是唯一的一道闸门）。
+if [ -f "$SCRIPT_DIR/hunter_clock_gate.sh" ]; then
+  if [ -n "${INVOCATION_ID:-}" ] && [ "${HUNTER_CLOCK_GATE_FORCE:-0}" != "1" ]; then
+    log "⓪ 时钟闸门：systemd 拉起（ExecStartPre 已执行），本次不重复检查"
+  else
+    bash "$SCRIPT_DIR/hunter_clock_gate.sh" || warn "时钟闸门异常退出（不影响启动）"
+  fi
+fi
+
 # ---- ① 底盘 CAN 通信复查（与 hunter-can.service 同一脚本，幂等）----
 log "① 底盘 CAN 通信复查（${CAN_IF:-can2}）"
 if bash "$SCRIPT_DIR/hunter_can_up.sh" --quick; then

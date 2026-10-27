@@ -4373,4 +4373,380 @@ ros2 topic echo /safety/state --once   # 定位健康时不应因发散误锁 MA
 - 故障注入复验（约 1 分钟，只拦本机出向）：`sudo iptables -I OUTPUT -p tcp --dport 9093 -j REJECT` → 等 45s → `sudo iptables -D OUTPUT -p tcp --dport 9093 -j REJECT`；期望日志顺序 `链路中断(10.1s)` → `communication_loss` → `链路恢复` → `断点续传`，且**不再出现 rosbag 录制行**。
 - 对账（⑧ 新增判据）：`链路恢复` 行的「缓存 **X** 条待回放」是**恢复瞬间库内真实行数**，随后各轮 `本轮回放 N 条` 之和 **ΣN 应 ≥ X**；差额 = 回放突发期间本地队列满、实时报文顺手落库的新行（被后续轮次一并带走），正常应是 X 的百分之几。最终 `telemetry_cache` 必须归零，且最后一轮日志之后不再出现回放轮次。2026-10-22 17:22 实测：X=376、ΣN=383、差 7（1.9%），库归零。
 
+---
+
+## V0.1.33（Date：2026-10-27）
+
+**主题：车端相机「全程 0 帧」定案——RealSense SDK 2.58→2.59.1 升级使 wrapper 组件库 ABI 断链（`class_loader::LibraryLoadException`），重编对齐后恢复；本版无源码改动，附现场误判链与五项待办**
+
+### 一、现场
+
+2026-10-27 `hunter-edge` 启动（09:27:30）后相机从未出过一帧，雷达同期被判「闪一下即停」。
+
+**追溯（重要）：那条 `2026-10-26 17:14:08` 是「错误时钟」写下的时间戳。** 该会话真实起点为 **2026-10-27 08:46:59**（开机约 19s 后自启），开机早期系统时钟仍停在错误的 10-26 17:14，**约 17s 后被 NTP 一次性向前拨了 55970 秒（15h32m）** —— 同一份 journal 因此同时存在「10-26 17:14」与「10-27 08:47」两套时间（详第八节）。此后 09:27:32、09:47:22 两次重启同位置同样失败 ⇒ 确定性缺陷、与时钟无关；相机从 08:46:59 一直坏到 10:0x 重编后修复。
+
+- `health_monitor` 每 2s `camera 话题频率异常：0.0Hz < 5.0Hz，持续超 2s`；1s 窗口实测计数为 0 且已过 15s 启动宽限 ⇒ 话题**真的没有生产者**，不是掉帧。
+- `vision_perception` `彩色图像超时：819.36s 未收到 /camera/camera/color/image_raw（阈值 0.50s）` 随时间单调累加（09:41:11 − 09:27:32 ≈ 819s）⇒ 该计数器是「自节点启动起从未收到」，**与时间戳基准无关**（排除了 `use_lidar_clock` 类怀疑）。
+- 平台侧远程视频 `0.00 Mbps / 0.0 fps` 黑屏（`remote_agent` 订阅同一话题无帧）。
+- 硬件侧全部无辜：`dmesg` 仅 `Found UVC 1.50 device Intel(R) RealSense(TM) Depth Camera 435 (8086:0b07)`，无 uvcvideo 报错、无 USB reset/掉线；`lsusb` 在位；`/dev/video0-5` 齐全；`fuser` 无进程占用。
+- 雷达**驱动侧**始终健康：`rslidar_sdk_node` `S<l` 常驻、`/lidar_points` 10.007Hz、`tcpdump` 见 `192.168.1.200:6699 → 192.168.1.102:6699` 稳定流入（909 包/5s、0 dropped）、6699+7788 双 socket 正常 bind。（「XXXXs 未更新」那个数字确实属于视觉节点对**相机**的计时、不是雷达——这点成立；**但不能**由此推出雷达感知链路健康：同日 `/scan` 与 `/perception/lidar/obstacle_cloud` 真的只有一帧，见第八节。）
+
+### 二、根因
+
+手工拉起即暴露：
+
+```
+terminate called after throwing an instance of 'class_loader::LibraryLoadException'
+  what():  Could not load library dlopen error: librealsense2.so.2.58:
+           cannot open shared object file: No such file or directory
+[ros2run]: Aborted
+```
+
+系统侧：`dpkg -l` 五件套（librealsense2 / -dev / -gl / -udev-rules / -utils）均为 **2.59.1-0~realsense.9165**；磁盘只有 `librealsense2.so.2.59(.1)`，`ldconfig -p` 正常注册 ⇒ **不是路径问题，是 SONAME 版本错配**。wrapper 源码 `realsense2_camera` 4.58.4（CMake `find_package(realsense2 2.58.0)`）的组件库 `librealsense2_camera.so` 是 SDK 升级前编的，NEEDED 写死 `.so.2.58`，2.59 无法满足。
+
+两个放大因子（比库缺失本身更值得修）：
+
+1. `realsense2_camera_node` 只是 `rclcpp_components` 容器，真正的库由 class_loader **运行时 dlopen** ⇒ `ldd` 主程序**查不到该依赖**（本次排障因此一度误判「依赖正常」）。
+2. `hunter_full.launch.py` 对两个硬件驱动只做 include、**无 `respawn`** ⇒ abort 一次 = 整个会话没有相机，不自愈。
+
+### 三、修复与实机执行（无源码改动、无 ROS 接口变更）
+
+```bash
+cd ~/HunterEdge
+rm -rf build/realsense2_camera install/realsense2_camera   # 必须删 build，规避 V0.1.26 mtime 空编译陷阱
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select realsense2_camera
+source install/setup.bash
+```
+
+编译期 `FindCUDA.cmake CMP0077` 告警为 OpenCV 4.10 CUDA 配置的既有噪声（最终 `Finished`，无 error），不影响产物。
+
+### 四、实测验收（2026-10-27 09:52 车端）
+
+| 判据 | 实测 |
+|------|------|
+| 驱动自述版本 | `RealSense ROS v4.58.4` / `Built with LibRealSense v2.59.1` / `Running with LibRealSense v2.59.1` |
+| 设备识别 | `Device with serial number 117322070409`、`RealSense D435`、`USB type: 3.2`、FW `5.14.0` |
+| 流 profile | Depth Z16 640×480@15、Color RGB8 640×480@15、`RealSense Node Is Up!` |
+| 彩色频率 | `ros2 topic hz /camera/camera/color/image_raw` = **14.986~15.029Hz**（min 0.062 / max 0.071，std dev 收敛 0.001） |
+| 平台远控视频 | **4.00 Mbps / 15.0 fps / 端到端 25ms**，画面正常播放 |
+| **生产路径（systemd）复验** | 关掉手工节点、`ps` 确认无残留 → `sudo systemctl restart hunter-edge` → 彩色 **15.100 / 15.042 / … / 14.999Hz**（min 0.058 / max 0.073）、深度 **14.995 / 14.991 / … / 14.989Hz**（std dev 收敛 0.0005） |
+| `journal` 复查 | `grep -E 'LibraryLoad\|Infra\|has died'`：重编后**无任何 LibraryLoad、无 has died**；**无 Infra** ⇒ 生产 launch 的 `enable_infra1/2:=false` 生效（848×480@30 双流只出现在手法命令里） |
+| SDK 钉版 | `apt-mark hold` 五件套全部 `set on hold`，`apt-mark showhold \| grep realsense` 五项在位 |
+| 全链路复验（10:1x） | `/scan` 9.984~10.004Hz、`/perception/lidar_objects` 9.977~10.004Hz、`/perception/lidar/obstacle_cloud` 9.995~10.019Hz、`/system/health` = **OK**（4/4 running，CPU 38.1% / GPU 49% / 54℃ / 内存 6.6%）⇒ 导航障碍输入、感知输出、里程计全部到位 |
+
+### 五、向后兼容与风险
+
+- 零话题/消息/服务/参数变更；只重编本机 wrapper，不动 `hunter_full.launch.py`。
+- realsense-ros 4.58.4 对 SDK 2.59.1 属「向上兼容编译」：本次验收覆盖 RGB + Depth 两路主用流；`accel/gyro`、`align_depth`、`rgbd` 等未启用流未验证，启用前需另行复验。
+- 日志残留 3 类噪声，均非故障：`Could not set param: rgb_camera.power_line_frequency with 3 Range: [0,2]`（D435 不支持该档）、`frame's time domain is HARDWARE_CLOCK. Timestamps may reset periodically.`、启动阶段 2 次 `Frames didn't arrived within 5 seconds`（USB 带宽瞬时不足）。
+- 手工验证命令未带 `enable_infra1/2:=false`，日志出现 Infra 848×480@30 双流（额外 USB 带宽）；生产 launch 已显式关闭，**已复验生产路径无 Infra**。
+
+### 六、待办（本版未处理，如实登记）
+
+> ✅ **已由 V0.1.34 落地**（新增 `hunter_clock_gate.sh` + `ExecStartPre ①` + `hunter_edge_up.sh ⓪`，有界等待 NTP 首同步、超时不阻断）。原判断与整改要点留档：**给整栈加「时钟同步闸门」。** `hunter-edge.service` 只依赖 `hunter-can` + `network-online.target`（第 9 行），**不等时钟同步**，开机 19s 就把整栈拉起；本次 RTC/NTP 在 17s 后把时钟向前拨 55970s，整栈时间轴当场断裂。整改：① 单元加 `After=time-sync.target` + `Wants=systemd-time-wait-sync.service`；② `ExecStartPre` 增有界等待（最多 60s，超时只 WARN 不阻塞，避免车永远起不来）；③ 查 RTC 是否保持（`sudo hwclock -r` / `timedatectl`）并 `hwclock --systohc` 回写。**此项决定本次事故是否每次上电重演。**
+
+1. **【已定性】`fastlio_mapping` `-11(SIGSEGV)`**：2026-10-27 08:52:57 崩溃，由**时钟跳变诱发的里程计发散**引起（第八节），不是随机崩溃。取证受限：该机无 `coredumpctl`（Jetson 默认未装 systemd-coredump），`dmesg` 也无 segfault 记录。真正待修的是**无 respawn**：`/Odometry` 从 08:52:57 断到 09:27:28，35 分钟无定位。
+2. **驱动/算法节点无 respawn**：`realsense2_camera`、`rslidar_sdk`、`ch10x_driver`、`fast_lio` 崩溃后整会话不自愈（全仓仅 `data_agent` 有 respawn）。本次两个故障（相机 abort、FAST-LIO2 段错误）**都是被这条放大的**。
+3. **`health_monitor` 的 `critical_nodes_` 空转**：该参数赋值后从未使用，无法区分「进程不存在」与「数据饥饿」；措辞还把 abort 误导为「疑似 CPU 过载」。配套整改见第九节的监控盲区分析。
+4. **启动无二进制依赖预检**：建议 `hunter_edge_up.sh` 在 launch 前对驱动组件库做 `ldd \| grep 'not found'`，命中即 fail（把本类故障报在启动日志第一屏，而非 800 秒后靠「相机 0 帧」发现）。
+5. **相机时间域为 `HARDWARE_CLOCK`**：需复验 `sensor_fusion` 的 `max_sync_diff(0.10s)` 时间对齐是否受影响（`ros2 topic echo /camera/camera/color/image_raw --field header.stamp --once` 与主机时钟比对）。
+6. **停机时部分节点以 `-6(SIGABRT)` 而非 `-2(SIGINT)` 退出**：`hunter_base`、`ch10x_driver`、`rslidar_sdk` 在每次 `systemctl stop/restart` 时均如此（析构阶段 abort，可能留 core），不影响运行，低优先级。
+7. **舰队风险排查**：若 SDK 升级源自批次性 `apt upgrade`，**其他车会同时中招**。逐台比对 `dpkg -l \| grep -i realsense` 与 `ros2 run realsense2_camera realsense2_camera_node` 首屏 `Built with LibRealSense` 是否一致；并查 `grep -iE 'realsense' /var/log/apt/history.log*` 定位升级时间点。
+
+### 七、分发与现场执行
+
+- 源码无改动；产物为 `build/realsense2_camera` + `install/realsense2_camera`（`--symlink-install`）。
+- **已执行（2026-10-27 10:0x）：** 关闭手工节点 → `apt-mark hold` 五件套成功 → `sudo systemctl restart hunter-edge` → 生产路径彩色/深度均 ≈15Hz。
+- 现场顺序（供其它车复用）：关掉手工测试节点 → `apt-mark hold` 五件套 → `sudo systemctl restart hunter-edge` → 验收：
+
+```bash
+ps -eo pid,etime,args | grep realsense2_camera_node | grep -v grep   # 生产路径应有且仅有一个
+ros2 topic hz /camera/camera/color/image_raw                         # ≈15Hz
+ros2 topic hz /camera/camera/depth/image_rect_raw                    # ≈15Hz（RGBD 由 depth 派生）
+sudo journalctl -u hunter-edge -b --no-pager | grep -E 'LibraryLoad|realsense2_camera_node|has died'
+```
+
+### 八、同时段的雷达侧故障链（2026-10-27 08:47–08:53，与相机故障**互相独立**）
+
+**根因是系统时钟跳变，不是雷达、也不是 FAST-LIO2 自己坏的。** 08:47:16 的日志里同时出现三个互不相关、却指向同一个数的量：
+
+| 观测 | 数值 | 反推 |
+|------|------|------|
+| `obstacle_cloud ... has not been updated for` | **55970.22 s** | 缓冲区创建于（当时错误的）`Oct 26 17:14:25.95` |
+| `Message Filter dropping ... at time 1793006065.936` | 1793062036.19 − 1793006065.936 = **55970.24 s** | 该消息时间戳同样落在 15.5 小时前 |
+| `彩色图像超时：17.34s`（`steady_clock` 实现，免疫时钟跳变） | 17.34 s | vision 节点生于 **08:46:59** |
+
+三式联立即得：**栈在 08:46:59 启动时系统时钟还停在 10-26 17:14（落后 15h32m），约 17 s 后被 NTP 一次性向前拨了 55970 s**。这一拨把「启动瞬间产生的消息时间戳、TF 缓存、代价地图 `last_updated`」全甩到 15 小时前，全栈时间轴瞬间断裂（附同一 0.6s 内的完整时间线）：
+
+| 时刻 | 证据 | 含义 |
+|------|------|------|
+| 08:47:16.28 | `obstacle_cloud ... not updated for 0.29s` → 0.49 / 0.69 / 0.89 s 递增 | **只收到了一帧**（即现场“雷达闪一下即停”那一帧），之后全被丢弃 |
+| 08:47:16 | `fastlio_mapping: No Effective Points!` ×3 | 点云配准失效（与时钟跳变同步） |
+| 08:47:16.218 → .785 | NDT `✓ 收敛 fit=3.292` → `✗ 严重失准 fit=9442913722596065968.000>5.00` | **0.5 秒内从收敛炸穿** |
+| 08:53:26 | `/scan ... 370.52s`、`obstacle_cloud ... 370.69s` | 6 分钟内**零有效感知输入**，代价地图全空 |
+| 08:53:29 | `odom→base 平移 845515.4m 超 sanity 门限/非有限（疑似里程计发散），退化单位阵` | **FAST-LIO2 已发散到 845 公里** |
+| 08:53:29 | `✗ 严重失准 fit=623541747712.000>5.00` | NDT 完全失准，对外宣告未收敛 |
+| 08:53:26+ | `Message Filter dropping message: frame 'base_link' ... earlier than all the data in the transform cache` | TF 只剩最近 10s，消息时标落在缓存之外 → **FAST-LIO2 发异常/超前时间戳** |
+| 08:53:27+ | `Extrapolation Error ... Requested time 1793062368.467666`（多秒不变） | planner 卡在死循环重试同一次 30s 前的 TF 查询 |
+| 08:52:57 | `fastlio_mapping exit -11` | **5 分 40 秒后段错误**；845km 是它死前的最后一帧 |
+| 08:53:29 | `[ESTOP] 保持急停（estop=false，AUTO条件=未满足）` | 最终态（安全侧行为正确） |
+
+**因果序（修正版）**：时钟跳变 → ① 消息时间戳落在 TF 缓存之外 → `MessageFilter` 整帧丢弃 → `observation buffer has not been updated` 从 0.29s 一路涨到 370s；② FAST-LIO2 配准失效（`No Effective Points!`）→ 里程计发散到 845 km → 5'40" 后 SIGSEGV；③ NDT 同一 0.5 秒内从收敛到 9.4e18。**`/scan` 断流与 FAST-LIO2 发散是同一上游原因的两个并列后果，不是因果关系**（上一版写成因果，已更正）。
+
+> ⚠️ **两次判断更正**：① 不能因 `/lidar_points` 10Hz 就断言雷达链路健康——`/scan` 与 `/perception/lidar/obstacle_cloud` 当时确实只有一帧，现场“雷达闪一下即停”的观察**准确**；② 但“闪一下”既不是雷达坏了、也不是 FAST-LIO2 发散造成的，而是**时钟跳变让这些消息全被时间过滤器丢掉**。
+
+**已定项 / 已排除**：不是雷达（`/lidar_points` 全程 10Hz、`rslidar_sdk` 未退出）、不是 D435（`dmesg` 无 uvc 报错）、不是 CPU 饥饿（跳变瞬间 CPU 38%）、不是 `pointcloud_to_laserscan` 退出。
+
+**待查（决定是否每次开机重演）**：RTC 为何落后 15.5h —— `timedatectl`（看 `RTC time` 与 `System clock synchronized`）、`sudo hwclock -r`、`journalctl -b \| grep -iE 'Time has been changed\|timesyncd\|chrony'`。若开机 RTC 恒落后，则**每次上电都会重演本次事故**；且时钟错 15h 会连带打掉 Kafka TLS 与遥测时间戳。
+
+### 九、监控盲区（本次最值得改的一条）
+
+`health_monitor` 只订阅四个**驱动层**话题：`/lidar_points`、`/camera/camera/color/image_raw`、`/imu/data`、`/chassis/state`。于是本日四类故障：
+
+| 故障 | health_monitor 能否感知 |
+|------|--------------------------|
+| 相机进程 abort | 只能看到“话题 0Hz”，且措辞误导为“疑似过载” |
+| `/scan` + `/perception/*` 断流 | **不能** |
+| FAST-LIO2 发散到 845km | **不能** |
+| FAST-LIO2 段错误 | **不能** |
+
+全程只报了一条 `camera 0Hz`，其余 8 分钟静默——这就是“带病运行 8 分钟无人发现”的机制。整改方向：① 把已赋值但从未使用的 `critical_nodes_` 接上**进程存活检查**（按 `/proc` 或 `ros2 node list` 对应 PID）；② 新增 `/scan`、`/Odometry`、`/perception/lidar_objects` 三条输出层频率看门狗（阈值可宽，≥1Hz 即判活）；③ 措辞区分“进程不存在（崩溃）”与“话题变慢（饥饿）”；④ 把**时钟同步状态**（`timedatectl` 的 `NTPSynchronized`）纳入健康上报——本次事故它同样完全无感，而它是所有时间戳的基准。
+
+---
+
+## V0.1.34（Date：2026-10-27）
+
+**主题：上电时钟闸门——根治 V0.1.33 §8 的“整栈时间轴断裂”。新增 `hunter_clock_gate.sh`（NTP 首同步有界等待，超时不阻断），接入 `hunter-edge.service` 的 `ExecStartPre` 与 `hunter_edge_up.sh` 的 ⓪ 步骤**
+
+### 一、现场与证据（实测）
+
+```
+Jan 01 08:00:36  systemd-timesyncd[626]: System clock time unset or jumped backwards,
+                 restoring from recorded timestamp: Mon 2026-10-26 17:13:55 CST
+Oct 27 08:47:16  systemd-timesyncd[626]: Initial synchronization to time server
+                 193.182.111.143:123 (1.pool.ntp.org).
+```
+
+- `Jan 01 08:00` = **上电时 RTC 没有可用时间**（内核时钟倒退到 epoch 附近）；`restoring from recorded timestamp: 10-26 17:13:55` = 上一次真实断电时刻（timesyncd 状态文件）。
+- 整栈在该状态下的 **08:46:59 就已拉起**（开机约 19s），17 秒后 NTP 首同步 → 时钟**向前拨 55970s（15h32m）**，与 V0.1.33 §8 用「未更新秒数 / 消息 `header.stamp` / `steady_clock` 节点年龄」三式联立算出的跳变量**完全一致**。
+- 当前 `timedatectl`：`RTC time` 与 `System time` 仅差 1s、`System clock synchronized: yes`、`NTP service: active`、`RTC in local TZ: no`；`sudo hwclock -r` = 系统时间。⇒ **RTC 硬件本身能读写，但在断电期间不保持**（内核运行期会周期性回写 RTC，所以在线时看起来是对的）。
+
+### 二、根因
+
+`hunter-edge.service` 的依赖链只有 `Requires=hunter-can.service` + `After=hunter-can.service network-online.target`（V0.1.33 第 9 行）——**“网络通”不等于“时钟准”**。RTC 丢时 + 栈抢在 NTP 首同步前启动，两者叠加就必然发生一次大跳变；而 ROS 2 的消息时间戳、TF 缓存、costmap `ObservationBuffer` 都以墙钟为基准，跳变即全链路失效。
+
+### 三、改动（三处，均为启动链，不动算法/参数）
+
+| 文件 | 改动 |
+|------|------|
+| `src/hunter_bringup/scripts/hunter_clock_gate.sh` | **新增**（116 行）。等 `NTPSynchronized=yes`，上限 `HUNTER_CLOCK_GATE_TIMEOUT`（默认 60s）；超时只 WARN。同步后再报「闸门前 → 闸门后」的修正量（>2s 即告警“本机 RTC 又不准了”）。**退出码恒 0**：时钟问题绝不阻断整车启动 |
+| `src/hunter_bringup/systemd/hunter-edge.service` | 新增 `ExecStartPre ①` 调用闸门（CAN 复查降为 `ExecStartPre ②`）；`TimeoutStartSec` 180 → **240**（为最长 60s 等待留余量）；注释记录“为何不用 `After=time-sync.target`” |
+| `src/hunter_bringup/scripts/hunter_edge_up.sh` | 新增 `⓪ 时钟闸门` 步骤（与单元同源、幂等），使手工 `bash hunter_edge_up.sh` 也受保护 |
+
+**设计取舍（故意不用 `After=time-sync.target` + `systemd-time-wait-sync.service`）**：那套写法在 NTP 服务器不可达时会**无限阻塞** `time-sync.target`，等价于“车永远不启动”。本方案宁可带着错时钟起来（旧行为）也不失去可用性，只把“已知会跳变”的那段窗口关掉。
+
+### 四、验证方式（实机验证**待办**）
+
+```bash
+# ① 脚本自检（不改系统状态）
+bash src/hunter_bringup/scripts/hunter_clock_gate.sh --check
+# ② 装单元并重启
+colcon build --symlink-install --packages-select hunter_bringup && sudo bash src/hunter_bringup/scripts/hunter_core_setup.sh --skip-deps --skip-build && sudo systemctl daemon-reload && sudo systemctl restart hunter-edge
+# ③ 验收：重启日志首行应见 [clock]，且以后不再出现 MessageFilter 整帧丢弃伴随巨大“未更新秒数”
+sudo journalctl -u hunter-edge -b | grep -E '\[clock\]|not updated for [0-9]{3,}s' | head -20
+```
+
+### 五、向后兼容与风险
+
+1. **启动时间**：NTP 已同步时闸门耗时 < 1s；未同步时最多 +60s（`TimeoutStartSec=240` 已覆盖）。
+2. **可用性优先**：闸门超时、脚本缺失、无 `timedatectl` 一律 `exit 0`，不会出现“因时钟而对不上就不启动”。
+3. **覆盖范围有限**：仅解决“上电时时钟还没对”这一个窗口。运行期间被外部拨钟（手工 `date -s`、NTP 大跳变）仍会复现同样症状——那是运维纪律问题，闸门不管。
+4. **历史数据污染（已发生）**：10-26 17:13:55 ～ 08:47:16 这 76 秒内 `data_agent` 上报的遥测/健康/事件带有**错误时间戳**，平台按时间窗检索时会把 10-27 的真实事件当成 10-26 17:14 的数据。无需改代码，仅需知晓。
+
+### 六、待办
+
+1. **RTC 硬件（唯一根治项，仍待）**：`RTC time` 之所以“现在对”是因为内核在运行期写入了 RTC；断电即丢说明**板上 RTC 电池/超级电容失效或未装**，软件无法补救。软件侧的补偿（同步后 `hwclock --systohc` 缩短下次偏差窗口）**已由 V0.1.35 落地并默认开启**。
+2. ~~NTP 源~~ **已由 V0.1.35 落地**：`hunter_core_setup.sh` 步骤 ⑥.0 写 `/etc/systemd/timesyncd.conf.d/10-hunter.conf`（国内四源 + `FallbackNTP`），把首同步从 ~76s 压到几秒。
+3. 把 `NTPSynchronized` 纳入 `/system/health`（V0.1.33 §9 整改方向 ④）。
+
+---
+
+## V0.1.35（Date：2026-10-27）
+
+**主题：时钟两件套收尾——NTP 源换国内（首同步 ~76s → 秒级）+ RTC 同步后回写与 `/dev/rtc0` 体检。改动只在部署脚本与时钟闸门，不动任何 ROS 节点**
+
+### 一、实测数据（接 V0.1.34）
+
+```
+$ timedatectl
+               Local time: Tue 2026-10-27 10:34:34 CST
+           Universal time: Tue 2026-10-27 02:34:34 UTC
+                 RTC time: Tue 2026-10-27 02:34:35
+System clock synchronized: yes          NTP service: active          RTC in local TZ: no
+$ sudo hwclock -r
+2026-10-27 10:34:44.449661+08:00
+```
+
+- `RTC time` 与 `System time` 只差 1s ⇒ **RTC 读写本身正常**（内核运行期会周期性回写），问题只在“断电期间不保持”。
+  > 更正（V0.1.36 §二）：方向对，但**严重度被低估**。`dmesg` 显示每次上电内核从 RTC 只读到 `1970-01-01T00:00:36`——不是“停在旧值”，而是**归零**（后备电源根本没供电）。这里“只差 1s”是内核运行期回写造成的假象。
+- 首同步服务器是 `193.182.111.143`（`1.pool.ntp.org` 的欧洲节点），开机后 **~76s** 才同步成功，而整栈在开机 ~19s 就已拉起 ⇒ 这个 76s 的空窗就是事故温床。
+
+### 二、两件事与做法
+
+| 问题 | 做法 | 为什么这么做 |
+|------|------|--------------|
+| NTP 源太远 | `/etc/systemd/timesyncd.conf.d/10-hunter.conf`：`NTP=ntp.aliyun.com ntp1.aliyun.com ntp.tencent.com cn.pool.ntp.org`、`FallbackNTP=ntp.ntsc.ac.cn time.cloudflare.com` | 用 **drop-in** 而不改发行版的 `timesyncd.conf`：apt 升级不会覆盖，回退只需删一个文件。国内源把首同步压到秒级，闸门等待就几乎不占启动时间 |
+| RTC 断电丢时 | ① `HUNTER_CLOCK_GATE_SYSTOHC=1`（同步后 `hwclock --systohc`）；② 闸门体内体检 `hwclock -r`，读不到直接报硬件问题 | 软件无法修复“断电丢时”（需补 RTC 电池），但可以**每次同步后立即把 RTC 写成对的**——若某次是异常断电而非电池失效，下次开机就少丢一段 |
+
+### 三、改动
+
+| 文件 | 改动 |
+|------|------|
+| `src/hunter_bringup/scripts/hunter_core_setup.sh` | 新增 `--skip-ntp` 开关；新增**步骤 ⑥.0 时钟同步**（写 drop-in → `timedatectl set-ntp true` → `systemctl enable --now systemd-timesyncd` → 同步后 `hwclock --systohc`）；生成的 `agent_env.sh` 增加 `HUNTER_CLOCK_GATE_TIMEOUT=60` / `HUNTER_CLOCK_GATE_SYSTOHC=1`；`README_agent_env` 增加“时钟异常”排查指路 |
+| `src/hunter_bringup/scripts/hunter_clock_gate.sh` | 同步成功后增加 RTC 体检：`hwclock -r` 失败即告警“属硬件问题（RTC 电池/超级电容/未装）”，与 `--systohc` 回写分开记日志 |
+
+### 四、验证（实机验证**待办**）
+
+```bash
+sudo bash src/hunter_bringup/scripts/hunter_core_setup.sh --skip-deps --skip-build
+cat /etc/systemd/timesyncd.conf.d/10-hunter.conf          # 国内源已落盘
+systemctl restart systemd-timesyncd && sleep 3
+timedatectl timesync-status                              # Server 应为 *.aliyun.com / *.tencent.com，offset 毫秒级
+timedatectl                                                # RTC time 与 System time 应一致
+journalctl -u systemd-timesyncd -b | grep -i 'Initial synchronization'
+```
+
+**验收判据**：`timesync-status` 的 `Server` 不再是 `1.pool.ntp.org`；冷启动时 `journalctl -u hunter-edge` 的 `[clock]` 行显示等待 **≤ 5s** 即通过（原为 76s）。
+
+### 五、向后兼容与风险
+
+1. **可整体退出**：`--skip-ntp` 跳过 ⑥.0（现场已自建 NTP 时用）；drop-in 只是一份新增文件，删掉即回到发行版默认。
+2. **不阻断部署**：NTP 不可达 / `timedatectl` 不可用 / 无 `hwclock` 全部只告警，脚本继续跑完 ⑥。
+3. **NTP 源可用性**：四主源 + 两备源已冗余；若某车所在网络对 UDP/123 封禁，仍会回落到“闸门超时 60s 后照常启动”（V0.1.34 既有行为）。
+4. **RTC 回写不等于修好硬件**：`hwclock --systohc` 只在“RTC 芯片还能跑、只是没对上”时有意义；实测本机是**断电丢时**（开机时 RTC 被内核判为 unset），仍需硬件补电池——本版只是把软件侧窗口收到最小。
+
+### 六、待办
+
+1. **RTC 电池（硬件）**：唯一根治项。Jetson AGX Orin 载板需确认 RTC 电池/超级电容是否装配、是否失效（`dmesg \| grep -i rtc`、`ls /dev/rtc*`）。
+   > V0.1.36 已定案：`dmesg` 铁证为“上电读数归零（1970-01-01T00:00:36）”，即未装或已耗尽；软件侧只能兜底。
+2. **舰队排查**：其余车辆是否同一批次同一问题 —— 逐台跑 `timedatectl`，看 `RTC time` 与 `System time` 在**冷启动后 5 分钟内**是否相差 > 60s。
+3. 把 `NTPSynchronized` 与 `RTC` 健康纳入 `/system/health`（V0.1.33 §9 ④），让平台侧能看见“这台车的时钟可信度”。
+
+---
+
+## V0.1.36（Date：2026-10-27）
+
+**主题：RTC 定案——`dmesg` 铁证“每次上电内核从 RTC 只读到 `1970-01-01T00:00:36`”⇒ 后备电源根本没供电（不是“停在旧值”）；同时修掉 V0.1.35 的一个死角：RTC 体检被关在“等待同步”分支里，已同步时一次都不会跑**
+
+### 一、实测（V0.1.35 验收通过项）
+
+```
+$ bash src/hunter_bringup/scripts/hunter_clock_gate.sh --check
+[clock] 时钟已同步（NTPSynchronized=yes，2026-10-27 10:44:21）：无需等待
+
+$ sudo bash src/hunter_bringup/scripts/hunter_core_setup.sh --skip-deps --skip-build
+[hunter-core] ⑥.0 时钟同步（NTP 源 + timesyncd）
+[hunter-core]   写入 /etc/systemd/timesyncd.conf.d/10-hunter.conf（国内 NTP 源 + FallbackNTP）
+[hunter-core]   时钟已同步（2026-10-27 10:44:45）
+[hunter-core]   已回写 RTC（hwclock --systohc）
+
+$ timedatectl timesync-status
+       Server: 203.107.6.88 (ntp.aliyun.com)
+     Stratum: 2      Offset: -6.296ms    Delay: 27.961ms    Jitter: 2.379ms
+Root distance: 15.952ms (max: 5s)
+
+$ timedatectl
+      Local time: Tue 2026-10-27 10:45:58 CST
+           RTC time: Tue 2026-10-27 02:45:58
+System clock synchronized: yes     NTP service: active     RTC in local TZ: no
+```
+
+- NTP 源已从 `1.pool.ntp.org`（欧洲，首同步 ~76s）切到 `ntp.aliyun.com`（**毫秒级 offset**）✅
+- `hwclock --systohc` 回写成功，`timedatectl` 的 `RTC time` 与 `Universal time` 一致 ✅
+- 闸门在 systemd 路径下正常执行，未报错 ✅
+
+### 二、RTC 定案：铁证与 V0.1.35 结论修正
+
+```
+$ sudo dmesg | grep -i rtc
+[    5.170799] tegra_rtc c2a0000.rtc: registered as rtc1
+[    5.170809] tegra_rtc c2a0000.rtc: Tegra internal Real Time Clock
+[   12.532302] nvvrs-pseq-rtc nvvrs-pseq-rtc: registered as rtc0
+[   12.534783] nvvrs-pseq-rtc nvvrs-pseq-rtc: setting system clock to 1970-01-01T00:00:36 UTC (36)
+
+$ ls -l /dev/rtc*
+lrwxrwxrwx 1 root root  4 Jan  1  1970 /dev/rtc -> rtc0
+crw------- 1 root root 251, 0 Jan  1  1970 /dev/rtc0
+crw------- 1 root root 251, 1 Oct 12 15:44 /dev/rtc1
+
+$ sudo hwclock -r
+2026-10-27 10:46:41.341509+08:00
+```
+
+**关键那一行是 `setting system clock to 1970-01-01T00:00:36 UTC (36)`**：
+
+1. `rtc0 = nvvrs-pseq-rtc`（NVVRS 电源序列 RTC，`/dev/rtc -> rtc0`，`hwclock` 读的就是它），`rtc1 = tegra_rtc`（Tegra 片内 RTC）。
+2. 上电时内核从 rtc0 只读出 **epoch 36 秒**——计数器从 0 起（36s 是 NVVRS 上电到内核读取的时长）⇒ **断电期间 RTC 没有任何后备电源供电**。不是“停在关机那一刻的旧值”。
+3. **与 10-27 事故完全同源**：事故日志里的 `Jan 01 08:00:36` 是 CST(+8) 的 `00:00:36 UTC`，与本次 `(36)` 是**同一个数**。两次上电都是“从 0 起”，说明不是偶发，而是长期如此。
+4. `hwclock -r` 现在读得对（`2026-10-27 10:46:41`），是因为 10:44:45 刚被 `hwclock --systohc` 写过——**这正是 V0.1.35 判读被误导的原因**：运行期一切正常，故障只在断电瞬间发生。
+
+> 由此对 V0.1.35 §一的判断作修正：当时写“RTC 读写本身正常，问题只在断电期间不保持”——方向对，但**严重度被低估**。真实情况是“归零”，不是“停旧值”。这意味着：只要不换电池，**每一台车每一次断电开机都必定丢时**，与“上次关机时间”无关。
+
+### 三、V0.1.35 留下的自伤死角
+
+```
+$ sudo journalctl -u hunter-edge -b | grep '\[clock\]'
+Oct 27 10:44:56 ... [clock] 时钟已同步（NTPSynchronized=yes，2026-10-27 10:44:56）：无需等待   ← 两条
+Oct 27 10:44:58 ... [clock] 时钟已同步（NTPSynchronized=yes，2026-10-27 10:44:58）：无需等待   ← 四条
+Oct 27 10:46:09 ... [clock] 时钟已同步（NTPSynchronized=yes，2026-10-27 10:46:09）：无需等待   ← 两条
+```
+
+两个问题暴露在这 8 行里：
+
+1. **RTC 体检一次都没跑过**。V0.1.35 把 `hwclock -r` 体检写在“等待同步 → 成功”分支里，而上面 8 条全是 `NTPSynchronized=yes` 的 **early-return** 路径。而 RTC 坏不坏跟“现在时间对不对”根本无关——恰恰是已同步时最需要查它（否则故障只能等下次断电才暴露）。本版把体检**上提到 early-return 之前**无条件执行。
+2. **每条启动出两条一模一样的日志**。`hunter-edge.service` 结构是 `ExecStartPre`（闸门）→ `ExecStart=hunter_edge_up.sh`，而后者 ⓪ 步骤也调一次闸门 ⇒ 每次启动 2 条（实测 4 次启动 = 8 条）。幂等所以功能无害，但现场会误认为服务被重复拉起。本版按 `INVOCATION_ID` 去重。
+
+### 四、改动
+
+| 文件 | 改动 |
+|------|------|
+| `src/hunter_bringup/scripts/hunter_clock_gate.sh` | 新增 `rtc_hw_check()` 并**提到 early-return 之前**无条件执行：判据① 取 `journalctl -k -b` 里 `setting system clock to …` 那行，年份 < 2000 就告警“RTC 后备电源失效”；判据② `hwclock -r` 失败告警“器件不可读”。删掉原等待分支里的重复体检 |
+| `src/hunter_bringup/scripts/hunter_core_setup.sh` | ⑥.0 在 `hwclock --systohc` 之后跑同一判据：**部署当时**就把“电池已死”报出来，不用等下次断电再挖日志 |
+| `src/hunter_bringup/scripts/hunter_edge_up.sh` | ⓪ 步骤去重：`INVOCATION_ID` 非空（systemd 拉起，ExecStartPre 已跑）则跳过；手工 `bash hunter_edge_up.sh` 照常执行；`HUNTER_CLOCK_GATE_FORCE=1` 强制 |
+
+**为什么判据必须取内核那一行**：`systemd-timesyncd` 会用 `/var/lib/systemd/timesync/clock` 把系统时钟回填成上次的值（10-27 事故里就是回填成 `10-26 17:13:55`），回填后 `timedatectl`、`date`、`hwclock -r` **全部看着正常**——只有内核那行 `setting system clock to 1970-…` 还留着真相。这也是本版不能用“`now - uptime`”推算启动时刻的原因：时钟跳变后该式同样失真。
+
+### 五、验证
+
+1. `bash -n` 三个脚本（`hunter_clock_gate.sh` / `hunter_edge_up.sh` / `hunter_core_setup.sh`）全部通过。
+2. 判据逻辑用真实 dmesg 行做 5 个用例实测：
+
+| 输入 | 期望 | 实测 |
+|------|------|------|
+| `nvvrs-pseq-rtc ... setting system clock to 1970-01-01T00:00:36 UTC (36)`（无时间戳前缀） | WARN | ✅ WARN |
+| 同上，带 `Oct 27 10:44:56 agilex kernel:` 前缀 | WARN | ✅ WARN |
+| `... setting system clock to 2026-10-27T02:45:00 UTC` | 静默 | ✅ 静默 |
+| 无该行（只有 `registered as rtc1`） | 静默（不能误报） | ✅ 静默 |
+| `... 1980-03-01T00:00:00 UTC` | WARN | ✅ WARN |
+
+3. **冷启动实测：待办**（见 §六）——本次是在已同步状态下热重启验证的，走的是 early-return 分支，闸门的“等待 + 跳变量告警”路径尚未在真实断电场景跑过。
+
+### 六、风险与待办
+
+**风险**
+
+1. `journalctl -k -b` 需要 root（`ExecStartPre` 是 root，满足）；手工 `--check` 不加 `sudo` 时读不到内核日志，此时判据**静默跳过而不是误报**。
+2. `INVOCATION_ID` 去重的边界：若有人手工把 `hunter_edge_up.sh` 塞进别的 systemd 单元运行，会跳过闸门——此时用 `HUNTER_CLOCK_GATE_FORCE=1` 或改回直接调 `hunter_clock_gate.sh`。
+3. 闸门上限仍是 60s。若某车网络起得比 60s 更晚，仍会在超时后带着错误时钟启动（设计如此：不阻断启动）。
+
+**待办**
+
+1. **RTC 电池（硬件）——唯一根治项**。已定案为“未装或已耗尽”：需开盖核 AGX Orin 载板 RTC 电池座（CR1220）/超级电容。换前每次断电开机必丢时。
+2. **冷启动验收**：断电 → 上电，看 `journalctl -u hunter-edge -b` 的 `[clock]`，期望出现 **RTC 告警 3 行** + `等待 Ns 后同步`，且期间不出现 `obstacle_cloud ... not updated for 5xxxx s`。
+3. **舰队排查**：逐台 `sudo dmesg \| grep 'setting system clock'`，命中 1970 即同批硬件问题。
+4. 把 `NTPSynchronized` 与“上电 RTC 读数”纳入 `/system/health`（V0.1.33 §9 ④），让平台侧能看见“这台车的时钟可信度”。
+
+
+
 

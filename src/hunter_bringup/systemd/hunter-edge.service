@@ -5,6 +5,8 @@ Documentation=file:///etc/hunter/README_agent_env
 # Requires=：CAN 未就绪则不启动本服务（“底盘都没通就别把车挂到 AUTO 待命状态”）；
 # After= 保证 hunter-can 完成（Type=oneshot + RemainAfterExit）后才拉起本服务；
 # network-online.target 保证 Kafka（运营端）接入前网络已就绪。
+# V0.1.34：上电时钟闸门（见下方 ExecStartPre）——本机 RTC 掉电不保持时间，栈必须等 NTP
+# 首同步后再起，否则时钟被拨 15h+ 会让全栈消息时间戳/TF 缓存失效（release.md V0.1.33 §8）。
 Requires=hunter-can.service
 After=hunter-can.service network-online.target
 Wants=network-online.target
@@ -20,11 +22,17 @@ Environment=PYTHONUNBUFFERED=1
 Environment=HUNTER_EDGE_AUTONOMOUS_NAV=true
 Environment=HUNTER_EDGE_NAV_MODE=nav
 EnvironmentFile=-/etc/hunter/agent_env.sh
-# ExecStartPre：CAN 幂等复查（接口真掉了直接失败 → Restart=on-failure 重新走一遍完整时序）
+# ExecStartPre ①（V0.1.34）：时钟闸门 —— 等 NTP 首同步，默认上限 60s；超时只告警、不阻断启动。
+# 不能用 `After=time-sync.target` + systemd-time-wait-sync.service 的硬等写法：NTP 不可达时会
+# 无限阻塞，等价于车永远不启动。实测事故：开机 19s 起栈，17s 后 NTP 把时钟前拨 55970s
+# ⇒ MessageFilter 整帧丢弃、代价地图空、FAST-LIO2 发散 845km 后 SIGSEGV。
+ExecStartPre=/bin/bash -c 'S="${HUNTER_CLOCK_GATE_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_clock_gate.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_clock_gate.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; if [ -z "$S" ]; then echo "[hunter-edge] 未找到 hunter_clock_gate.sh，跳过时钟闸门" >&2; exit 0; fi; exec /bin/bash "$S"'
+# ExecStartPre ②：CAN 幂等复查（接口真掉了直接失败 → Restart=on-failure 重新走一遍完整时序）
 ExecStartPre=/bin/bash -c 'S="${HUNTER_CAN_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_can_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_can_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; exec /bin/bash "$S" --quick'
 ExecStart=/bin/bash -c 'S="${HUNTER_EDGE_UP_SCRIPT:-}"; if [ -z "$S" ]; then for c in "${HUNTER_WS_PREFIX:-$HOME/HunterEdge/install}/share/hunter_bringup/scripts/hunter_edge_up.sh" "${HUNTER_SRC_DIR:-$HOME/HunterEdge}/src/hunter_bringup/scripts/hunter_edge_up.sh"; do [ -f "$c" ] && { S="$c"; break; }; done; fi; [ -f "$S" ] || { echo "[hunter-edge] 未找到 hunter_edge_up.sh（用 HUNTER_EDGE_UP_SCRIPT 指定绝对路径）" >&2; exit 1; }; exec /bin/bash "$S"'
 # 整栈启动含相机硬件复位（initial_reset）与 Nav2 lifecycle，给足启动时间
-TimeoutStartSec=180
+# V0.1.34：180 → 240，为时钟闸门（最长 60s 等待 NTP 同步）预留余量
+TimeoutStartSec=240
 Restart=on-failure
 RestartSec=10
 # 退出宽限（V0.1.12 下调）：fast_lio2 建图模式写 PCD + data_agent flush 残留消息一般 < 30s；

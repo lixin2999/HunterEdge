@@ -12,6 +12,9 @@
 #   ④ 编译：以运行用户身份 colcon build 相关包
 #   ⑤ 自检：hunter-kafka-check（接入链路七层自检，退出码非 0 不自启服务）；并给运行用户装
 #        ~/.local/bin/hunter-kafka-check 命令包装（ament 不把 lib/<pkg>/ 加进 PATH，直接 source 后用不了）
+#   ⑥.0 时钟同步（V0.1.35）：写 /etc/systemd/timesyncd.conf.d/10-hunter.conf（国内 NTP 源 +
+#        FallbackNTP）并启用 systemd-timesyncd，同步后回写 RTC。RTC 掉电丢时是本次“整栈
+#        时间轴断裂”的根因（release.md V0.1.33 §8），NTP 源换国内可把首同步从 ~76s 压到几秒
 #   ⑥ systemd：安装并启用 hunter-can / hunter-edge / ota-agent / remote-agent
 #        （hunter-can 上电启用底盘 CAN；hunter-edge 依赖它启动整栈——
 #         data_agent/command_agent 上报运营端并待命自动驾驶，见 §13.10）
@@ -21,7 +24,7 @@
 # 用法:
 #   sudo bash hunter_core_setup.sh --bundle ~/HUNTER-001-bundle/HUNTER-001 \
 #        [--ws <工作空间>] [--user <登录用户>] [--skip-deps] [--skip-build]
-#        [--offline] [--no-systemd] [--no-start] [--force-config] [--force-key]
+#        [--offline] [--no-systemd] [--no-start] [--force-config] [--force-key] [--skip-ntp]
 #   # --ws / --user 通常省写：默认取 sudo 调用者的家目录 + ~/HunterEdge
 #   # 改完口令/参数后的“重跑”可以不传 --bundle（/etc/hunter/kafka 四件套齐即自动复用）：
 #   sudo bash hunter_core_setup.sh --skip-deps
@@ -39,6 +42,7 @@
 #   --skip-build   跳过 colcon 编译
 #   --offline      自检只查本地配置/证书，不连 broker（现场无云端网络时用）
 #   --no-systemd   不安装/启用 systemd 服务
+#   --skip-ntp     不改 /etc/systemd/timesyncd.conf.d/ 与 timesyncd 状态（现场已自建 NTP 时用）
 #   --no-start     只安装并 enable systemd 服务，**不立即启动**（台架/无底盘时用；
 #                  不加本项则启动 hunter-can → ota/remote-agent → hunter-edge 整栈）
 #   --force-config 用仓内参数文件/接入包覆盖 /etc/hunter/ 下已有内容（默认保留现场修改，
@@ -49,7 +53,7 @@ set -euo pipefail
 BUNDLE_DIR=""
 WS_DIR=""                             # 未指定时按运行用户的家目录推导（见下方“前置检查”）
 RUN_USER="${SUDO_USER:-$(id -un)}"
-SKIP_DEPS=0 SKIP_BUILD=0 OFFLINE=0 NO_SYSTEMD=0 FORCE_CONFIG=0 FORCE_KEY=0 NO_START=0
+SKIP_DEPS=0 SKIP_BUILD=0 OFFLINE=0 NO_SYSTEMD=0 FORCE_CONFIG=0 FORCE_KEY=0 NO_START=0 SKIP_NTP=0
 
 log()  { echo "[hunter-core] $*"; }
 warn() { echo "[hunter-core] ! $*" >&2; }
@@ -67,6 +71,7 @@ while [ $# -gt 0 ]; do
     --no-start)     NO_START=1; shift ;;
     --force-config) FORCE_CONFIG=1; shift ;;
     --force-key)    FORCE_KEY=1; shift ;;
+    --skip-ntp)     SKIP_NTP=1; shift ;;
     -h|--help)      sed -n '/^set -euo pipefail/q; p' "$0"; exit 0 ;;   # 打印文头注释（自动随注释行数变化，不需手工维护行号）
     *) die "未知参数: $1（--help 看用法）" ;;
   esac
@@ -396,6 +401,11 @@ HUNTER_EDGE_MAP_YAML=$WS_DIR/maps/hunter_map.yaml
 HUNTER_EDGE_MAP_FILE=$WS_DIR/maps/hunter_map.pcd
 # DDS 实现：留空 = 用 ROS 默认；须与现场 ~/.bashrc 的 RMW_IMPLEMENTATION 保持一致
 HUNTER_RMW_IMPLEMENTATION=$RMW_DETECTED
+# ── 上电时钟闸门（V0.1.34；见 hunter_clock_gate.sh）──
+# 等 NTP 首同步再起栈的等待上限（秒；0 = 不等待，退回“带着错时钟启动”的旧行为）
+HUNTER_CLOCK_GATE_TIMEOUT=60
+# 1 = 同步后顺带回写 RTC（本机 RTC 掉电不保持，回写能缩短下次开机偏差；需硬件补电池才根治）
+HUNTER_CLOCK_GATE_SYSTOHC=1
 EOF
 chmod 0644 "$ETC_DIR/agent_env.sh"
 log "  写入 $ETC_DIR/agent_env.sh（HUNTER_WS_PREFIX=$WS_DIR/install）"
@@ -426,6 +436,8 @@ Agent 运行环境说明（由 hunter_core_setup.sh 生成于 $(date '+%F %T')�
                                           journalctl -u hunter-can -u hunter-edge -b --no-pager
   接入不通                          →  hunter-kafka-check（看退出码：10 配置 20 证书 30 认证 40 网络 50 Topic 60 投递）
   底盘不通                          →  sudo bash <仓>/src/hunter_bringup/scripts/hunter_can_up.sh（看退出码 2=无接口 3=无底盘帧）
+  时钟/时区异常，或上电后导航“瞎了”      →  timedatectl；bash <仓>/src/hunter_bringup/scripts/hunter_clock_gate.sh --check
+                                          （NTP 源在 /etc/systemd/timesyncd.conf.d/10-hunter.conf；RTC 掉电丢时需硬件补电池）
   严禁                              →  把凭据写进任何 YAML、拷进仓库/镜像层、或在日志里打印口令
 EOF
 chmod 0644 "$ETC_DIR/README_agent_env"
@@ -561,6 +573,66 @@ fi
 #   hunter_bringup/systemd/{hunter-can,hunter-edge}.service   —— 上电自启链路
 #   hunter_agents/{ota_agent,remote_agent}/scripts/*.service  —— Agent 常驻服务
 if [ "$NO_SYSTEMD" -eq 0 ]; then
+  # ---- ⑥.0 时钟同步（V0.1.35）----
+  # 本机 RTC 掉电不保持时间（实测：10-26 17:13 断电 → 10-27 08:46 上电，内核时钟退回
+  # “Jan 01 08:00”，timesyncd 用状态文件回填成 10-26 17:13:55），而整栈只依赖
+  # network-online 就在开机 ~19s 起来，17s 后被 NTP 前拨 55970s（15h32m）→ 全栈消息时间戳
+  # /TF 缓存失效 → MessageFilter 整帧丢弃、代价地图空、FAST-LIO2 发散后段错误。
+  # 两件软件侧能做且有效的事：① NTP 源换国内（实测原 1.pool.ntp.org 是欧洲节点，首同步 ~76s）；
+  # ② 同步后立即回写 RTC，缩短下次开机偏差（根治靠硬件补 RTC 电池，见下方告警）。
+  if [ "$SKIP_NTP" -eq 0 ]; then
+    log "⑥.0 时钟同步（NTP 源 + timesyncd）"
+    NTP_DROPIN_DIR=/etc/systemd/timesyncd.conf.d
+    NTP_DROPIN="$NTP_DROPIN_DIR/10-hunter.conf"
+    mkdir -p "$NTP_DROPIN_DIR"
+    cat > "$NTP_DROPIN" <<'NTPEOF'
+# 由 HunterEdge hunter_core_setup.sh 生成（V0.1.35）
+# 目的：把首同步从“境外 1.pool.ntp.org”换到国内源。实测原配置开机后 ~76s 才首同步，
+# 而整栈在开机 ~19s 就起来了 → 抢在时钟校正前启动，NTP 一跳变整栈时间轴即断裂
+# （MessageFilter 整帧丢弃 / 代价地图空 / FAST-LIO2 发散，见 release.md V0.1.33 §8）。
+[Time]
+NTP=ntp.aliyun.com ntp1.aliyun.com ntp.tencent.com cn.pool.ntp.org
+FallbackNTP=ntp.ntsc.ac.cn time.cloudflare.com
+NTPEOF
+    log "  写入 $NTP_DROPIN（国内 NTP 源 + FallbackNTP）"
+    timedatectl set-ntp true 2>/dev/null || warn "  timedatectl set-ntp true 失败（timesyncd 未装？）"
+    systemctl enable --now systemd-timesyncd 2>/dev/null || warn "  启用 systemd-timesyncd 失败"
+    systemctl restart systemd-timesyncd 2>/dev/null || true
+    # 首同步通常 1~3s（国内源）；最多等 10s，不到就只告警——部署不能被 NTP 卡住
+    _ntp_wait=0
+    while [ "$_ntp_wait" -lt 10 ]; do
+      _ntp_sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no)"
+      if [ "$_ntp_sync" = "yes" ]; then break; fi
+      sleep 1
+      _ntp_wait=$(( _ntp_wait + 1 ))
+    done
+    if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no)" = "yes" ]; then
+      log "  时钟已同步（$(date '+%F %T')）"
+      if command -v hwclock >/dev/null 2>&1; then
+        hwclock --systohc 2>/dev/null && log "  已回写 RTC（hwclock --systohc）" \
+          || warn "  回写 RTC 失败（/dev/rtc0 不可用？那就是硬件问题：补 RTC 电池/超级电容）"
+      fi
+      # RTC 硬件体检（V0.1.36）：部署时就把“电池已死”当场告警，不用等下次断电丢时再挖日志。
+      # 判据只能取内核启动那一行：timesyncd 已把系统时钟回填/同步成对的，`timedatectl` 此时
+      # 一律显示正常，掩盖了“上电时 RTC 从 1970 起”这个事实。
+      _rtc_boot="$(journalctl -k -b --no-pager 2>/dev/null \
+        | sed -n 's/.*setting system clock to \([0-9-]*T[0-9:]*\) UTC.*/\1/p' | head -1)"
+      case "$_rtc_boot" in
+        ''|2[0-9][0-9][0-9]-*) ;;
+        *)
+          warn "  本次上电内核从 RTC 只读到 $_rtc_boot ⇒ RTC 后备电源失效（读数从 0 起）"
+          warn "    ⇒ 属硬件问题：AGX Orin 载板 RTC 电池（CR1220 座）/超级电容 未装、装反或电压不足"
+          warn "    ⇒ 软件侧只能靠开机时钟闸门等 NTP 校正；换电池前每次断电开机都会丢时"
+          ;;
+      esac
+    else
+      warn "  时钟尚未同步（网络未通或 NTP 被阻）：不阻塞部署，开机时 hunter_clock_gate.sh 会再等一次"
+      warn "  现场查：timedatectl timesync-status / journalctl -u systemd-timesyncd -b"
+    fi
+  else
+    log "⑥.0 跳过时钟同步配置（--skip-ntp）"
+  fi
+
   log "⑥ 安装 systemd 服务（hunter-can / hunter-edge / ota-agent / remote-agent）"
   unit_src_of() {
     case "$1" in
