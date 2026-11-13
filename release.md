@@ -4838,6 +4838,127 @@ $ sudo journalctl -u hunter-edge -b | grep -E '\[clock\]|not updated for [0-9]{3
 3. 把 `NTPSynchronized` 与“上电 RTC 读数”纳入 `/system/health`（V0.1.33 §9 ④）。
 4. `fast_lio` 等节点仍无 respawn（V0.1.33 待办，与本版无关但仍在台账上）。
 
+## V0.1.38（Date：2026-11-13）
 
+**主题：新增 `sil_bridge_agent` —— HunterSim ↔ HunterEdge 真 SIL 全栈闭环（CARLA 传感器经 Kafka 注入车端真实输入话题，全栈产出的 `/cmd_vel` 回传仿真自车）；配套 `hunter_bringup/launch/hunter_sil.launch.py` SIL 模式整栈编排**
 
+### 一、背景与定位
 
+此前 HunterSim 的 SIL 测试由**仿真侧脚本自车**（确定性速度环 + 车道保持）驱动，被测对象只是仿真自己，车端全栈并未参与，属"假 SIL"。本版把控制权真正交给 HunterEdge：
+
+```
+CARLA 传感器 → HunterSim EdgeLinkRuntime → Kafka carla.{sim_id}.edge_sensor
+  → sil_bridge_agent → /lidar_points /camera/camera/... /imu/data
+                       /chassis/state /localization/odom /Odometry + TF
+  → lidar/vision/fusion → decision_making → auto_mission(mapping cruise)
+  → /cmd_vel → sil_bridge_agent → Kafka carla.{sim_id}.edge_control
+  → HunterSim control_driver hook → 仿真自车
+```
+
+**被测软件与实车完全相同，只换输入来源**。评估引擎消费真实自车行为采样，`success_criteria` 照常裁决，结论真实反映全栈表现。平台（HunterCore）侧**零改动**：场景下发、判据、结果回传契约全部沿用；车端→平台仍走现有 `hunter.<vid>.telemetry/event/health`。
+
+### 二、新增包 `hunter_agents/sil_bridge_agent`（ament_python）
+
+| 文件 | 职责 |
+|------|------|
+| `sil_bridge_agent/codec.py` | 坐标系转换 + 信封/payload 编解码（**无 rclpy / confluent_kafka 依赖**，纯逻辑可单测） |
+| `sil_bridge_agent/session.py` | 会话绑定 + 断流看门狗 + 控制序号 + 各流限频（同样无 ROS 依赖） |
+| `sil_bridge_agent/sil_bridge_agent.py` | ROS2 节点 + Kafka 收发线程（导入守卫，缺 ROS/缺库时降级为明确报错而非崩溃） |
+| `scripts/sil_bridge_node` | 可执行入口（**不依赖 setuptools 入口元数据**，沿用 `remote_agent_node` 的 `PackageNotFoundError` 教训） |
+| `scripts/sil-bridge.service` | systemd 单元（三候选路径探测 + `KillSignal=SIGINT` + 导出 `RMW_IMPLEMENTATION`） |
+| `config/sil_bridge_params.yaml` | 话题映射/限频/看门狗/`sim_id` 过滤（**不含任何凭据**） |
+| `launch/sil_bridge.launch.py` | 只拉起桥接单进程（全栈由 `hunter_sil.launch.py` 编排，避免双发布者） |
+| `test/test_codec.py`、`test_session.py`、`test_sil_bridge_node.py` | 103 项单测（mock rclpy / ROS 消息 / confluent_kafka / hunter_kafka） |
+
+**不新增任何 ROS 话题/消息**（.ai-rules）：话题名与 `frame_id` 全部取自 `hunter_bringup/config/sensor_params.yaml`（`rslidar` / `camera_color_optical_frame` / `imu`）。`carla.*` 是 SIL 专用 Kafka 通道，**不走 `topic_name()` 8 Topic 契约**（直接用 `confluent_kafka` + `hunter_kafka.config.load_conf`，契约文件不受影响）。
+
+### 三、坐标系翻转（本版最易错、也最关键的一处）
+
+CARLA 左手系（X 前 / Y 右 / Z 上）↔ ROS REP-103 右手系（X 前 / Y 左 / Z 上），反射矩阵 `R = diag(1,-1,1)`，`det = -1`。**真向量与伪向量的翻转规则不同**：
+
+| 量 | 类别 | 转换 |
+|----|------|------|
+| 位置 / 速度 / 加速度 | 真向量 | `(x, -y, z)` |
+| 角速度 / 陀螺 / 横摆角速度 | 伪向量 | `(-x, +y, -z)` |
+| 四元数 | — | `(-qx, +qy, -qz, qw)` |
+| 欧拉角 | — | `(-roll, +pitch, -yaw)` |
+
+这是 HunterSim 侧 `steer = -atan(L·ω / max(|v|,0.5)) / MAX_STEER` 符号约定成立的前提。单测用**独立推导**交叉校验（先翻欧拉角再转四元数 ≡ 直接翻四元数分量、纯 yaw 与参考公式 `sin(-yaw/2)/cos(-yaw/2)` 对照、单位范数），而非把实现公式抄进断言。
+
+### 四、三条安全语义（与仿真端看门狗、车端超时停车对齐）
+
+1. **会话绑定 + 实例隔离**：正则订阅 `^carla\..+\.edge_sensor$` 会收到所有仿真实例的帧，必须按 `session` boot 帧绑定唯一 `sim_id`，之后只处理该实例数据；`sim_id_filter` 非空时进一步限定。boot 幂等（重连重发不重置计数与 `seq`）；异 `sim_id` 的 stop 帧不得终止本会话。
+2. **传感器断流停发 ROS 帧**：上行断流 > `watchdog_ms`（默认 500ms）时**停发**，让车端 `safety_guard` 的 `scan_timeout`/`cmd_timeout` 超时停车语义自然生效——**不伪造零速点云**（伪造会让感知以为"前方空旷"）。**控制回传不停**：继续转发全栈产出的 `/cmd_vel`（此时已是零速），仿真端由它自己的看门狗决定刹停，两侧语义不互相掩盖。
+3. **stop / 进程退出补恰好一帧零速**：收到 stop 帧后停发并补一帧零速；**没收到 stop 帧就退出**（SIGINT / systemd 重启 / 崩溃恢复）同样补帧（`SessionState.close()`），否则仿真自车会沿用末帧指令滑行到看门狗超时（500ms × 3.5m/s ≈ **1.75m**）。与 stop 共用同一待办故**幂等**，`seq` 严格接续（重置会被仿真端按 `seq<=last` 去重丢弃 → 自车滑行）。
+
+### 五、SIL 模式整栈编排 `hunter_sil.launch.py`
+
+**不启动的节点（逐项理由，均已核实代码）**：
+
+| 不启动 | 理由 |
+|--------|------|
+| `rslidar_sdk` / `realsense2_camera` / `ch10x_driver` | sil_bridge 独占其输出话题，同时启动形成**双发布者**（点云/图像互相覆盖，感知结果不可信） |
+| `hunter_base`（CAN） | SIL 无 CAN 硬件；`/chassis/state` 由仿真真值发布，`/cmd_vel` 回传仿真而非下发底盘 |
+| `localization.launch.py`（fast_lio2 + EKF） | 用**仿真真值定位**替代 LIO，排除定位误差这一变量；`odom→base_link` TF 原由 EKF `publish_tf=true` 发布，现由 sil_bridge 接管 |
+| `hunter_autonomous_nav.launch.py` | 其 mapping 分支带 `fast_lio2_param_injector` / `pcd_to_map`（依赖 LIO 写 PCD），nav 分支还起 Nav2 + NDT；SIL 两者都不需要，故**直接编排 `auto_mission_node(mapping)`** 并自带 `pointcloud_to_laserscan`（原只在 nav 分支） |
+| `hunter_relocalization`（NDT） | **已核实 mapping cruise 不依赖 `/relocalization/pose`**：`startCruiseCallback` 只校验 mapping 模式 / 非急停 / 航点热重载 / `/Odometry` 新鲜；`isLocalizationValid()`（要求 NDT 收敛）仅在 nav 模式状态机调用。SIL 真值世界系即 map 系，由 sil_bridge 发 `map→odom` 恒等 TF |
+| `safety_guard` | mapping 模式下实车栈本就不启动它，`auto_mission` cruise 是 `/cmd_vel` 的**唯一所有者**；SIL 保持一致避免双发布者，障碍制动由 `stop/warn_obstacle_dist` 阈值负责 |
+| `health_monitor`（默认 `use_health_monitor:=false`） | **SIL 无 CAN，它会持续报 CRITICAL** → `auto_mission` 的 `mapping_paused_` 永久暂停巡航 |
+| `rviz2` | 车端无头运行纪律（V0.1.30 防复发加固①），SIL 同样严禁默认起 GUI |
+
+**巡航启动门控链（排查「车不动」按此顺序查，已写入 launch 头部与用户手册）**：
+
+1. `decision_making` 必须输出 **AUTO**：仲裁为 `ESTOP > REMOTE > AUTO`，而 `estop_ || chassis_fault || chassis_stale → ESTOP`（`decision_making.cpp:135`）。故 **`/chassis/state` 必须新鲜** —— 它由 sil_bridge 从 `ego_state` 流发布，**`ego_state` 是必需流**，缺它整条巡航被 ESTOP 闸死。
+2. `auto_mission` mapping：`pause = (behavior.mode != "AUTO") || (health.overall_status == "CRITICAL")`（`auto_mission_node.cpp:1117`）→ 默认关闭 `health_monitor`。
+3. `/Odometry` 新鲜（`cruise_odom_timeout_`）：sil_bridge 用仿真真值发布（**与 `/localization/odom` 同一对象，保证航点反馈与定位严格同源**）。
+4. `/perception/fused_objects` 新鲜（`isPerceptionAlive()`，`cruiseControlStep`）：**感知子栈必须启动**。
+5. 航点非空：`startCruiseCallback` 热重载 `params_file` 里的 waypoints。**SIL 航点必须是 CARLA 场景坐标**（Town 地图与实车地图不匹配，这正是选 mapping cruise 而非 nav 的原因），用 `auto_params_file` 指向 SIL 专用 YAML。
+
+**时钟纪律**：SIL **固定墙钟**，故意不提供 `use_sim_time` 旋钮——链路里没有 `/clock` 发布者，置 true 会让所有节点定时器停摆（整栈静默不动且无报错）。sil_bridge 一律用**墙钟**打 stamp：CARLA 仿真经过秒不是 Unix epoch，当 stamp 会被 TF/消息滤波器判为远古消息全量丢弃。
+
+### 六、本版修掉的两个真实缺陷（由单测抓出，非格式问题）
+
+| 缺陷 | 后果 | 修复 |
+|------|------|------|
+| `StreamRateLimiter` 限频判定不留时间戳量级容差 | 生产用 `time.time()`（≈1.76e9），float64 在该量级表示误差达 ~4e-7s；`100.1-100.0=0.09999999999999432 < 0.1` → **恰好按标称周期到达的帧被误判"早到"丢弃**，上行 10Hz 配限频 10Hz 退化成约 5Hz，表现为感知输入莫名减半且**无任何报错** | 判据改 `(now-last) < interval - tol`，`tol = max(1e-9, abs(now)*1e-15)`；补 epoch 量级标称周期回归测试（并验证容差不会大到放行半周期内的帧） |
+| 进程退出未补零速 | 会话仍 active 时 `control_pending()` 为 False，`_flush_stop_zero()` 直接返回 → SIGINT / systemd 重启时仿真自车沿用末帧滑行 500ms（≈1.75m） | 新增 `SessionState.close()`（活跃则置停 + 欠一帧零速，与 stop 共用待办故幂等，未 boot 返回 False 不凭空产帧），`shutdown()` 先 `close()` 再 `_flush_stop_zero()`；补 3 条 close 单测 |
+
+另修正一处**无效旋钮**：`hunter_sil.launch.py` 曾声明 `use_sim_time` 却未接线（各节点硬编码 False），等于一个改了没反应的参数（flake8 F841）。本版移除该声明，改为在 docstring 与节点处写明"SIL 不变量：固定墙钟"。
+
+### 七、验证
+
+1. **单测 103 项全绿**（`pytest test -q` → `103 passed`）：codec 30 + session 33 + node 40。节点层用 `sys.modules` 注入假 rclpy / ROS 消息 / confluent_kafka / hunter_kafka，**无需 ROS 环境即可在 CI 跑**。
+   - 假 ROS 消息用 **16 个显式类**复刻"未赋值字段默认 0.0 / 单位四元数"语义（自动补全的 `__getattr__` 替身会返回子对象而非 0.0，与真实 ROS 不符，曾掩盖 IMU 朝向 fallback 断言）。
+   - 覆盖：话题契约等于 `sensor_params.yaml`（含 RealSense **双层 namespace**）、QoS 分流、boot 绑定/异实例拒绝、空 payload 不刷看门狗、lidar Y 取反 + `point_step/row_step` 布局、depth 尺寸不符丢帧、IMU 无 ego 缓存时朝向单位四元数、`ego_state` 双 odom 同源、TF 接管、chassis 阿克曼反解与零速地板 0.5、**stamp 是墙钟而非 sim_ts**、单流异常隔离、控制不限幅不平滑、`seq` 严格递增、倒车负值、stop 恰好一帧零速、投递证实 `on_delivery`、事件受控词表 + 抑制期、shutdown 幂等。
+2. **flake8 exit=0**（与 HunterSim 同口径：`max-line-length=120` + 同一 `extend-ignore` 清单）。
+3. **纯逻辑模块无 ROS 依赖**：`codec.py` / `session.py` 可在 Windows 开发机直接单测，坐标反射与看门狗边界这两处最易错的逻辑不依赖实机。
+4. **mypy / ruff 复核**（Windows 开发机，借 HunterSim 解释器执行；本仓 `.venv` 只装了 ruff）：`mypy --ignore-missing-imports sil_bridge_agent` → `Success: no issues found in 4 source files`；`launch/` + `setup.py` 加 `--no-namespace-packages` → `Success`；`ruff check --select F821,F822,F823,F811,F841` → `All checks passed`。
+   - 据 mypy 修正一处**类型不变量表达**：`on_message` 的 `stream = envelope.get("stream")` 改 `cast(str, ...)`。`decode_envelope` 已在入口拒绝缺失/非字符串 `stream`（返回 `None` → `reject()`），但返回类型 `Optional[Dict[str, Any]]` 使检查器把 `.get()` 视为 `Any | None`，从而对 `limiter.allow(stream, now)` / `session.note_sensor(stream, now)` 误报 `arg-type`。**cast 只表达既有不变量、零运行时行为变化**；改后 103 单测 / flake8 / ruff / mypy 复跑全绿。
+   - 两项**环境假报，不改代码**：① 本机未装 ROS2 时本地 `launch/` 目录会遮蔽 ROS `launch` 包 → `Module "launch" has no attribute "LaunchDescription"`，加 `--no-namespace-packages` 即消失（Jetson 实机有 ROS，不受影响）；② 缺 `types-PyYAML` 桩包 → `import-untyped`，`--disable-error-code=import-untyped` 后**无任何其它错误**，证明没有真实类型问题被掩盖。
+   - 复跑须知：Windows GBK 本地编码下 mypy 读含中文注释的 `setup.cfg` 会抛 `UnicodeDecodeError`，须先置 `PYTHONUTF8=1`（环境问题，非代码缺陷）。
+
+### 八、部署与实机验收
+
+详见 `Deployment_Guide.md` §9（SIL 模式部署）与 `User_Manual.md` §11（SIL 操作与「车不动」排查）。要点：
+
+```bash
+# Jetson：编译 + 入口可执行位（Windows 侧 core.filemode=false，须显式记录 100755）
+colcon build --symlink-install --packages-select sil_bridge_agent hunter_bringup
+chmod +x src/hunter_agents/sil_bridge_agent/scripts/sil_bridge_node
+
+# 起 SIL 整栈（不启动真实传感器驱动/CAN/LIO）
+ros2 launch hunter_bringup hunter_sil.launch.py auto_params_file:=/etc/hunter/sil_waypoints.yaml
+
+# 仿真侧会话 boot 后启动巡航（无需先验地图）
+ros2 service call /auto_mission/start_mapping_cruise std_srvs/srv/Trigger
+```
+
+⚠ **实车模式严禁启用 `hunter_sil.launch.py` 与 `sil-bridge.service`**：会与真实传感器驱动/CAN 底盘抢同名话题形成双发布者。`sil-bridge.service` 默认**不 enable**，仅 SIL 联调时手工 start，联调结束必须 `stop` + `disable`。
+
+### 九、风险与待办
+
+1. **实机闭环尚未跑通**：本版完成代码、单测、编排与文档；Jetson ↔ Windows CARLA 的端到端联调（SCN-2056 动物横穿：感知检出 → 全栈制动/避让 → `/cmd_vel` 闭环 → 评估真实裁决 → 三方链路面板）标注为**待办**，需按 Deployment_Guide §9 验收剧本逐项执行。
+2. **带宽**：默认降采样压缩档（rgb 640 宽 JPEG@10fps、depth@10fps、lidar@10Hz、imu@50Hz、ego_state@20Hz）。Jetson 与仿真机跨网段时若上行不足，先降 `rgb_fps`/`lidar_fps`，**不要靠关看门狗掩盖断流**。
+3. **`battery_*` 是仿真占位**（48.0V / SOC 100%）：SIL 无电池模型，置 0 会让 `data_agent` 持续误报 `battery_low`/`battery_critical` 造成事件风暴。这是占位而非伪造实车测量——实车模式不启用本 Agent。
+4. **`enable_health_report` 默认 false**：`data_agent` 独占 health 1Hz 通道，避免双发布者；仅在"不带 data_agent 的独立 SIL bringup"时才置 true。
+5. **航点坐标**：SIL 专用 `auto_params_file` 需按 CARLA 场景手工标定，尚未提供自动生成工具。

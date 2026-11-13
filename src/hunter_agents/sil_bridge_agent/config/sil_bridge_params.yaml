@@ -1,0 +1,86 @@
+# sil_bridge_params.yaml — 真 SIL 桥接 Agent 参数（HunterEdge V0.1.38 / HunterSim V3.9.0）
+#
+# ⚠ 安全约定：本文件**不写任何凭据**。Broker / SCRAM 口令 / mTLS 证书路径统一来自
+#   /etc/hunter/kafka/kafka.properties（目录 0750 / properties 0640 / 私钥 0600，不入版本库）。
+#   sil_bridge_agent 与 remote_agent 同形态：独立进程内自建 ROS 节点，
+#   启动时按 --config / 本文件覆盖内置默认值（systemd 与 launch 均可运行）。
+#
+# 数据链路：
+#   CARLA 传感器 → HunterSim EdgeLinkRuntime → Kafka carla.{sim_id}.edge_sensor
+#     → 本 Agent → HunterEdge 真实输入话题 → 全栈（perception/decision_making/auto_mission）
+#     → /cmd_vel → 本 Agent → Kafka carla.{sim_id}.edge_control → 仿真自车
+#
+# ⚠ 话题名与 frame_id 全部取自 hunter_bringup/config/sensor_params.yaml，
+#   **不新增任何 ROS 接口**；改这里必须同步改 sensor_params.yaml 与 URDF。
+sil_bridge_agent:
+  ros__parameters:
+    vehicle_id: "HUNTER-001"                          # 留空或与接入包不一致时以 kafka.properties 为准
+    kafka_properties: "/etc/hunter/kafka/kafka.properties"
+    kafka_bundle_dir: "/etc/hunter/kafka"
+
+    # ── 会话与看门狗 ──
+    # sim_id_filter 非空 = 只接受该仿真实例的会话（多车/多实例共用 broker 时的隔离手段）；
+    # 留空 = 接受首个 session boot 帧并绑定其 sim_id。
+    sim_id_filter: ""
+    # 传感器断流阈值：与仿真端 EdgeLinkSettings.watchdog_ms 和车端 safety_guard
+    # scan_timeout/cmd_timeout(0.5s) 同口径。断流即停发 ROS 帧，让车端超时停车语义生效。
+    watchdog_ms: 500
+    sensor_topic_regex: "^carla\\..+\\.edge_sensor$"   # librdkafka：以 ^ 开头即正则订阅
+    consumer_group: "hunter-sil-bridge"
+
+    # ── ROS 话题映射（默认值 = sensor_params.yaml，禁止随意改名）──
+    lidar_topic: "/lidar_points"
+    lidar_frame: "rslidar"                            # URDF link + rslidar_sdk ros_frame_id
+    # ⚠ RealSense 节点名 /camera/camera 带双层 namespace，vision_perception 订阅的
+    #   正是下面这两个全名；写成 /camera/color/image_raw 会**静默无消费者**。
+    rgb_topic: "/camera/camera/color/image_raw"
+    depth_topic: "/camera/camera/depth/image_rect_raw"
+    camera_frame: "camera_color_optical_frame"
+    imu_topic: "/imu/data"
+    imu_frame: "imu"
+    chassis_topic: "/chassis/state"
+    odom_topic: "/localization/odom"
+    # auto_mission **mapping cruise 的巡航反馈源**（原 FAST-LIO2 /Odometry）。
+    # SIL 禁用 LIO 后由本 Agent 用仿真真值发布，保证航点反馈与定位严格同源。
+    lio_odom_topic: "/Odometry"
+    cmd_vel_topic: "/cmd_vel"
+    base_frame: "base_link"
+    odom_frame: "odom"
+    map_frame: "map"
+
+    # ── TF 接管 ──
+    # odom→base_link 原由 EKF publish_tf=true 发布；SIL 禁用 LIO/EKF 后必须由本 Agent 接管，
+    # 否则 pointcloud_to_laserscan / costmap 全部因缺 TF 丢帧。
+    publish_tf: true
+    # map→odom 恒等：SIL 真值世界系即 map 系，无全局重定位（NDT）。
+    # 缺这条会让 Nav2 的 map→base_link 查询链断裂。
+    publish_map_tf: true
+
+    # ── 各流 ROS 发布限频（保护 Jetson CPU；<=0 不限频）──
+    # 与仿真端上行限频相互独立：仿真端限的是**上行带宽**，这里限的是**车端发布/感知负载**。
+    lidar_fps: 10.0
+    rgb_fps: 10.0
+    depth_fps: 10.0
+    imu_fps: 50.0
+    ego_state_fps: 20.0
+
+    # ── 底盘反馈占位（SIL 无电池/电机模型）──
+    # ⚠ battery_soc 置 0 会让 data_agent 持续误报 battery_low/battery_critical（事件风暴），
+    #   故给满电标称值。这是**仿真占位**而非伪造实车测量——实车模式不启用本 Agent。
+    battery_voltage: 48.0
+    battery_soc: 100.0
+    battery_current: 0.0
+    battery_temperature: 25.0
+    # HUNTER-SE 轴距：与 safety_guard / auto_mission 的 wheelbase 一致，
+    # 用于把末帧 /cmd_vel 经阿克曼反解成 ChassisState.steering_angle（SIL 无真实转角反馈）。
+    wheelbase: 0.46
+
+    # ── 平台上报（现有契约通道）──
+    # carla.* 是 SIL 专用通道，不走 topic_name() 8 Topic 契约；
+    # 链路事件仍经 hunter.<vid>.event 上报，且只上报受控词表内类型（communication_loss=critical）。
+    enable_event_report: true
+    # data_agent 独占 health 1Hz 通道，默认关闭避免双发布者；
+    # 仅在「不带 data_agent 的独立 SIL bringup」时才置 true。
+    enable_health_report: false
+    health_interval_s: 1.0
+    stats_log_interval_s: 10.0
