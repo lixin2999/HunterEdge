@@ -75,7 +75,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, GroupAction,
-                            IncludeLaunchDescription, LogInfo)
+                            IncludeLaunchDescription, LogInfo, OpaqueFunction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -150,9 +150,20 @@ def generate_launch_description():
     description = _isolated(local_src('description.launch.py'))
 
     # ---- 2. SIL 桥接（替代传感器驱动 + CAN + LIO/EKF + 全局定位）----
-    sil_bridge = _isolated(
-        pkg_src('sil_bridge_agent', 'launch', 'sil_bridge.launch.py'),
-        launch_arguments={'params_file': LaunchConfiguration('sil_params_file')})
+    # 与 hunter_full.launch.py §6b 同一坑：GroupAction(scoped=True, forwarding=False)
+    # 建立空作用域后才对 launch_arguments 里的 LaunchConfiguration 求值，父作用域
+    # 的 sil_params_file 已被清空 → "launch configuration does not exist"。
+    # 故用 OpaqueFunction 在 execute 阶段（Declare 已完成）读父作用域的值，
+    # 再以字面量传入 _isolated，保留作用域隔离语义。
+    def _launch_sil_bridge(context, *args, **kwargs):
+        params_file = context.launch_configurations.get(
+            'sil_params_file',
+            os.path.join(sil_share, 'config', 'sil_bridge_params.yaml'))
+        return [_isolated(
+            pkg_src('sil_bridge_agent', 'launch', 'sil_bridge.launch.py'),
+            launch_arguments={'params_file': params_file})]
+
+    sil_bridge = OpaqueFunction(function=_launch_sil_bridge)
 
     # ---- 3. 点云 → 激光扫描（原只在 hunter_autonomous_nav 的 nav 分支）----
     # 参数与 nav 分支同源（range_min 0.70 / 1° 束 / transform_tolerance 0.3），

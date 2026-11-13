@@ -4961,4 +4961,64 @@ ros2 service call /auto_mission/start_mapping_cruise std_srvs/srv/Trigger
 2. **带宽**：默认降采样压缩档（rgb 640 宽 JPEG@10fps、depth@10fps、lidar@10Hz、imu@50Hz、ego_state@20Hz）。Jetson 与仿真机跨网段时若上行不足，先降 `rgb_fps`/`lidar_fps`，**不要靠关看门狗掩盖断流**。
 3. **`battery_*` 是仿真占位**（48.0V / SOC 100%）：SIL 无电池模型，置 0 会让 `data_agent` 持续误报 `battery_low`/`battery_critical` 造成事件风暴。这是占位而非伪造实车测量——实车模式不启用本 Agent。
 4. **`enable_health_report` 默认 false**：`data_agent` 独占 health 1Hz 通道，避免双发布者；仅在"不带 data_agent 的独立 SIL bringup"时才置 true。
-5. **航点坐标**：SIL 专用 `auto_params_file` 需按 CARLA 场景手工标定，尚未提供自动生成工具。
+5. **航点坐标**：SIL 专用 `auto_params_file` 需按 CARLA 场景手工标定，尚未提供自动生成工具。（**V0.1.39 已提供模板** `hunter_bringup/config/sil_waypoints.example.yaml`，见 V0.1.39 §四。）
+
+---
+
+## V0.1.39（Date：2026-11-13）
+
+**主题：SIL 实车首跑三处阻塞修复（V0.1.38 实机验收第一关）——`hunter_sil.launch.py` 因 `_isolated()` 作用域缺陷启动即抛 `sil_params_file does not exist`、`sil_bridge_node` 因 CRLF 行尾 `exit 127`、`sil_waypoints.yaml` 无模板可备航点恒为 0；配套 `.gitattributes` 行尾防复发 + 仓库首个 SIL 航点模板**
+
+### 一、背景（实机首跑现象）
+
+HUNTER-001 上执行 `ros2 launch hunter_bringup hunter_sil.launch.py auto_params_file:=/etc/hunter/sil_waypoints.yaml`，暴露三处单测/文档阶段不可见的问题——**全部在 SIL 启动链上，被测算法栈本身无恙**：
+
+1. 整栈抛 `Caught exception in launch: launch configuration 'sil_params_file' does not exist`，banner 打完即崩，一个节点都没起；
+2. 修掉①后 `sil_bridge_node-2: process has died [pid ..., exit code 127]`，且 `[sil_bridge_node-2] /usr/bin/env: 'python3\r': No such file or directory`——桥接死则 `/chassis/state`、`/Odometry`、`odom→base_link`/`map→odom` TF 全断，巡航门控链第 1、3 环必死；
+3. `[WARNING] Parameter file path is not a file: /etc/hunter/sil_waypoints.yaml` + `共加载 0 个航点`——即使①②修好，`start_mapping_cruise` 门控第 5 环（航点非空）也必失败，且该 WARNING 不报错、极易被忽略。
+
+### 二、修复①：`sil_params_file` does not exist（launch 作用域缺陷，同坑第二次复发）
+
+- **根因**：`hunter_sil.launch.py` §2 经 `_isolated()` 传 `launch_arguments={'params_file': LaunchConfiguration('sil_params_file')}`；`_isolated()` 用 `GroupAction(scoped=True, forwarding=False)` 包裹子 launch，执行时**先清空父作用域**、再在空作用域内求值 `launch_arguments`，父作用域里已 `DeclareLaunchArgument` 的参数也随之不存在。`use_*` 开关不触发是因为 `IfCondition` 在进作用域**前**求值；`auto_params_file` 用在顶层 Node 不受影响。
+- **复发背景**：相机驱动（V0.0.95）已踩过同根因坑并在 `hunter_full.launch.py` §6b 写下判例与注释（"_isolated() 的 GroupAction(forwarding=False) 会清空父作用域，故此处只能用字面量"），SIL 新编排未沿用判例——**教训升级：凡经 `_isolated()` 向子 launch 传父级参数，必须 OpaqueFunction+字面量，禁止直传 `LaunchConfiguration`**。
+- **修复**：照 §6b 判例改 `OpaqueFunction(function=_launch_sil_bridge)`，execute 阶段（全部 Declare 已完成）读 `context.launch_configurations` 的 `sil_params_file`，以**字面量**传入 `_isolated()`；作用域隔离语义不变、零行为差异。实车验证：整栈正常拉起且 `--config` 正确落到 `sil_bridge_params.yaml`。
+
+### 三、修复②：入口脚本 CRLF 行尾 → exit 127
+
+- **根因**：`scripts/sil_bridge_node`（36 处 CRLF）与 `scripts/sil-bridge.service` 系 Windows 开发机新建文件落成全 CRLF。Linux 内核按字节读 shebang，`#!/usr/bin/env python3\r\n` 被解析成程序名 `python3\r` → 找不到解释器 → **127**。全仓扫描：其余四个无扩展名入口（remote/command/ota/vehicle_ingest 的 `*_node`）均为 0 CR，佐证"只有 Windows 新建文件中招"——V0.1.38 新增包时未做行尾自检。
+- **排障口径扩展**：V0.1.08「127 先查路径」仍然成立，本版补充第二含义——**路径存在仍 127 时查解释器/行尾**：`head -1 <脚本> | cat -A`，行尾出现 `^M$` 即 CRLF（`file <脚本>` 报 "with CRLF line terminators" 同判）。
+- **修复**：PowerShell 字节级（ReadAllBytes/WriteAllBytes）去 CR，UTF-8 中文注释零改动；**防复发**：仓库根新增 `.gitattributes`，强制 `**/scripts/*_node`、`*.service`、`*.sh` 为 `text eol=lf`（Windows 侧 checkout 同样受控）。老 checkout 现场救急：`sed -i 's/\r$//' <脚本>`。
+
+### 四、修复③（新增）：SIL 航点模板 `hunter_bringup/config/sil_waypoints.example.yaml`
+
+- V0.1.38 §九-5 与 Deployment_Guide §9.3 都只写"需按 CARLA 场景手工标定"，连模板都没有；现场需手书整份 ROS 参数 YAML，且文件缺失只 WARN 不报错，属"静默失败"。
+- 模板要点：标准 `auto_mission_node: ros__parameters:` 层级（launch 启动作参数文件读入、`start_mapping_cruise` 从同一文件热重载 `waypoints`）；**11 项巡航参数与 `autonomous_nav_params.yaml` 逐项同源**（SIL 结论可迁移实车）；`waypoints` 为 Town10HD **占位坐标**，头部注释写明获取方式（HunterSim boot 帧 spawn transform / `carla` API `map.get_waypoint()` 采样）与三条约束（首点距出生位姿 >0.30m、相邻间距 ≥2m、取在可行车道中心）。部署：`sudo cp` 到 `/etc/hunter/sil_waypoints.yaml` 后按实际场景标定。
+
+### 五、验证
+
+- `python -m py_compile hunter_sil.launch.py` 通过；实车 launch sil_bridge 命令行 `--config .../sil_bridge_params.yaml` 传参正确（修复①生效）；
+- 行尾复核：`sil_bridge_node` CR 36→0、`sil-bridge.service` CR 36→0，转换后内容逐行核对无损（中文注释、缩进、`#!/usr/bin/env python3` 完好）；
+- 模板与 `autonomous_nav_params.yaml` 的 `waypoints` 字符串列表契约（`"x,y,yaw_rad,label"`）逐字段兼容；巡航参数段与实车同源复核 11/11。
+
+### 六、部署（Jetson，存量实车）
+
+```bash
+cd ~/HunterEdge
+# A) 快速止血（不等同步）：去 CR + 重编两个包
+sed -i 's/\r$//' src/hunter_agents/sil_bridge_agent/scripts/sil_bridge_node \
+                  src/hunter_agents/sil_bridge_agent/scripts/sil-bridge.service
+colcon build --symlink-install --packages-select sil_bridge_agent hunter_bringup
+# B) 或直接同步 V0.1.39 仓库（含 .gitattributes 防复发）后同样重编两包
+
+# 共同：航点模板落地并按实际 CARLA 场景标定
+sudo mkdir -p /etc/hunter
+sudo cp src/hunter_bringup/config/sil_waypoints.example.yaml /etc/hunter/sil_waypoints.yaml
+sudo nano /etc/hunter/sil_waypoints.yaml
+```
+
+验收判据：起栈不再出现 `does not exist` / `exit code 127` / `Parameter file path is not a file` 三项；`ros2 topic hz /chassis/state /Odometry` 非零；`/planning/behavior_state` 稳定 AUTO；`start_mapping_cruise` 返回 `success: true` 且日志航点数 >0。注意 V0.1.38 遗留待办（§九-1 端到端联调）仍在推进中，本版只打通启动链。
+
+### 七、文档同步与版本号规范（自本版起生效）
+
+- 文档同步：`README.md` V2.29（§15.9 快速验证补航点模板与行尾自检）、`User_Manual.md` V2.29（§11.2 启动前检查④、§11.4 排查清单新增第 0 步"起栈自检"）、`Deployment_Guide.md` V2.29（§9.2 行尾陷阱、§9.3 模板步骤、§9.4/§9.7 对应更新）。
+- **版本号规范**：今后每次功能开发或问题修复，release.md **追加新条目**；功能新增或变更 → **次版本号（第二个数字）递增**；问题修复或功能完善 → **修订号（第三个数字）递增**。本版为纯修复+配套完善，V0.1.38→V0.1.39。

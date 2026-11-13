@@ -1,0 +1,42 @@
+# sil_waypoints.example.yaml — SIL 模式 auto_mission 参数模板（V0.1.38）
+#
+# 用途：hunter_sil.launch.py 的 auto_params_file 指向的本文件副本。
+#   sudo mkdir -p /etc/hunter
+#   sudo cp <本文件> /etc/hunter/sil_waypoints.yaml   # 再按下面说明改坐标
+#   ros2 launch hunter_bringup hunter_sil.launch.py auto_params_file:=/etc/hunter/sil_waypoints.yaml
+#
+# ⚠ 航点必须是 **CARLA 场景坐标**（Town 地图世界系，与自车 /Odometry 真值同源），
+#   不是实车地图坐标——SIL 走 mapping cruise、无先验地图、无 NDT，用实车坐标
+#   会让车朝场景外/建筑物里走。获取方式（任选其一）：
+#     1) HunterSim 会话 boot 帧里自车 spawn transform（x, y, yaw）为原点参照，
+#        沿车道中心线前向取点；CARLA Viewer 直接读目标点坐标；
+#     2) carla Python API：map.get_waypoint() 沿路由采样，转成 "x,y,yaw,label"。
+# ⚠ 以下坐标是**占位示例**（假设自车在 Town10HD spawn ≈(-10.2, -118.0)附近），
+#   换地图/换出生点必须整体重标。
+# ⚠ 航点约束（同实车，违反应急停/FAULT）：
+#   ① 首个航点距自车出生位姿 >0.30m（全部重合 → FAULT 锁存）；
+#   ② 相邻航点间距 ≥2m（避免"已到达"预检误跳过）；
+#   ③ 取点须在可行车道中心、远离建筑/路缘（仿真无代价地图预检，撞上才知）。
+#
+# 巡航参数与 autonomous_nav_params.yaml 同源（保证 SIL 结论可迁移到实车）；
+# mission_mode / params_file 等由 launch 注入，此处无需重复。
+auto_mission_node:
+  ros__parameters:
+    cruise_max_speed: 0.1            # 首跑安全临时值（≈慢步速），确认平稳后逐步回调 0.5 → 1.0
+    cruise_turn_speed: 0.4           # 航向偏差 > cruise_yaw_slow_deg 时的限速（m/s）
+    cruise_min_speed: 0.05           # 接近航点减速下限（m/s）
+    cruise_reach_dist: 0.6           # 到达判定距离（m）
+    cruise_brake_dist: 2.0           # 开始线性减速的距离（m）
+    cruise_kp_yaw: 1.2               # 航向 P 增益
+    cruise_max_yaw_rate: 0.5         # 最大角速度（rad/s）
+    cruise_yaw_slow_deg: 45.0        # 航向偏差超过此角度降速（度）
+    cruise_min_turn_radius: 1.9      # HUNTER-SE 最小转弯半径（m）
+    cruise_cmd_rate: 20.0            # /cmd_vel 发布频率（Hz）
+    cruise_odom_timeout: 1.0         # /Odometry 超时（s），超时停车等待
+
+    # 格式："x,y,yaw_rad,label"（yaw：0=+X 方向，逆时针为正，单位弧度；label 不含逗号）
+    waypoints:
+      - "-2.2,-118.0,0.0,检查点A"
+      - "6.0,-118.0,0.0,检查点B"
+      - "6.0,-110.4,1.5708,检查点C"
+      - "-2.2,-110.4,3.1416,检查点D"
