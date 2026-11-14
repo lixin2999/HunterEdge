@@ -5062,3 +5062,13 @@ cd ~/HunterEdge && colcon build --symlink-install --packages-select sil_bridge_a
 
 ### 七、文档同步
 三册升 V2.30（基线 V0.2.0）：`README.md` §15 新增分地图航点小节；`User_Manual.md` §11.2/§11.4 航点步骤改为 `.d` 目录形态；`Deployment_Guide.md` §9.3 生成/部署步骤、§9.4 参数表补两参、头部变化记录。
+
+---
+
+## V0.2.1（Date：2026-11-14）
+**修复 V0.2.0 生成器首次实机运行报错：`AttributeError: 'World' object has no attribute 'get_client'`**
+
+- 现象：仿真机 `python gen_sil_waypoints.py --maps all --out-dir ./sil_waypoints.d` 连上 server、`get_available_maps()` 与地图筛选均正常，在最后打印版本行时抛 `AttributeError`（CARLA Python API 中 `get_client()` 在 `Client` 上、`World` 没有此方法）。
+- 修复：版本改取 `client.get_service_version()`；连通性验证保留 `client.get_world()` 调用但不另存对象；逐处复核生成器其余 CARLA API（`load_world`/`get_spawn_points`/`Transform.location·rotation`）均存在且用法正确。纯 `main()` 路径改动，不改产物格式与命名契约。
+- 验证：`py_compile` 通过；`pytest src/hunter_agents/sil_bridge_agent/test` **117 项全绿**。待用户在 CARLA 机重跑生成器产出 `sil_waypoints.d/` 并部署（V0.2.0 §六 步骤不变）。
+- 文档同步：三册横幅升 V2.31（基线 V0.2.1），无章节级变化（修复不涉及部署/操作口径）。

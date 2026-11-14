@@ -189,7 +189,7 @@ def main() -> int:
     try:
         client = carla.Client(args.host, args.port)
         client.set_timeout(15.0)
-        world = client.get_world()
+        client.get_world()          # 连通性验证（World 对象无 get_client，版本取 client 侧）
     except Exception as exc:  # noqa: BLE001
         print("[ERROR] 连不上 CARLA %s:%s ——%s" % (args.host, args.port, exc),
               file=sys.stderr)
@@ -207,7 +207,7 @@ def main() -> int:
         print("[ERROR] 没有可生成的地图", file=sys.stderr)
         return 2
 
-    print("CARLA %s | 目标地图：%s" % (world.get_client().get_version(), ", ".join(want)))
+    print("CARLA %s | 目标地图：%s" % (client.get_service_version(), ", ".join(want)))
     n = generate(client, want, args.count, args.min_gap, args.out_dir)
     print("完成：%d/%d 个文件 → %s" % (n, len(want), args.out_dir))
     print("下一步：整个目录部署到 Jetson /etc/hunter/sil_waypoints.d/（scp -r 即可）")
