@@ -42,6 +42,7 @@ import datetime
 import math
 import os
 import sys
+import time
 from typing import Any, List, Optional
 
 # ─── 坐标转换：优先复用 codec（唯一事实源），独立运行时用同式回退 ───────────
@@ -125,39 +126,78 @@ def render_yaml(map_name: str, transforms: List[Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _load_world(client: Any, name: str, retries: int = 1,
+                pause_s: float = 15.0) -> None:
+    """带重试的 load_world：超大图（Town12/13/15）或 server 边下载资源边加载时，
+    RPC 超时时 server 往往仍在后台加载——等一会先复查当前图，已经切到位就不重发。"""
+    for attempt in range(retries + 1):
+        try:
+            client.load_world(name)
+            return
+        except RuntimeError as exc:
+            if attempt >= retries:
+                raise
+            print("  [WARN] 加载 %s 超时（%s），等 %.0fs 后复查/重试"
+                  "（server 可能仍在后台加载）…" % (name, exc, pause_s))
+            time.sleep(pause_s)
+            try:  # 超时≠失败：先确认是否其实已经切到位
+                if client.get_world().get_map().name.rsplit("/", 1)[-1] == name:
+                    print("  [OK] %s 实际已加载完成，继续" % name)
+                    return
+            except RuntimeError:
+                pass  # 还在忙，下一轮重试 load 兜着
+
+
 def generate(client: Any, maps: List[str], count: int, min_gap: float,
-             out_dir: str) -> int:
-    """逐图 load_world → 筛点 → 写文件；返回成功生成的文件数。"""
+             out_dir: str, load_retries: int = 1,
+             load_pause_s: float = 15.0) -> int:
+    """逐图 load_world → 筛点 → 写文件；单图失败只跳过不中断整批。
+
+    返回成功生成的文件数。"""
     os.makedirs(out_dir, exist_ok=True)
     original = client.get_world().get_map().name.rsplit("/", 1)[-1]
     written = 0
+    failed: List[str] = []
     try:
         for name in maps:
-            loaded = client.get_world().get_map().name.rsplit("/", 1)[-1]
-            if loaded != name:
-                print("  切换地图 %s → %s（读取出生点需先加载）" % (loaded, name))
-                client.load_world(name)
-            spawns = client.get_world().get_map().get_spawn_points()
-            chosen = select_spawn_points(spawns, count, min_gap)
-            if not chosen:
-                print("  [WARN] %s 筛不出任何航点（count=%d min-gap=%.1f 过严），跳过"
-                      % (name, count, min_gap))
-                continue
-            if len(chosen) < min(count, 2):
-                print("  [WARN] %s 仅筛出 %d 个航点（min-gap=%.1fm 过大或出生点稀疏）"
-                      % (name, len(chosen), min_gap))
-            path = os.path.join(out_dir, "sil_waypoints_%s.yaml" % name)
-            with open(path, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(render_yaml(name, chosen))
-            written += 1
-            print("  [OK] %-10s %2d 航点 → %s" % (name, len(chosen), path))
+            try:
+                loaded = client.get_world().get_map().name.rsplit("/", 1)[-1]
+                if loaded != name:
+                    print("  切换地图 %s → %s（读取出生点需先加载）" % (loaded, name))
+                    _load_world(client, name, retries=load_retries,
+                                pause_s=load_pause_s)
+                spawns = client.get_world().get_map().get_spawn_points()
+                chosen = select_spawn_points(spawns, count, min_gap)
+                if not chosen:
+                    print("  [WARN] %s 筛不出任何航点（count=%d min-gap=%.1f 过严），跳过"
+                          % (name, count, min_gap))
+                    continue
+                if len(chosen) < min(count, 2):
+                    print("  [WARN] %s 仅筛出 %d 个航点（min-gap=%.1fm 过大或出生点稀疏）"
+                          % (name, len(chosen), min_gap))
+                path = os.path.join(out_dir, "sil_waypoints_%s.yaml" % name)
+                with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(render_yaml(name, chosen))
+                written += 1
+                print("  [OK] %-10s %2d 航点 → %s" % (name, len(chosen), path))
+            except Exception as exc:  # noqa: BLE001（单图任何失败不得中断整批）
+                failed.append(name)
+                print("  [FAIL] %s 生成失败，跳过继续下一图：%s" % (name, exc))
+        if failed:
+            print("[WARN] 失败地图：%s ——可单独重跑：--maps %s"
+                  % (", ".join(failed), " ".join(failed)))
     finally:
-        if original and client.get_world().get_map().name.rsplit("/", 1)[-1] != original:
+        try:
+            current = client.get_world().get_map().name.rsplit("/", 1)[-1]
+        except RuntimeError:
+            current = ""    # server 尚在原图后台加载：不催它，交给下面的 load 兜底
+        if original and current != original:
             print("  恢复运行前地图：%s" % original)
             try:
                 client.load_world(original)
             except Exception as exc:  # noqa: BLE001
-                print("  [WARN] 恢复地图失败（不影响已生成文件）：%s" % exc)
+                print("  [WARN] 恢复地图失败（不影响已生成文件），请在仿真机手动切回 %s：%s"
+                      % (original, exc))
     return written
 
 
@@ -194,6 +234,9 @@ def main() -> int:
                         help="航点最小两两间距（米，默认 20；须 ≥ auto_mission 的 2m 下限）")
     parser.add_argument("--out-dir", default="./sil_waypoints.d", dest="out_dir",
                         help="输出目录（部署到 Jetson /etc/hunter/sil_waypoints.d/）")
+    parser.add_argument("--timeout", type=float, default=60.0,
+                        help="RPC 超时（秒，默认 60；Town12/13/15 等超大图首次加载"
+                             "远慢于小图，15s 必超时）")
     args = parser.parse_args()
 
     if args.min_gap < 2.0:
@@ -208,7 +251,7 @@ def main() -> int:
 
     try:
         client = carla.Client(args.host, args.port)
-        client.set_timeout(15.0)
+        client.set_timeout(args.timeout)
         client.get_world()          # 连通性验证
     except Exception as exc:  # noqa: BLE001
         print("[ERROR] 连不上 CARLA %s:%s ——%s" % (args.host, args.port, exc),

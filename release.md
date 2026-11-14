@@ -5072,3 +5072,13 @@ cd ~/HunterEdge && colcon build --symlink-install --packages-select sil_bridge_a
 - 修复：新增 `_server_version(client)` 按**存在性探测**：`get_server_version`（0.9.16 实测在位）→ `get_service_version` → 旧版 `get_client().get_version()`，均取不到返回 "unknown" 仅降级展示、**不阻塞生成**。两次报错均发生在版本行本身，其后的生成主流程（`load_world`/`get_spawn_points`/`Transform`）按 0.9.16 官方 API 逐处静态复核均存在且用法正确，待实机重跑闭环。产物格式与命名契约不变，纯 `main()` 展示路径改动。
 - 验证：`py_compile` 通过；新增 `test_server_version_probe_across_carla_api_shapes`（三种 API 形态各断言），`pytest src/hunter_agents/sil_bridge_agent/test` **118 项全绿**（117→118）。待用户在 0.9.16 仿真机重跑生成器产出 `sil_waypoints.d/` 并部署（V0.2.0 §六 步骤不变）。
 - 文档同步：三册横幅升 V2.31（基线 V0.2.1），无章节级变化（修复不涉及部署/操作口径）。
+
+---
+
+## V0.2.2（Date：2026-11-14）
+**修复 V0.2.1 生成器实机二跑：超大图 load_world 超时掀翻整批（0.9.16 实测：12 图清单中前 10 图成功后 Town12 超时崩溃，Town15 未获执行）**
+
+- 现象：版本行已正常（`CARLA 35e2d5a`），Town01~Town11 共 10 图成功产出；切到 **Town12** 时 `load_world` 抛 `RuntimeError: time-out of 15000ms`——① 固定 RPC 超时 15s 对 Town12/15 等超大图（且 server 当时还在边下载 Town10HD 资源）不够；② 单图异常直接穿透 `generate()` 掀翻整批：已写盘的 10 个文件保留，但排在其后的 Town15 不再执行，退出码还呈崩溃态。
+- 修复（均在 `gen_sil_waypoints.py`，产物格式/命名契约不变）：① 新增 `--timeout` 参数（默认 **60s**）取代硬编码 15s；② 新增 `_load_world()`：超时重试 1 次，且重试前先复查当前图——**RPC 超时≠加载失败**，server 往往稍后自行加载完成，已切到位则直接继续不重发；③ 逐图 try/except：**单图失败只 `[FAIL]` 跳过**，其余图照常，末尾提示失败图可 `--maps Town12 Town15` 单独重跑；④ `finally` 恢复原图段同样加固（复查当前图异常不再穿透，恢复失败提示手动切回）。
+- 验证：`py_compile` 通过；新增 2 项回归（单图超时不中断整批且照常恢复原图；超时但后台已加载完成→复查命中不重发），`pytest src/hunter_agents/sil_bridge_agent/test` **120 项全绿**（118→120）。待用户重跑：已生成的 10 个文件会被同名覆盖（无副作用），可整批 `--maps all`，也可只补失败图 `--maps Town12 Town15`（可再配 `--timeout 120`）。
+- 文档同步：三册横幅升 V2.32（基线 V0.2.2），无章节级变化。

@@ -167,6 +167,60 @@ def test_generate_skips_map_with_no_selectable_points() -> None:
         assert client.loaded == []                            # 本来就是当前图，不切
 
 
+def test_generate_survives_single_map_load_timeout() -> None:
+    """实机教训（V0.2.2）：Town12 超大图 load_world 超时曾掀翻整批——
+    单图失败必须只跳过，其余图继续、原图照常恢复。"""
+    import tempfile
+    spawns = [_TF(x * 50.0, 10.0, 0.0) for x in range(6)]
+    maps = {"Town01": _Map("Town01", spawns),
+            "Town12": _Map("Town12", spawns),
+            "Town02": _Map("Town02", spawns)}
+
+    class _Flaky(_Client):
+        def load_world(self, name):
+            if name == "Town12":
+                self.loaded.append(name)
+                raise RuntimeError("time-out of 15000ms while waiting for the simulator")
+            return super().load_world(name)
+
+    client = _Flaky(maps, initial="Town01")
+    with tempfile.TemporaryDirectory() as td:
+        n = gwp.generate(client, ["Town12", "Town02"], count=4, min_gap=20.0,
+                         out_dir=td, load_pause_s=0.0)
+        assert n == 1                                         # Town12 不搅局，Town02 照常产出
+        assert os.path.isfile(os.path.join(td, "sil_waypoints_Town02.yaml"))
+        assert not os.path.exists(os.path.join(td, "sil_waypoints_Town12.yaml"))
+        assert client.loaded.count("Town12") == 2             # 首次 + 重试一次
+        assert client.loaded[-1] == "Town01"                  # 恢复原图
+
+
+def test_load_world_recovers_when_bg_load_finished() -> None:
+    """超时≠失败：RPC 超时时 server 可能已在后台加载完成——复查到即继续，不重发。"""
+    import tempfile
+    spawns = [_TF(x * 50.0, 10.0, 0.0) for x in range(6)]
+    maps = {"Town01": _Map("Town01", spawns), "Town12": _Map("Town12", spawns)}
+
+    class _SlowBg(_Client):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._bg_done = set()
+
+        def load_world(self, name):
+            self.loaded.append(name)
+            self.current = name                   # 后台实际加载成功
+            if name == "Town12" and name not in self._bg_done:
+                self._bg_done.add(name)
+                raise RuntimeError("time-out while waiting for the simulator")
+
+    client = _SlowBg(maps, initial="Town01")
+    with tempfile.TemporaryDirectory() as td:
+        n = gwp.generate(client, ["Town12"], count=4, min_gap=20.0,
+                         out_dir=td, load_pause_s=0.0)
+        assert n == 1                             # 复查命中，不算失败
+        assert os.path.isfile(os.path.join(td, "sil_waypoints_Town12.yaml"))
+        assert client.loaded == ["Town12", "Town01"]  # 不重发 Town12，仅恢复原图
+
+
 def test_server_version_probe_across_carla_api_shapes() -> None:
     """版本字符串按 API 存在性探测（0.9.16 实测只有 get_server_version）。"""
     class _Modern:                       # CARLA 0.9.16
