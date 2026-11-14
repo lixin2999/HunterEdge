@@ -1,16 +1,25 @@
-# sil_waypoints.example.yaml — SIL 模式 auto_mission 参数模板（V0.1.38）
+# sil_waypoints.example.yaml — SIL 模式 auto_mission 参数模板（V0.1.38，手工兜底用）
 #
-# 用途：hunter_sil.launch.py 的 auto_params_file 指向的本文件副本。
+# ★ V0.2.0 起首选方案不是本模板，而是分地图自动生成 + boot 自动装载：
+#   仿真机跑 sil_bridge_agent/tools/gen_sil_waypoints.py 产出 sil_waypoints.d/ 后
+#   部署到 /etc/hunter/sil_waypoints.d/，桥接按 boot 帧 map_id 自动写活动文件
+#   （README §15.10）。本模板仅用于未部署该目录的单图快速验证。
+#
+# 用途：hunter_sil.launch.py 的 auto_params_file（V0.2.0 起默认即
+#   /etc/hunter/sil_waypoints.yaml，可不带参数）指向的本文件副本。
 #   sudo mkdir -p /etc/hunter
 #   sudo cp <本文件> /etc/hunter/sil_waypoints.yaml   # 再按下面说明改坐标
-#   ros2 launch hunter_bringup hunter_sil.launch.py auto_params_file:=/etc/hunter/sil_waypoints.yaml
+#   ros2 launch hunter_bringup hunter_sil.launch.py
 #
 # ⚠ 航点必须是 **CARLA 场景坐标**（Town 地图世界系，与自车 /Odometry 真值同源），
 #   不是实车地图坐标——SIL 走 mapping cruise、无先验地图、无 NDT，用实车坐标
 #   会让车朝场景外/建筑物里走。获取方式（任选其一）：
 #     1) HunterSim 会话 boot 帧里自车 spawn transform（x, y, yaw）为原点参照，
 #        沿车道中心线前向取点；CARLA Viewer 直接读目标点坐标；
-#     2) carla Python API：map.get_waypoint() 沿路由采样，转成 "x,y,yaw,label"。
+#     2) carla Python API：map.get_waypoint() 沿路由采样。
+#   ⚠ 两条方式拿到的都是 **CARLA 原始坐标**，写入前必须转 ROS 侧（与桥接
+#     /Odometry 真值同系）：x_ros=x、y_ros=-y、yaw_ros=-yaw_carla；
+#     gen_sil_waypoints.py 已自动完成该翻系，手工改时切勿遗漏。
 # ⚠ 以下坐标是**占位示例**（假设自车在 Town10HD spawn ≈(-10.2, -118.0)附近），
 #   换地图/换出生点必须整体重标。
 # ⚠ 航点约束（同实车，违反应急停/FAULT）：

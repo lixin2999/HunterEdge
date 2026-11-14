@@ -1,4 +1,4 @@
-# sil_bridge_params.yaml — 真 SIL 桥接 Agent 参数（HunterEdge V0.1.38 / HunterSim V3.9.0）
+# sil_bridge_params.yaml — 真 SIL 桥接 Agent 参数（HunterEdge V0.2.0 / HunterSim V3.9.0）
 #
 # ⚠ 安全约定：本文件**不写任何凭据**。Broker / SCRAM 口令 / mTLS 证书路径统一来自
 #   /etc/hunter/kafka/kafka.properties（目录 0750 / properties 0640 / 私钥 0600，不入版本库）。
@@ -22,6 +22,15 @@ sil_bridge_agent:
     # sim_id_filter 非空 = 只接受该仿真实例的会话（多车/多实例共用 broker 时的隔离手段）；
     # 留空 = 接受首个 session boot 帧并绑定其 sim_id。
     sim_id_filter: ""
+    # ── 按地图自动装载航点（V0.2.0）──
+    # boot 帧 map_id → 把 waypoints_map_dir 下的 sil_waypoints_<map_id>.yaml 覆盖到
+    # waypoints_active_file；auto_mission 在 start_mapping_cruise 时热重载该文件，
+    # 所以**换仿真地图后必须重新发起巡航**才装载新航点。
+    # 分地图文件由仿真机 tools/gen_sil_waypoints.py 批量生成（部署文档 §9.3）。
+    # 置空任一项 = 关闭本机制，活动文件完全手工维护（内置裸默认即为关闭）。
+    # ⚠ active 路径必须与 hunter_sil.launch.py 的 auto_params_file 一致。
+    waypoints_map_dir: "/etc/hunter/sil_waypoints.d"
+    waypoints_active_file: "/etc/hunter/sil_waypoints.yaml"
     # 传感器断流阈值：与仿真端 EdgeLinkSettings.watchdog_ms 和车端 safety_guard
     # scan_timeout/cmd_timeout(0.5s) 同口径。断流即停发 ROS 帧，让车端超时停车语义生效。
     watchdog_ms: 500

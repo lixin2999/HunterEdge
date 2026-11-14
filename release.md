@@ -5022,3 +5022,43 @@ sudo nano /etc/hunter/sil_waypoints.yaml
 
 - 文档同步：`README.md` V2.29（§15.9 快速验证补航点模板与行尾自检）、`User_Manual.md` V2.29（§11.2 启动前检查④、§11.4 排查清单新增第 0 步"起栈自检"）、`Deployment_Guide.md` V2.29（§9.2 行尾陷阱、§9.3 模板步骤、§9.4/§9.7 对应更新）。
 - **版本号规范**：今后每次功能开发或问题修复，release.md **追加新条目**；功能新增或变更 → **次版本号（第二个数字）递增**；问题修复或功能完善 → **修订号（第三个数字）递增**。本版为纯修复+配套完善，V0.1.38→V0.1.39。
+
+---
+
+## V0.2.0（Date：2026-11-13）
+**SIL 航点体系升级：CARLA 内置地图航点批量生成器 + 仿真会话 boot 按地图自动装载**（`sil_bridge_agent` tools/运行时、`hunter_bringup` launch 默认值；对应三册文档 V2.30）
+
+### 一、背景与需求
+V0.1.39 打通启动链后，SIL 航点仍是**单一手工维护的活动文件**：换仿真地图就要手改坐标。需求两条：① 给出 CARLA 内置地图（Town01~Town15）各自可用航点并落入 `sil_waypoints.yaml` 体系；② SIL 仿真时按场景实际加载的地图自动选用对应航点。技术事实：各 Town 坐标**没有可信静态表**（不同 CARLA 版本地图集合与坐标都可能变），唯一正确来源是运行中 server 的 `map.get_spawn_points()`（出生点全部位于可行车道，天然满足 auto_mission 的 ≥2m 间距与可直达约束）——因此需求①的正确交付形态是**仿真侧一次性生成器**，而非硬编码坐标表。
+
+### 二、新增⍠1：分地图航点生成器（CARLA 仿真机运行）
+`src/hunter_agents/sil_bridge_agent/tools/gen_sil_waypoints.py`：
+- 用法：`python gen_sil_waypoints.py --maps all --out-dir ./sil_waypoints.d`（需 `pip install carla` 与 server 同版本；也可 `--maps Town03 Town10HD` 指定；`--count` 默认 8、`--min-gap` 默认 20m 且拒绝 <2m）；
+- 逐图 `load_world` → 出生点池贪心筛选（两两间距 ≥ min-gap）→ 写 `sil_waypoints_<Map>.yaml`（auto_mission ROS 参数契约，11 项巡航参数与模板同源）；结束**恢复运行前地图**（不在进行中会话的 server 上跑，见头部警告）；
+- **坐标系纪律**：输出为 ROS 侧坐标（`x_ros=x`、`y_ros=-y`、`yaw_ros=-yaw_carla`），与桥接发布 `/Odometry` 真值同源；转换实现优先复用 `sil_bridge_agent.codec`，仿真机无该包时用内置同式回退，单测断言两者逐点一致（防双实现漂移一个符号整套航点作废）。
+
+### 三、新增⍠2：boot 按地图自动装载航点（车端）
+`sil_bridge_agent` 新参数 `waypoints_map_dir` / `waypoints_active_file`（两份标准参数 YAML 均已配好：`/etc/hunter/sil_waypoints.d` → `/etc/hunter/sil_waypoints.yaml`；**内置裸默认关闭**，裸默认不得碰 /etc 真实文件）：
+- session boot 帧已携 `map_id`（V0.1.38 契约既有字段），`_apply_map_waypoints` 把 dir 下 `sil_waypoints_<map_id>.yaml` 覆盖到活动文件；`start_mapping_cruise` 热重载自然拿到新航点——**时序契约：换地图后必须重新发起巡航**；
+- 防御语义：该图无文件/无 map_id/拷贝异常 → 只 WARN 沿用现有活动文件，链路与会话不受影响；置空任一项即关闭（回到 V0.1.39 手工行为）。
+
+### 四、配套调整
+`hunter_sil.launch.py`：`auto_params_file` 默认值由实车参数 `autonomous_nav_params.yaml`（SIL 下坐标体系错误且需命令行手工覆盖）改为 `/etc/hunter/sil_waypoints.yaml`，与桥接 `waypoints_active_file` 同源——部署 `.d` 目录后**裸命令起栈即全自动**，无需手工指定航点文件。
+
+### 五、验证
+`pytest src/hunter_agents/sil_bridge_agent/test` 全绿 **103→117**：新增生成器 9 项（转换≡codec 逐点一致、贪心间距/计数/空池、YAML 契约与翻系断言、假 client 全流程含恢复地图）与节点 5 项（关闭不碰文件、命中拷贝、缺文件/无 map_id 沿用、拷贝异常不炸会话）；`py_compile` 三改动文件通过；参数 YAML 解析验证。
+
+### 六、部署与验收
+```bash
+# 仿真机（Windows，CARLA server 运行中，不在进行 SIL 会话时）：
+python gen_sil_waypoints.py --maps all --out-dir ./sil_waypoints.d
+# 整个目录上 Jetson：
+scp -r sil_waypoints.d hunter@<jetson>:/tmp/ && ssh hunter@<jetson> \
+  'sudo mkdir -p /etc/hunter && sudo rm -rf /etc/hunter/sil_waypoints.d && sudo mv /tmp/sil_waypoints.d /etc/hunter/'
+# Jetson 重编（两包都动：ament_cmake 复制安装 + 桥接代码）：
+cd ~/HunterEdge && colcon build --symlink-install --packages-select sil_bridge_agent hunter_bringup
+```
+验收：起栈不带参数；仿真 boot Town0X 后日志出现「地图 Town0X 航点已装载」且 `/etc/hunter/sil_waypoints.yaml` mtime 更新；`start_mapping_cruise` 返回 success 且航点数 >0；换图会话重新 boot 后**重新发起巡航**即切新一套航点，无需改任何文件。
+
+### 七、文档同步
+三册升 V2.30（基线 V0.2.0）：`README.md` §15 新增分地图航点小节；`User_Manual.md` §11.2/§11.4 航点步骤改为 `.d` 目录形态；`Deployment_Guide.md` §9.3 生成/部署步骤、§9.4 参数表补两参、头部变化记录。

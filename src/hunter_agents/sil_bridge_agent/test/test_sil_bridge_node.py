@@ -875,6 +875,89 @@ def test_report_health_payload_when_enabled() -> None:
 
 
 # ---------------------------------------------------------------------------
+# boot 按地图装载航点（V0.2.0：map_id → sil_waypoints_<map>.yaml → 活动文件）
+# ---------------------------------------------------------------------------
+def _boot_map(agent, map_id):
+    agent.on_message(_env("session", b"", {"phase": "boot", "sim_id": SIM,
+                                           "scene_id": "SCN-2056",
+                                           "map_id": map_id}), TOPIC)
+
+
+def _wp_agent(tmpdir, map_dir="", active=""):
+    target = os.path.join(tmpdir, active) if active else ""
+    return _agent(waypoints_map_dir=map_dir, waypoints_active_file=target), target
+
+
+def _write(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def _read(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_boot_waypoints_auto_load_disabled_by_default() -> None:
+    """dir/active 置空 = 关闭机制，不得碰任何文件（V0.1.39 行为）。"""
+    with tempfile.TemporaryDirectory() as td:
+        target = os.path.join(td, "active.yaml")
+        agent = _agent(waypoints_map_dir="", waypoints_active_file=target)
+        _boot_map(agent, "Town03")
+        assert not os.path.exists(target)
+        assert agent.session.active is True            # 关闭机制不影响会话本身
+
+
+def test_boot_copies_matching_map_waypoints() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        wp_dir = os.path.join(td, "sil_waypoints.d")
+        os.makedirs(wp_dir)
+        _write(os.path.join(wp_dir, "sil_waypoints_Town03.yaml"), "T3\n")
+        agent, target = _wp_agent(td, map_dir=wp_dir, active="active.yaml")
+        _write(target, "old\n")
+        _boot(agent)                                   # 预置 boot 帧 map_id=Town03
+        assert _read(target) == "T3\n"
+
+
+def test_boot_missing_map_file_keeps_active_file() -> None:
+    """该地图没生成过航点：只 WARN，沿用现有活动文件，链路不受影响。"""
+    with tempfile.TemporaryDirectory() as td:
+        wp_dir = os.path.join(td, "sil_waypoints.d")
+        os.makedirs(wp_dir)
+        _write(os.path.join(wp_dir, "sil_waypoints_Town05.yaml"), "T5\n")
+        agent, target = _wp_agent(td, map_dir=wp_dir, active="active.yaml")
+        _write(target, "old\n")
+        _boot_map(agent, "Town03")
+        assert _read(target) == "old\n"
+        assert agent.session.active is True
+
+
+def test_boot_without_map_id_keeps_active_file() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        wp_dir = os.path.join(td, "sil_waypoints.d")
+        os.makedirs(wp_dir)
+        _write(os.path.join(wp_dir, "sil_waypoints_Town03.yaml"), "T3\n")
+        agent, target = _wp_agent(td, map_dir=wp_dir, active="active.yaml")
+        _write(target, "old\n")
+        _boot_map(agent, "")
+        assert _read(target) == "old\n"
+
+
+def test_boot_waypoints_copy_failure_does_not_break_link() -> None:
+    """文件级异常（目标不可写等）不得炸会话：后续数据流照常处理。"""
+    with tempfile.TemporaryDirectory() as td:
+        wp_dir = os.path.join(td, "sil_waypoints.d")
+        os.makedirs(wp_dir)
+        _write(os.path.join(wp_dir, "sil_waypoints_Town03.yaml"), "T3\n")
+        blocker = os.path.join(td, "blocked")          # 目标是目录 → copyfile 必炸
+        os.makedirs(blocker)
+        agent = _agent(waypoints_map_dir=wp_dir,
+                       waypoints_active_file=blocker)
+        _boot(agent)
+        assert agent.session.active is True
+
+
+# ---------------------------------------------------------------------------
 # 生命周期
 # ---------------------------------------------------------------------------
 def test_shutdown_flushes_zero_and_closes_idempotently() -> None:

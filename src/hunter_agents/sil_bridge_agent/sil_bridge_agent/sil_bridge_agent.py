@@ -51,6 +51,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import threading
 import time
 from typing import Any, Dict, Optional, cast
@@ -153,6 +154,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "kafka_bundle_dir": DEFAULT_BUNDLE_DIR,
     # ── 会话与看门狗 ──
     "sim_id_filter": "",              # 非空=只接受该 sim_id 的会话（多实例隔离）
+    # ── 按地图自动装载航点（V0.2.0，配合 tools/gen_sil_waypoints.py）──
+    # boot 帧 map_id → 把 dir 下 sil_waypoints_<map_id>.yaml 覆盖到 active 文件，
+    # auto_mission 在 start_mapping_cruise 时热重载。**换地图后必须重新发起巡航**。
+    # 内置默认**关闭**（裸默认不得碰 /etc 真实文件）；启用由参数 YAML 提供，
+    # share/config 与 /etc/hunter 两份标准部署形态都已配好。
+    "waypoints_map_dir": "",
+    "waypoints_active_file": "",
     "watchdog_ms": 500,               # 传感器断流阈值，与仿真端/safety_guard 同口径
     "sensor_topic_regex": SENSOR_TOPIC_REGEX,
     "consumer_group": "hunter-sil-bridge",
@@ -455,6 +463,36 @@ class SilBridgeAgent:
     # ------------------------------------------------------------------
     # 帧处理
     # ------------------------------------------------------------------
+    def _apply_map_waypoints(self, map_id: str) -> None:
+        """boot 时按仿真场景 CARLA 地图装载航点文件（V0.2.0）。
+
+        文件命名契约与 tools/gen_sil_waypoints.py 产物一致：
+        ``<dir>/sil_waypoints_<map_id>.yaml``。拷贝只发生在 boot 帧，
+        auto_mission 只在 start_mapping_cruise 热重载——因此**换地图后需
+        重新发起巡航**才装载新航点。文件级操作不得影响链路：全程 try 保护，
+        失败仅 WARN；未配置 dir/active 时关闭本机制（内置裸默认即关闭）。
+        """
+        wp_dir = str(self.config.get("waypoints_map_dir") or "")
+        target = str(self.config.get("waypoints_active_file") or "")
+        if not wp_dir or not target:
+            return
+        if not map_id:
+            logger.warning("boot 帧无 map_id，沿用现航点文件：%s", target)
+            return
+        source = os.path.join(wp_dir, "sil_waypoints_%s.yaml" % map_id)
+        if not os.path.isfile(source):
+            logger.warning(
+                "地图 %s 无航点文件：%s（用 gen_sil_waypoints.py 生成并部署到 %s；"
+                "沿用现有活动文件 %s）", map_id, source, wp_dir, target)
+            return
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(source, target)
+            logger.info("地图 %s 航点已装载：%s → %s（下次 start_mapping_cruise 热重载生效）",
+                        map_id, source, target)
+        except OSError as exc:
+            logger.warning("航点文件装载失败（不影响链路）：%s", exc)
+
     def on_message(self, raw: Any, topic: str) -> None:
         """处理一条上行信封（会话帧先于准入判定，迟到帧也必须按序执行）。"""
         envelope = decode_envelope(raw)
@@ -473,6 +511,7 @@ class SilBridgeAgent:
                             stats["sim_id"], stats["scene_id"], stats["map_id"],
                             stats["watchdog_ms"])
                 self._last_ego = None
+                self._apply_map_waypoints(stats["map_id"])
             elif phase == "stop":
                 logger.info("SIL 会话结束：sim_id=%s（补一帧零速后停发）", self.session.sim_id)
                 self._flush_stop_zero()

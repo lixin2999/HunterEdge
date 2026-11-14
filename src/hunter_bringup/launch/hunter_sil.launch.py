@@ -59,8 +59,10 @@ TF/消息滤波器判为远古消息全量丢弃）。
 用法
 ----
     # Jetson 上（先 source ROS2 与工作空间；凭据取 /etc/hunter/kafka）
-    ros2 launch hunter_bringup hunter_sil.launch.py \
-        auto_params_file:=/etc/hunter/sil_waypoints.yaml
+    ros2 launch hunter_bringup hunter_sil.launch.py
+    # auto_params_file 默认即 /etc/hunter/sil_waypoints.yaml（与 sil_bridge 的
+    # waypoints_active_file 默认一致：部署 /etc/hunter/sil_waypoints.d/ 后，
+    # boot 时按仿真地图自动装载，无需手工指定）
 
     # 仿真侧会话 boot 后，启动巡航（无需先验地图）
     ros2 service call /auto_mission/start_mapping_cruise std_srvs/srv/Trigger
@@ -104,7 +106,6 @@ def _isolated(source, *, condition=None, launch_arguments=None):
 def generate_launch_description():
     pkg_share = get_package_share_directory('hunter_bringup')
     sil_share = get_package_share_directory('sil_bridge_agent')
-    auto_share = get_package_share_directory('auto_mission')
 
     use_perception = LaunchConfiguration('use_perception')
     use_data_agent = LaunchConfiguration('use_data_agent')
@@ -120,8 +121,10 @@ def generate_launch_description():
             description='sil_bridge 参数 YAML（不含凭据；凭据取 /etc/hunter/kafka）'),
         DeclareLaunchArgument(
             'auto_params_file',
-            default_value=os.path.join(auto_share, 'config', 'autonomous_nav_params.yaml'),
-            description='auto_mission 参数 YAML；SIL 应指向航点为 CARLA 场景坐标的专用文件'),
+            default_value='/etc/hunter/sil_waypoints.yaml',
+            description='auto_mission 参数 YAML（航点为 CARLA 场景坐标）；'
+                        '默认与 sil_bridge waypoints_active_file 一致，'
+                        'boot 时按地图从 sil_waypoints.d 自动装载'),
         DeclareLaunchArgument(
             'use_perception', default_value='true',
             description='激光/视觉感知与融合（cruise 的 isPerceptionAlive 门控依赖它）'),
