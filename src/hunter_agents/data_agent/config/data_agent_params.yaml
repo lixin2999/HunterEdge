@@ -41,3 +41,12 @@ data_agent:
     # ── 链路兜底（produce() 成功 ≠ 送达，靠投递回执 + 队列积压上限判定）─
     kafka_queue_limit: 50        # 本地队列积压超过 50 条（约 5s）→ 转 SQLite 缓存
     kafka_flush_timeout_ms: 5000 # 退出时等待投递的超时（毫秒）
+
+    # ── health.ip 上报（HunterCore V1.28.0 契约，顶层可选字段）──────────
+    # auto：探测默认路由出口地址（4G/eth0），失败则**省略 ip 键**（绝不发 null/空串）；
+    # off ：永不携带 ip（与旧版报文等价，回滚开关，无需回滚车端版本）；
+    # <IP>：固定值（产线/封闭场地调试），非法值自动降级为 off。
+    # 留空 = 取环境变量 HEALTH_IP_REPORT，再空则 auto。
+    # ⚠ 上线顺序：平台必须先到 V1.28.0+（旧 schema additionalProperties:false 会把
+    #   带 ip 的 health 整条送 DLQ → 车辆在线态/状态全部断更）。
+    health_ip_report: ""

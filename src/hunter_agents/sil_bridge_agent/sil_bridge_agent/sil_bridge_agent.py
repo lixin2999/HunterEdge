@@ -52,6 +52,7 @@ import logging
 import math
 import os
 import shutil
+import sys
 import threading
 import time
 from typing import Any, Dict, Optional, cast
@@ -924,13 +925,42 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
     return cfg
 
 
-def main() -> None:
+def strip_ros_args(argv: list) -> list:
+    """剔除 ros2 launch 注入的 ROS 参数，只留下本节点 argparse 认识的参数。
+
+    ``launch_ros.actions.Node(name=...)`` 会无条件在命令行末尾追加
+    ``--ros-args -r __node:=sil_bridge_agent``；本节点不是 rclpy 声明式参数节点，
+    argparse 遇到未知参数会直接 ``exit code 2``，launch 里表现为
+    ``sil_bridge_node: error: unrecognized arguments: --ros-args ...``，
+    随后整条 SIL 链路无人消费 ``edge_sensor``，面板显示"SIL 等待车端"。
+    """
+    if not argv:
+        return []
+    if HAS_ROS:
+        try:
+            from rclpy.utilities import remove_ros_args
+            return list(remove_ros_args(args=argv)[1:])
+        except Exception:  # noqa: BLE001 —— 老版本 rclpy 无该函数时走手写兜底
+            logger.debug("remove_ros_args 不可用，改用截断兜底")
+    # 兜底：launch 只会把 ROS 参数追加在尾部，遇到 `--ros-args` 即截断；
+    # 同时丢掉 ROS 段结束后可能出现的分隔符 `--`。
+    cleaned = []
+    for token in argv:
+        if token == "--ros-args":
+            break
+        if token == "--":
+            continue
+        cleaned.append(token)
+    return cleaned
+
+
+def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description="HUNTER SIL Bridge Agent")
     parser.add_argument(
         "--config",
         default=os.environ.get("HUNTER_SIL_CONFIG", "/etc/hunter/sil_bridge_params.yaml"),
         help="YAML 参数文件（不含任何 Kafka 凭据）")
-    args = parser.parse_args()
+    args = parser.parse_args(strip_ros_args(sys.argv if argv is None else argv))
     agent = SilBridgeAgent(load_config(args.config))
     # systemd KillSignal=SIGINT → Python 默认抛 KeyboardInterrupt → run() 的 finally
     # 执行 shutdown()（补零速 + flush + 关节点）收拾干净再退出。

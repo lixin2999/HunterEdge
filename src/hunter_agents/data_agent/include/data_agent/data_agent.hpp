@@ -17,6 +17,7 @@
 #include <librdkafka/rdkafkacpp.h>
 #include <sqlite3.h>
 
+#include "data_agent/health_ip.hpp"
 #include "data_agent/kafka_access.hpp"
 #include "hunter_msgs/msg/chassis_command.hpp"
 #include "hunter_msgs/msg/chassis_state.hpp"
@@ -110,6 +111,9 @@ private:
   double hard_turn_;           // 文档 14.3：0.8 rad/s
   double comm_loss_duration_;  // 文档 14.3：10s
   double cache_max_hours_;     // 文档 14.6：24 小时
+  // health.ip（契约 V1.28.0 顶层可选字段）：auto|off|<IP>；
+  // 空串 = 取环境变量 HEALTH_IP_REPORT，再空则 auto
+  std::string health_ip_report_mode_;
 
   // Kafka SASL_SSL 认证参数（开发机内联兜底；生产凭据只来自 kafka.properties）
   std::string security_protocol_;   // "SASL_SSL"
@@ -201,6 +205,11 @@ private:
   std::string bag_output_dir_{"/data/rosbag"};  // bag 录制输出目录
   // 当前录制子进程 PID（0 = 无活跃录制）
   pid_t bag_record_pid_{0};
+
+  // health.ip 探测器（契约 V1.28.0）：只产出通过 schema 校验的地址；
+  // 探测失败返回空串 → buildHealthJson 省略 ip 键（绝不发 null/空串/unknown）
+  HealthIpReporter health_ip_reporter_;
+  std::string last_reported_ip_;   // 仅用于变化日志（不是状态机，平台侧自会去重）
 
   // 事件检测状态
   double prev_velocity_;

@@ -459,6 +459,22 @@ def test_default_config_carries_no_credentials() -> None:
     assert cfg["battery_soc"] > 0.0 and cfg["battery_voltage"] > 0.0
 
 
+def test_strip_ros_args_keeps_own_cli() -> None:
+    """ros2 launch 会追加 `--ros-args -r __node:=...`，必须剔除后再给 argparse。
+
+    否则 argparse 报 `unrecognized arguments` 退出（exit code 2），
+    SIL 链路无人消费 edge_sensor，面板长期显示"SIL 等待车端"。
+    """
+    argv = ["sil_bridge_node", "--config", "/tmp/p.yaml",
+            "--ros-args", "-r", "__node:=sil_bridge_agent"]
+    assert mod.strip_ros_args(argv) == ["sil_bridge_node", "--config", "/tmp/p.yaml"]
+    # 无 ROS 参数时原样返回；ROS 段后的 `--` 分隔符也要丢掉
+    assert mod.strip_ros_args(["sil_bridge_node"]) == ["sil_bridge_node"]
+    assert mod.strip_ros_args(
+        ["sil_bridge_node", "--ros-args", "--"]) == ["sil_bridge_node"]
+    assert mod.strip_ros_args([]) == []
+
+
 def test_sensor_topic_regex_is_librdkafka_regex() -> None:
     assert mod.SENSOR_TOPIC_REGEX.startswith("^")
     assert mod.SENSOR_TOPIC_REGEX == r"^carla\..+\.edge_sensor$"

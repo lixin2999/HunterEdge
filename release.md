@@ -5082,3 +5082,156 @@ cd ~/HunterEdge && colcon build --symlink-install --packages-select sil_bridge_a
 - 修复（均在 `gen_sil_waypoints.py`，产物格式/命名契约不变）：① 新增 `--timeout` 参数（默认 **60s**）取代硬编码 15s；② 新增 `_load_world()`：超时重试 1 次，且重试前先复查当前图——**RPC 超时≠加载失败**，server 往往稍后自行加载完成，已切到位则直接继续不重发；③ 逐图 try/except：**单图失败只 `[FAIL]` 跳过**，其余图照常，末尾提示失败图可 `--maps Town12 Town15` 单独重跑；④ `finally` 恢复原图段同样加固（复查当前图异常不再穿透，恢复失败提示手动切回）。
 - 验证：`py_compile` 通过；新增 2 项回归（单图超时不中断整批且照常恢复原图；超时但后台已加载完成→复查命中不重发），`pytest src/hunter_agents/sil_bridge_agent/test` **120 项全绿**（118→120）。待用户重跑：已生成的 10 个文件会被同名覆盖（无副作用），可整批 `--maps all`，也可只补失败图 `--maps Town12 Town15`（可再配 `--timeout 120`）。
 - 文档同步：三册横幅升 V2.32（基线 V0.2.2），无章节级变化。
+
+---
+
+## V0.2.3（Date：2026-11-14）
+
+**主题：修复 SIL 整栈下 `sil_bridge_node` 被 ros2 launch 注入的 `--ros-args -r __node:=...` 顶崩（argparse → exit code 2），导致仿真面板长期「SIL 等待车端」、`edge_control` 无消费者、仿真自车零速停留**
+
+### 一、现象（HUNTER-001 首轮 SIL 全栈联调）
+
+`ros2 launch hunter_bringup hunter_sil.launch.py` banner 之后其余节点均正常拉起，唯桥接进程立刻死亡：
+
+```
+[sil_bridge_node-2] sil_bridge_node: error: unrecognized arguments: --ros-args -r __node:=sil_bridge_agent
+[ERROR] [sil_bridge_node-2]: process has died [pid 6729, exit code 2,
+        cmd '.../sil_bridge_node --config .../sil_bridge_params.yaml --ros-args -r __node:=sil_bridge_agent']
+```
+
+连带现象（**全部由桥接死亡派生，不是算法问题**）：
+
+- 车端 ROS 话题全空：`/lidar_points`、`/imu/data`、`/camera/...`、`/chassis/state`、`/Odometry` 与 `odom→base_link`/`map→odom` TF 均无发布者；
+- 仿真端 `control_received=0` + `edge_control_watchdog: 控制帧断流，零速刹停保持`（自车 0 m/s）；
+- 仿真端持续 `ego_speed_stuck: desired=8.7 m/s actual=0.00 m/s`；
+- 平台/仿真面板长期显示 **「SIL 等待车端」**。
+
+### 二、根因
+
+`launch_ros.actions.Node(name='sil_bridge_agent')` 会**无条件**在命令行尾部追加 `--ros-args -r __node:=sil_bridge_agent`。`sil_bridge_agent` 沿用 `remote_agent`/`ota_agent` 的「独立进程内自建 ROS 节点 + argparse 读 `--config`」形态（不是 rclpy 声明式参数节点），`parser.parse_args()` 不认识 ROS 参数 → argparse 打印用法并以**退出码 2** 退出。
+
+V0.1.38 设计期只验证了 systemd / 裸命令行两种启动路径（均无 ROS 参数），V0.1.39 修的是 launch 作用域与 CRLF 行尾，**这一层从未被覆盖**；单测也不跑 `main()` 的 argv 解析，故 121 项单测无法暴露。
+
+### 三、修复（`sil_bridge_agent.py`）
+
+新增 `strip_ros_args(argv)`，`main(argv=None)` 先剥离 ROS 参数段再交给 argparse：
+
+1. **首选 rclpy 官方实现**：`rclpy.utilities.remove_ros_args()`（rclpy 在位时按 ROS 规则处理 `--ros-args`、`--`、`-r`/`--remap` 等）；
+2. **兜底**（rclpy 缺失或老版本无该函数）：遇 `--ros-args` 即截断（launch 只会在尾部追加），并丢弃 ROS 段后的裸 `--` 分隔符。
+
+节点名本就由 `Node("sil_bridge_agent")` 硬编码，launch 的 `__node` remap 属冗余，剥离后**零行为差异**；systemd / 裸命令行（无 ROS 参数）路径原样透传，向后兼容。
+
+### 四、验证
+
+- 新增单测 `test_strip_ros_args_keeps_own_cli`：launch 尾部注入 / 无 ROS 参数 / ROS 段含 `--` / 空 argv 四种形态；
+- `pytest src/hunter_agents/sil_bridge_agent/test -q` → **121 passed**（120→121）；
+- 实机判据：起栈不再出现 `unrecognized arguments: --ros-args`；桥接日志出现 `SIL Kafka 就绪：订阅 ^carla\..+\.edge_sensor$`；`ros2 topic hz /chassis/state /Odometry` 非零；仿真端 `control_received` 随巡航增长。
+
+### 五、部署（Jetson，纯 Python 改动，无需重编 C++）
+
+```bash
+cd ~/HunterEdge
+source /opt/ros/humble/setup.bash && source install/setup.bash
+colcon build --symlink-install --packages-select sil_bridge_agent
+ros2 launch hunter_bringup hunter_sil.launch.py
+```
+
+### 六、同轮联调的运维前置（**非车端代码缺陷**，勿归因 HunterEdge）
+
+桥接修好后若仍「SIL 等待车端」，按下面两条排查 Kafka 侧：
+
+- 症状：仿真端 `Topic carla.<sim_id>.edge_sensor not found in cluster metadata`；车端/仿真端生产者报 `KafkaTimeoutError: Failed to update metadata after 1.0 secs`。
+- 根因：`carla.{sim_id}.edge_sensor` / `carla.{sim_id}.edge_control` 是**每轮仿真按 `sim_id` 新建的一次性主题**，broker `auto.create.topics.enable=false`（或 mTLS 主体缺 CREATE 权限）时生产者永远拿不到元数据，消费端也订阅不到。
+- 处置：测试环境开 `auto.create.topics.enable=true`；或由仿真端在会话启动时用 AdminClient 预建两主题（sim_id 每轮变化，**不要手工建一次了事**），并确保 mTLS 主体对 `carla.*` 具备 CREATE/DESCRIBE/READ/WRITE。
+- 另：`产物上传失败（保留本地副本）：/api/v1/data/files/presign HTTP 422` 属平台侧入参校验问题（本地副本保留、mcap 上传成功），不影响仿真判据与 SIL 控制链路。
+
+### 七、文档同步
+
+三册升 **V2.33**（基线 V0.2.3），均为章节级增量：
+
+- `README.md`：版本头；§15.2 包结构表补 `strip_ros_args` 并把单测数改为 121；§15.9 起栈自检补「ROS 参数剥离」与「Kafka 主题前置」两段告警。
+- `User_Manual.md`：版本头；§11.3 起栈步骤补一句「不要手改 launch 注入的 `--ros-args`」；§11.4 第 0 步扩充 `unrecognized arguments: --ros-args` 判据与处置，并新增第 0b 步「一次性 Kafka 主题缺失」的现场判读。
+- `Deployment_Guide.md`：版本头变化块；§9.4 起栈步骤补「起栈 10 秒内必看的两条日志」；§9.6 验收第 2/3 步判据补 `unrecognized arguments` 与主题缺失；§9.7 常见部署故障新增两行（argparse 被 ROS 参数顶崩、一次性 `carla.*` 主题缺失）。
+
+---
+
+## V0.2.4（Date：2026-11-14）
+
+**主题：health 心跳按 HunterCore V1.28.x 契约上报车辆 IP（顶层可选 `ip`）——新增探测/校验模块、`health_ip_report` 开关、自检脚本与单测**
+
+### 一、背景与契约（不可协商）
+
+V1.28.1 起，车辆台账 `vehicle_svc.vehicles.ip_address` 的**唯一写路径**是 health 心跳回写（建账/台账修改对话框已移除 IP 输入项）。车端只做一件事：在既有 1Hz `hunter.{vehicle_id}.health` 里增加**顶层可选 `ip`**。
+
+| 项 | 取值 |
+|---|---|
+| Schema | `HunterCore/contracts/kafka/schemas/health.schema.json`（draft-07，**`additionalProperties: false`**） |
+| `ip` | `string`，`minLength 3` / `maxLength 45`，IPv4 点分十进制 或**压缩形式 IPv6** |
+| 必填项 | 不变：`vehicle_id` / `timestamp` / `status` / `system`（7 子字段） |
+| 不变项 | 不新增 Topic、不改 1Hz、不动 acks、不碰 `system` 段、不涉及 `gear`/`lat`/`lng` |
+
+三条铁律（决定了实现形态）：
+
+1. **非法值毁整条 health**：消费侧先 schema 校验，`schema_invalid` **直接进 DLQ、不重试** → 该车在线态与状态更新全部断更，不只是 IP 不变。故探测失败/关闭/固定值非法时**整个键省略**，绝不发 `null` / `""` / `"unknown"` / 带端口 / CIDR / `%zone` / IPv4-mapped / 三段地址。
+2. **上报值即权威**：非空合法值直接覆盖台账（含人工录入的过渡值）。
+3. **车端不做变化检测**：平台按「与上一次写入值比较」去重，每秒都带即可（不引入状态机）。
+
+### 二、实现（`data_agent`，C++）
+
+新增 `include/data_agent/health_ip.hpp` + `src/health_ip.cpp`（`HealthIpReporter`，**不依赖 rclcpp**，可离线单测）：
+
+- **取哪个地址**：默认路由出口网卡源地址——UDP `connect()` 到 `8.8.8.8:80`，再读本地 socket 地址；无 IPv4 时再试 `2606:4700:4700::1111:80`。**不发包、不做 DNS、无需 root**，不用 `hostname -I` 第一项（多网卡顺序不保证）。
+- **排除清单**：`127.0.0.0/8`、`::1`、`169.254.0.0/16`、`fe80::/10`、`lo`/`docker*`/`br-*`/`veth*`/`virbr*`/`tun*`/`tap*`/`wg*`/`zt*`/`tailscale*` 接口。
+- **双栈**：优先 IPv4，仅当无 IPv4 才报 IPv6；一辆车只报**一个**地址。
+- **重采样**：启动 1 次 + `60s` TTL + **网络事件触发**（每秒比对「`getifaddrs` 接口=地址」集合与 `/proc/net/route`、`/proc/net/ipv6_route` 的默认路由出口——link up/down、DHCP 续租、WiFi↔4G 切换、默认路由度量切换都会改变指纹）→ 丢缓存后**下一拍心跳（≤1s）**即带新值，满足切网 ≤2s。探测失败**10s 后重试**（而非空等 60s），避免开机网络未就绪时长时间缺 `ip`。
+- **校验比契约更严一档**：契约 pattern 允许 IPv4 前导零（`010.0.0.1`），平台侧 `ipaddress` 严格校验却会拒绝；车端取两者交集（自定义 4 段 0-255 严格解析 + `inet_pton`/`inet_ntop` 归一），避免「schema 能过、平台丢弃」的灰区；IPv6 输出统一为压缩小写形式。
+- **报文构造**（`data_agent.cpp::buildHealthJson()`）：仅在 `current()` 返回非空时写 `,"ip":"..."`，插在 `status` 之后；`current()` 为空则整键不写。日志只在值变化时打一条（INFO 上报地址变化 / WARN 不可用），不刷屏。
+
+**配置开关**（对齐平台侧模拟器 `--ip auto|none|<IP>`）：
+
+| 配置 | 行为 |
+|---|---|
+| `health_ip_report: "auto"`（默认） | 自动探测，失败省略 `ip` |
+| `health_ip_report: "off"` | 永不携带 `ip`（与旧版报文逐字节等价；`none` 同义） |
+| `health_ip_report: "192.168.10.21"` | 固定值（产线/封闭场地调试），启动时归一化 |
+
+优先级：**ROS 参数 `health_ip_report` > 环境变量 `HEALTH_IP_REPORT` > `auto`**；非法固定值（带端口/CIDR/zone/mapped）**降级为 `off` 并记 ERROR**，不「尽力发送」。`config/data_agent_params.yaml` 新增该参数（默认空串＝取环境变量）。
+
+### 三、交付物与验证
+
+- `test/test_health_ip.cpp`（gtest，10 例）：合法 IPv4/压缩 IPv6 归一、非法 IPv4（三段/越界/端口/CIDR/前导零/空段/尾点/`unknown`/`N/A`）拒绝、非法 IPv6（`%zone`/IPv4-mapped/三冒号/CIDR）拒绝、`off`/`none` 永不上报、固定值归一、非法固定值降级 `off`、配置优先级、地址准入（loopback/link-local/fe80/未指定）与虚接口排除（docker0/br-*/veth*/virbr*/tun*/tap*/wg*/zt*/tailscale*）。
+- `scripts/health_ip_selfcheck.py`：采样一次 + 按车端语义构造报文 + 用契约 schema 做 draft-07 校验，支持 `--ip auto|none|<IP>`、`--selftest`（含 7 个非法值注入必须被拦下 + schema 反向校验）、`--validate-file`（校验抓包 60s 报文）。
+- 本机已验证：`python3 src/hunter_agents/data_agent/scripts/health_ip_selfcheck.py --selftest` 全 PASS（auto 探测到本机出口地址、三个模式报文均过 schema、7 个非法值全部拦截、`10.0.0.3/24` 被 schema 反向拒绝）。
+- **待 Jetson 验证**（本机无 C++ 工具链）：`colcon build --symlink-install --packages-select data_agent` 无 `-Wall -Wextra -Wpedantic` 警告；`colcon test --packages-select data_agent` 中 `test_health_ip` 全绿。
+
+### 四、部署与上线顺序（**最容易踩的一条**）
+
+平台 **V1.28.0 之前**的 health schema 没有 `ip` 且 `additionalProperties: false`，收到带 `ip` 的报文会**整条进 DLQ**（`schema_invalid`，不重试）→ 车辆在线态、状态全部断更。
+
+1. **平台侧先升到 V1.28.0+**（当前部署机已是 V1.28.1）；
+2. 车端发版**先以 `off` 上线**（报文与旧版逐字节等价，零风险）：
+   ```bash
+   # /etc/hunter/data_agent_params.yaml（或 systemd Environment）
+   health_ip_report: "off"      # 或环境变量 HEALTH_IP_REPORT=off
+   ```
+   ⚠ **缺键/留空 = `auto`**：升级前就存在的 `/etc/hunter/data_agent_params.yaml` 里没有这一行，若不显式写 `off`，重启后会**立刻按 auto 上报 IP**——平台未升级时等于直接踩 DLQ。升级前请先确认该文件已有 `health_ip_report: "off"`（或用 `systemctl edit hunter-edge` 注入 `Environment=HEALTH_IP_REPORT=off`）。
+   重编并重启：`rm -rf build/data_agent install/data_agent`（避 C++ mtime 陷阱）→ `colcon build --symlink-install --packages-select data_agent` → `sudo systemctl restart hunter-edge`；
+3. 平台确认升级完成后改 `auto`（或注入环境变量 `HEALTH_IP_REPORT=auto`）并重启，首批建议 **1 台试点**，确认无 DLQ 再推全量；
+4. **回滚只需 `off`**，不必回滚车端版本。
+
+### 五、验收口径（提测证据）
+
+1. 抓 60s 报文，用 `contracts/kafka/schemas/health.schema.json` 做 draft-07 校验**全部通过**且有 `ip` 键（`health_ip_selfcheck.py --validate-file`）；
+2. **断网 / 无默认路由**：报文**不含 `ip` 键**（不是空串），且仍能通过 schema 校验；
+3. **切网**（WiFi→4G）后 ≤2s 内首条报文 `ip` 已变；
+4. 注入非法值（如 `10.0.0.3/24`）时自检脚本必须拦下——生产代码**不应存在**能发出非法值的分支。
+
+平台侧观测（运维执行）：台账 `select vehicle_id, ip_address, last_online_time from vehicle_svc.vehicles`；异常路径 `grep -E 'health_ip_invalid_ignored|vehicle_ledger_ip_write_failed'` 应为空；`hunter.<vid>.health.dlq` 无新增。判据：列表页 IP 列 ≤60s 出现上报值、改 IP 后 ≤60s 自动更新、无 `health_ip_invalid_ignored` 与 DLQ 新增。
+
+### 六、文档同步
+
+三册升 **V2.34**（基线 V0.2.4）：
+
+- `README.md`：版本头；§11.3 契约表后新增 **§11.4「health 心跳上报车辆 IP（V0.2.4）」**（契约、语义、探测/校验口径、开关优先级、失败语义、上线顺序）。
+- `User_Manual.md`：版本头；§6.2 新增「平台车辆列表 IP 列不更新 / 变为 `-`」排障行（含「缺键/留空 = auto」的回滚提醒）；§7 降级策略补一行「IP 探测失败 → 省略 `ip` 键、health 与判活照常」。
+- `Deployment_Guide.md`：版本头；§5.8 增量升级表新增 V0.2.4 行（重编 `data_agent`，验收 `ros2 param get /data_agent health_ip_report` 与 `journalctl` 中 `health.ip 上报地址`）；§7.6 故障表新增 `health.ip` 三行（DLQ 新增 / `health_ip_invalid_ignored` / IP 列不变）。

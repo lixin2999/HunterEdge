@@ -17,6 +17,7 @@ find_library(SQLITE3_LIB sqlite3)
 
 add_executable(data_agent_node
   src/data_agent.cpp
+  src/health_ip.cpp
   src/kafka_access.cpp
   src/main.cpp
 )
@@ -39,10 +40,22 @@ install(TARGETS data_agent_node
 install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}
 )
+# health.ip 自检脚本（采样一次 + 构造 health 报文 + schema 校验）
+install(PROGRAMS scripts/health_ip_selfcheck.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
   ament_lint_auto_find_test_dependencies()
+
+  # health.ip 契约/校验单测：纯逻辑（无 rclpy/ROS 依赖），可离线跑
+  ament_add_gtest(test_health_ip test/test_health_ip.cpp src/health_ip.cpp)
+  if(TARGET test_health_ip)
+    target_include_directories(test_health_ip PRIVATE include)
+    target_compile_features(test_health_ip PRIVATE cxx_std_17)
+  endif()
 endif()
 
 ament_package()

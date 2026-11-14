@@ -262,6 +262,9 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   declare_parameter("hard_turn", 0.8);
   declare_parameter("comm_loss_duration", 10.0);
   declare_parameter("cache_max_hours", 24.0);
+  // health.ip（契约 V1.28.0 顶层可选字段）：auto|off|<IP>；
+  // 留空 = 读环境变量 HEALTH_IP_REPORT，再空则 auto（探测失败省略该键）
+  declare_parameter("health_ip_report", "");
   // 事件去重抑制期（秒）：同一 event_type 在此间隔内只上报一次（边沿触发）；
   // detectEvents 是 100ms 判定，无此门控会在低电/超速/急停持续期间每拍重复上报
   declare_parameter("event_min_interval", 10.0);
@@ -295,6 +298,7 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   bag_record_duration_s_ = get_parameter("bag_record_duration_s").as_double();
   bag_output_dir_ = get_parameter("bag_output_dir").as_string();
   cache_max_hours_ = get_parameter("cache_max_hours").as_double();
+  health_ip_report_mode_ = get_parameter("health_ip_report").as_string();
   kafka_queue_limit_ = static_cast<int>(get_parameter("kafka_queue_limit").as_int());
   kafka_flush_timeout_ms_ = static_cast<int>(get_parameter("kafka_flush_timeout_ms").as_int());
   replay_batch_size_ = static_cast<int>(get_parameter("replay_batch_size").as_int());
@@ -344,6 +348,22 @@ DataAgent::DataAgent(const rclcpp::NodeOptions & options)
   telemetry_topic_ = "hunter." + vehicle_id_ + ".telemetry";
   event_topic_ = "hunter." + vehicle_id_ + ".event";
   health_topic_ = "hunter." + vehicle_id_ + ".health";
+
+  // health.ip（契约 V1.28.0）：默认 auto，探测失败则**省略 ip 键**。
+  // 非法固定值（如带端口/CIDR/zone）不会降级为"尽力发送"，而是直接关掉——
+  // 一个脏值会让 schema 校验失败、整条 health 进 DLQ，该车在线态与状态更新全部断更。
+  {
+    const std::string mode = HealthIpReporter::resolveMode(
+      health_ip_report_mode_, "HEALTH_IP_REPORT");
+    if (!health_ip_reporter_.configure(mode)) {
+      RCLCPP_ERROR(get_logger(),
+        "health_ip_report=%s 不是合法 IP（IPv4 点分十进制 / 压缩 IPv6；禁止端口、CIDR、"
+        "zone id、IPv4-mapped），已降级为 off：health 报文不携带 ip 键", mode.c_str());
+    }
+    RCLCPP_INFO(get_logger(),
+      "health.ip 上报：mode=%s%s（配置优先级：health_ip_report 参数 > 环境变量 HEALTH_IP_REPORT > auto）",
+      mode.c_str(), health_ip_reporter_.enabled() ? "" : "（off：报文不含 ip）");
+  }
 
   // 运营端入口（用于契约 system.network_latency_ms 采样；取 bootstrap 首个 broker）
   parseFirstBroker(kafka_brokers_, broker_host_, broker_port_);
@@ -883,7 +903,7 @@ std::string DataAgent::buildTelemetryJson()
 std::string DataAgent::buildHealthJson()
 {
   // ── 契约：contracts/kafka/schemas/health.schema.json ────────────────────
-  // required = [vehicle_id, timestamp, status, system]；可选 gear / free_storage_mb / lat / lng。
+  // required = [vehicle_id, timestamp, status, system]；可选 ip / gear / free_storage_mb / lat / lng。
   // 平台 data-collector-health 据此写 Redis 读模型 vehicle:status:{id} 并回写车辆台账
   // status/last_online_time（联调唯一判据：平台侧 last_online_time 刷新）。
   std::ostringstream oss;
@@ -892,6 +912,28 @@ std::string DataAgent::buildHealthJson()
   oss << "\"vehicle_id\":\"" << jsonEscape(vehicle_id_) << "\"";
   oss << ",\"timestamp\":" << this->now().seconds();
   oss << ",\"status\":\"" << vehicleStatusForContract() << "\"";
+  // ip（契约 V1.28.0 顶层可选，字符串 3~45 字符）：只写通过契约校验的地址。
+  // 探测失败 / off / 非法固定值 → **整个键省略**（写 null、""、"unknown" 都会被
+  // schema 判失败并把整条 health 送进 DLQ，连在线判活一起断掉）。
+  // 不去重、不做变化检测：平台按"与上次写入值比较"去重，1Hz 全量上报即可。
+  const std::string health_ip = health_ip_reporter_.current();
+  if (!health_ip.empty()) {
+    oss << ",\"ip\":\"" << jsonEscape(health_ip) << "\"";
+  }
+  if (health_ip != last_reported_ip_) {
+    if (health_ip.empty()) {
+      // off 模式属有意配置，不打 WARN（避免每次开机一条误导性告警）
+      if (health_ip_reporter_.enabled()) {
+        RCLCPP_WARN(get_logger(),
+          "health.ip 不可用（探测失败），本次及后续心跳省略 ip 键；"
+          "平台保留台账人工录入值");
+      }
+    } else {
+      RCLCPP_INFO(get_logger(), "health.ip 上报地址：%s → %s",
+        last_reported_ip_.empty() ? "(无)" : last_reported_ip_.c_str(), health_ip.c_str());
+    }
+    last_reported_ip_ = health_ip;
+  }
   // free_storage_mb（G-08：OTA 存储门禁 ≥2048MB；不上报即门禁缺数据、按安全默认拒绝）
   oss << ",\"free_storage_mb\":" << freeStorageMb();
   // gear / lat / lng（G-08 / G-11）：当前底盘驱动未提供档位与 GPS → **不臆造**，
