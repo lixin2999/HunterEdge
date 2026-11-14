@@ -5066,9 +5066,9 @@ cd ~/HunterEdge && colcon build --symlink-install --packages-select sil_bridge_a
 ---
 
 ## V0.2.1（Date：2026-11-14）
-**修复 V0.2.0 生成器首次实机运行报错：`AttributeError: 'World' object has no attribute 'get_client'`**
+**修复 V0.2.0 生成器实机（CARLA 0.9.16）运行报错：版本行两次误用 Client/World API**
 
-- 现象：仿真机 `python gen_sil_waypoints.py --maps all --out-dir ./sil_waypoints.d` 连上 server、`get_available_maps()` 与地图筛选均正常，在最后打印版本行时抛 `AttributeError`（CARLA Python API 中 `get_client()` 在 `Client` 上、`World` 没有此方法）。
-- 修复：版本改取 `client.get_service_version()`；连通性验证保留 `client.get_world()` 调用但不另存对象；逐处复核生成器其余 CARLA API（`load_world`/`get_spawn_points`/`Transform.location·rotation`）均存在且用法正确。纯 `main()` 路径改动，不改产物格式与命名契约。
-- 验证：`py_compile` 通过；`pytest src/hunter_agents/sil_bridge_agent/test` **117 项全绿**。待用户在 CARLA 机重跑生成器产出 `sil_waypoints.d/` 并部署（V0.2.0 §六 步骤不变）。
+- 现象：仿真机 `python gen_sil_waypoints.py --maps all --out-dir ./sil_waypoints.d` 连上 server、`get_available_maps()` 与地图筛选均正常，在最后打印版本行时抛 `AttributeError`——先后两步：`World.get_client()` 不存（V0.2.0 原写法）；改成 `Client.get_service_version()` 在 0.9.16 仍不存，实测方法名为 **`Client.get_server_version()`**（第二次报错信息自身已提示）。CARLA Python API 的 Client 版本查询方法名跨版本不稳定，不能单选一个名字硬写。
+- 修复：新增 `_server_version(client)` 按**存在性探测**：`get_server_version`（0.9.16 实测在位）→ `get_service_version` → 旧版 `get_client().get_version()`，均取不到返回 "unknown" 仅降级展示、**不阻塞生成**。两次报错均发生在版本行本身，其后的生成主流程（`load_world`/`get_spawn_points`/`Transform`）按 0.9.16 官方 API 逐处静态复核均存在且用法正确，待实机重跑闭环。产物格式与命名契约不变，纯 `main()` 展示路径改动。
+- 验证：`py_compile` 通过；新增 `test_server_version_probe_across_carla_api_shapes`（三种 API 形态各断言），`pytest src/hunter_agents/sil_bridge_agent/test` **118 项全绿**（117→118）。待用户在 0.9.16 仿真机重跑生成器产出 `sil_waypoints.d/` 并部署（V0.2.0 §六 步骤不变）。
 - 文档同步：三册横幅升 V2.31（基线 V0.2.1），无章节级变化（修复不涉及部署/操作口径）。

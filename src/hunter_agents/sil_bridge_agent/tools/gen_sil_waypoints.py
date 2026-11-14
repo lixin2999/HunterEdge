@@ -161,6 +161,26 @@ def generate(client: Any, maps: List[str], count: int, min_gap: float,
     return written
 
 
+def _server_version(client: Any) -> str:
+    """server 版本字符串（仅展示用，取不到不阻塞生成）。
+
+    CARLA Python API 的 Client 方法名跨版本不稳定：0.9.16 实测为
+    `get_server_version()`（无 get_service_version，也无 World.get_client），
+    旧版为 `get_client().get_version()`——故按存在性探测。
+    """
+    for attr in ("get_server_version", "get_service_version"):
+        fn = getattr(client, attr, None)
+        if fn is not None:
+            try:
+                return str(fn())
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        return str(client.get_client().get_version())
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="SIL 分地图航点批量生成器（须在有 CARLA server 的仿真机上运行）")
@@ -189,7 +209,7 @@ def main() -> int:
     try:
         client = carla.Client(args.host, args.port)
         client.set_timeout(15.0)
-        client.get_world()          # 连通性验证（World 对象无 get_client，版本取 client 侧）
+        client.get_world()          # 连通性验证
     except Exception as exc:  # noqa: BLE001
         print("[ERROR] 连不上 CARLA %s:%s ——%s" % (args.host, args.port, exc),
               file=sys.stderr)
@@ -207,7 +227,7 @@ def main() -> int:
         print("[ERROR] 没有可生成的地图", file=sys.stderr)
         return 2
 
-    print("CARLA %s | 目标地图：%s" % (client.get_service_version(), ", ".join(want)))
+    print("CARLA %s | 目标地图：%s" % (_server_version(client), ", ".join(want)))
     n = generate(client, want, args.count, args.min_gap, args.out_dir)
     print("完成：%d/%d 个文件 → %s" % (n, len(want), args.out_dir))
     print("下一步：整个目录部署到 Jetson /etc/hunter/sil_waypoints.d/（scp -r 即可）")

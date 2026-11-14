@@ -167,6 +167,28 @@ def test_generate_skips_map_with_no_selectable_points() -> None:
         assert client.loaded == []                            # 本来就是当前图，不切
 
 
+def test_server_version_probe_across_carla_api_shapes() -> None:
+    """版本字符串按 API 存在性探测（0.9.16 实测只有 get_server_version）。"""
+    class _Modern:                       # CARLA 0.9.16
+        def get_server_version(self):
+            return "0.9.16"
+
+    class _Legacy:                       # 旧版：get_client().get_version()
+        class _Inner:
+            def get_version(self):
+                return "0.9.13"
+
+        def get_client(self):
+            return self._Inner()
+
+    class _Neither:
+        pass
+
+    assert gwp._server_version(_Modern()) == "0.9.16"
+    assert gwp._server_version(_Legacy()) == "0.9.13"
+    assert gwp._server_version(_Neither()) == "unknown"    # 取不到不阻塞生成
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
